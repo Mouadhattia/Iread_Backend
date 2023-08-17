@@ -5,7 +5,7 @@ from flask import Blueprint,request,jsonify
 from flask_login import login_required
 from extensions import login_manager,db
 from datetime import datetime
-
+import logging
 from models.book import Book
 from models.book_pack import Book_pack
 from models.session import Session
@@ -57,19 +57,29 @@ def load_user(user_id):
 # @retval 404: If the book is not found in the database.
 # @retval 405: If the HTTP method is not allowed (only POST is allowed).
 @main.route('/search_books',methods=['POST'])
-@login_required
+# @login_required
 def search_books():
 
     try:
         token=request.json['id']
-        books=db.session.query(Book,Session).filter(Book.token==token,Session.date > datetime.now())
+        books=db.session.query(Book,Session).filter(Book.id==token,Session.start_date > datetime.now())
         book=books.first()
         
         book_sessions=books.join(Session, Session.book_id==Book.id).all()
-        if len(book_sessions)>=2:
-            teacher=Teacher.query.filter_by(id=book_sessions[1].Session.teacher_id).first()
         
-        sessions=[{"date":book_session.Session.date,"location":book_session.Session.location.value,"teacher":teacher.email } for book_session in book_sessions]
+        sessions=[{
+            "id":book_session.Session.id,
+            "title":book_session.Session.name,
+            "start":book_session.Session.start_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+            "end":book_session.Session.end_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+            "teacher":Teacher.query.filter_by(id=book_session.Session.teacher_id).first().email,
+            "pack_id":book_session.Session.pack_id,
+            "extendedProps":{
+                "location":book_session.Session.location.value,
+                "description":book_session.Session.description,
+                "category":"primary"
+                } 
+                } for book_session in book_sessions]
         
         if book_sessions or book:
             return jsonify({
@@ -78,13 +88,15 @@ def search_books():
                 'page_number':book.Book.page_number,
                 'release_date':book.Book.release_date,
                 'category':book.Book.category,
-                'session':[session for session in sessions]
+                'img':book.Book.img,
+                'desc':book.Book.desc,
+                'sessions':[session for session in sessions]
                     
                 }),200
         else:
             return jsonify({'message': 'Book not found or no sessions associated with this book'}),404
     except Exception as error:
-        return jsonify({'message': 'Internal server error'}),500
+        return jsonify({'message': str(error)}),500
 
 
 ## @brief Route for retrieving a specific page from a book.
@@ -135,16 +147,18 @@ def get_all_session_list():
     
 
 @main.route('/show_session_details',methods=['POST'])
-@login_required
+# @login_required
 def show_session_details():
     try:
         token=request.json['id']
-        session=Session.query.filter_by(token=token).first()
+        session=Session.query.filter_by(id=token).first()
         if session:
             teacher=Teacher.query.filter_by(id=session.teacher_id).first()
-            return jsonify({'date':session.date,
+            book=Book.query.filter_by(id=session.book_id).first()
+            return jsonify({'date':session.start_date,
                             'location':session.location.value,
-                            'teacher':teacher.email,
+                            'teacher':teacher.username,
+                            'book':book.title,
                             'capacity':session.capacity,
                             'active':session.active,
                             'name':session.name,
@@ -154,6 +168,7 @@ def show_session_details():
         else:
             return jsonify({'message':'No session found'})
     except Exception as error:
+        logging.error('An error occurred: %s', error, exc_info=True)
         return jsonify({'message':str(error)}), 500
 
 

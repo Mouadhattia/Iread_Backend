@@ -4,6 +4,7 @@ from extensions import db
 from models.book import Book
 from models.user import Teacher
 from enum import Enum
+from models.pack import Pack
 
 class Location(Enum):
     ONLINE='online'
@@ -24,7 +25,11 @@ class Session(db.Model):
     price=db.Column(db.Float,default=0)
     discount=db.Column(db.Float,default=0)
     location=db.Column(db.Enum(Location),default=Location.ONLINE)
-    date=db.Column(db.Date,nullable=False)
+    start_date=db.Column(db.Date,nullable=False)
+    end_date=db.Column(db.Date,nullable=False)
+    pack_id=db.Column(db.ForeignKey(Pack.id))
+    description = db.Column(db.String(200))
+
     active=db.Column(db.Boolean,nullable=False,default=False)
 
     

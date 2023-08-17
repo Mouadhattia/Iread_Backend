@@ -9,6 +9,7 @@ from models.teacher_postulate import Teacher_postulate
 from models.pack import Pack
 from models.follow_pack import Follow_pack
 from models.book import Book
+from models.book_pack import Book_pack
 from models.session import Session
 from models.follow_session import Follow_session
 from apps.main.email import generate_confirmed_token,reader_confirm_token
@@ -17,7 +18,7 @@ from flask_mail import Message
 from config import ConfigClass
 from flask_login import login_user,logout_user,current_user,login_required
 from functools import wraps
-
+import logging
 
 ## @brief Blueprint for user readers' authentication.
 # This blueprint contains routes and functions related to user authentication, including login, registration,
@@ -212,17 +213,19 @@ def dashboard():
     try:
         infos = db.session.query(User, Book, Session, Follow_session).filter(User.email == current_user.email).join(Follow_session, User.id == Follow_session.user_id).join(Session, Session.id == Follow_session.session_id).join(Book, Book.id == Session.book_id)
 
-        followed_sessions = infos.filter(Session.date < datetime.now()).all()
-        pending_sessions = infos.filter(Session.date >= datetime.now(), Follow_session.approved == 0).all()
-        current_session_followed = infos.filter(Session.date >= datetime.now(), Follow_session.approved == 1).all()
+        followed_sessions = infos.filter(Session.start_date < datetime.now()).all()
+        pending_sessions = infos.filter(Session.start_date >= datetime.now(), Follow_session.approved == 0).all()
+        current_session_followed = infos.filter(Session.start_date>= datetime.now(), Follow_session.approved == 1).all()
 
         followed_sessions_data = []
         for session_follow in followed_sessions:
             followed_sessions_data.append({
                 'session_name': session_follow.Session.name,
+                'id': session_follow.Session.id,
                 'book_title': session_follow.Book.title,
+                'book_id': session_follow.Book.id,
                 'author': session_follow.Book.author,
-                'location': session_follow.Session.location,
+                'location': session_follow.Session.location.value,
                 'date': session_follow.Session.date.strftime('%Y-%m-%d')
             })
 
@@ -230,10 +233,12 @@ def dashboard():
         for pending_session in pending_sessions:
             pending_session_data.append({
                 'session_name': pending_session.Session.name,
+                'id': pending_session.Session.id,
                 'book_title': pending_session.Book.title,
+                'book_id': pending_session.Book.id,
                 'author': pending_session.Book.author,
-                'location': pending_session.Session.location,
-                'date': pending_session.Session.date.strftime('%Y-%m-%d'),
+                'location': pending_session.Session.location.value,
+                'date': pending_session.Session.start_date.strftime('%Y-%m-%d'),
                 'approved': pending_session.Follow_session.approved
             })
 
@@ -241,10 +246,12 @@ def dashboard():
         for session_follow in current_session_followed:
             current_session_followed_data.append({
                 'session_name': session_follow.Session.name,
+                'id': session_follow.Session.id,
                 'book_title': session_follow.Book.title,
+                'book_id': session_follow.Book.id,
                 'author': session_follow.Book.author,
-                'location': session_follow.Session.location,
-                'date': session_follow.Session.date.strftime('%Y-%m-%d'),
+                'location': session_follow.Session.location.value,
+                'date': session_follow.Session.start_date.strftime('%Y-%m-%d'),
                 'approved': session_follow.Follow_session.approved
             })
 
@@ -257,6 +264,7 @@ def dashboard():
         })
 
     except Exception as error:
+        logging.error('An error occurred: %s', error, exc_info=True)
         return jsonify({'message':'Internal serveur error'}),500
 
 
@@ -486,23 +494,33 @@ def delete_account():
 # @retval 404: If the formation is not found in the database.
 # @retval 405: If the HTTP method is not allowed (only POST is allowed).
 #
-
 @reader.route('/register_session', methods=['POST'])
 @login_required
 def register_session():
     try:
         token = request.json['id']
-        session = db.session.query(Session).filter(Session.token == token).first()
-        if session:
-            follow = Follow_session(user_id=current_user.id, session_id=session.Session.id)
-            db.session.add(follow)
-            db.session.commit()
-            
-            return jsonify({'message': 'You are registered successfully'}), 200
+        
+        session_instance = db.session.query(Session).filter(Session.id == token).first()
+    
+        if session_instance:
+            # Assuming session_instance.id is related to pack_id and book_id
+            follow_pack = Follow_pack.query.filter_by(pack_id=session_instance.pack_id, user_id=current_user.id).first()
+           
+            if follow_pack and follow_pack.approved:
+                follow = Follow_session(user_id=current_user.id, session_id=session_instance.id)
+                db.session.add(follow)
+                db.session.commit()
+                
+                return jsonify({'message': 'You are registered successfully'}), 200
+            else:
+                return jsonify({'message': 'No matching or approved Follow_pack found'}), 404
         else:
             return jsonify({'message': 'No session found'}), 404
-    except:
+    except Exception as e:
+        print(e)  # Print the exception for debugging purposes
         return jsonify({'message': 'Internal server error'}), 500
+
+
 
 
 @reader.route('/cancel_register_session', methods=['POST'])
@@ -553,19 +571,20 @@ def follow_pack():
 @login_required
 def get_followed_pack_list():
     try:
+        packs = db.session.query(Pack, Follow_pack.approved).join(Follow_pack).filter(Pack.id == Follow_pack.pack_id, Follow_pack.user_id == current_user.id)
 
-        packs=db.session.query(Pack).join(Follow_pack).filter(Pack.id==Follow_pack.pack_id,Follow_pack.user_id==current_user.id)
-        
-        followed_pack_list=[]
-        for followed_pack in packs:
-            followed_pack_list.append({'title':followed_pack.title})
-        
+        followed_pack_list = []
+
+        for followed_pack, approved in packs:
+            followed_pack_list.append({'title': followed_pack.title, 'id': followed_pack.id, 'approved': approved})
+
         if followed_pack_list:
-            return jsonify({'followed_pack_list':followed_pack_list}), 200
+            return jsonify({'followed_pack_list': followed_pack_list}), 200
         else:
             return jsonify({'message': 'You have not followed any pack at the moment'}), 404
     except:
         return jsonify({'message': 'Internal server error'}), 500
+
 
 
 @reader.route('/unfollowed_pack', methods=['POST'])
