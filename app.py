@@ -64,7 +64,9 @@ from flask_migrate import Migrate
 
 ## @brief Create the Flask application instance.
 app=Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000", "supports_credentials": True}})
+
+
+CORS(app, resources={r"/*": {"origins": "*", "supports_credentials": True}})
 
 ## @brief Configure the application using the configuration class from the config.py file.
 app.config.from_object(ConfigClass)
@@ -96,3 +98,6 @@ app.register_blueprint(reader)
 app.register_blueprint(teacher)
 app.register_blueprint(admin)
 app.register_blueprint(main)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5003)  # Change the port to your desired port number

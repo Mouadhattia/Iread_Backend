@@ -7,7 +7,7 @@ Faker==19.1.0
 Flask==2.2.3
 Flask-Admin==1.6.1
 Flask-Bcrypt==1.0.1
-Flask-Cors==4.0.0
+Flask-Cors==4.0.0s
 Flask-Login==0.6.2
 Flask-Mail==0.9.1
 Flask-Migrate==4.0.4

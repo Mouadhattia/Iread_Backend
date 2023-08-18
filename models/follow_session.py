@@ -14,5 +14,6 @@ class Follow_session(db.Model):
     session_id=db.Column(db.ForeignKey(Session.id),primary_key=True)
     approved=db.Column(db.Boolean,default=False)
     
+    user = db.relationship(User, backref=db.backref('follow_session', cascade='all, delete-orphan'))
     def __repr__(self):
         return '< Follow_session %s >' %self.session_id

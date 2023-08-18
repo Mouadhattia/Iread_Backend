@@ -78,6 +78,7 @@ def register():
         username=request.json['username']
         email=request.json['email']
         password=request.json['password']
+       
         if user_email_exist(email):
             return jsonify({'message':'This email is already used . Please choose another'}),409 # Conflit
         else:
@@ -86,7 +87,7 @@ def register():
             db.session.add(new_user)
             db.session.commit()
             confirmation_token=generate_confirmed_token(email)
-            confirm_link = f"http://localhost:3001/reader/confirm/{confirmation_token}"
+            confirm_link = f"http://5.135.52.74:5003/reader/confirm/{confirmation_token}"
             #confirmation_email = render_template('confirm.html',username=username,confirm_link=confirm_link)
             msg = Message('Confirm your account', recipients=[email],sender=ConfigClass.MAIL_USERNAME)
             msg.body=confirm_link
@@ -137,7 +138,7 @@ def resend_email_confirmation_link():
             user=User.query.filter_by(email=email).first()
             username=user.username
             confirmation_token=generate_confirmed_token(email)
-            confirm_link = f"http://localhost:5000/reader/confirm/{confirmation_token}"
+            confirm_link = f"http://5.135.52.74:5003/reader/confirm/{confirmation_token}"
             #confirmation_email = render_template('confirm.html',username=username,confirm_link=confirm_link)
             msg = Message('Confirm your account', recipients=[email],sender=ConfigClass.MAIL_USERNAME)
             msg.body=confirm_link
@@ -304,7 +305,7 @@ def forget_password():
             return jsonify({'message':'Any account with this email'}),404
         else:
             confirmation_token=generate_confirmed_token(email)
-            confirm_link = f"http://localhost:5000/reader/password_reset/{confirmation_token}"
+            confirm_link = f"http://5.135.52.74:5003/reader/password_reset/{confirmation_token}"
             #confirmation_email = render_template('proof_your_identity.html',confirm_link=confirm_link)
             msg = Message('Proof your identity', recipients=[email],sender=ConfigClass.MAIL_USERNAME)
             msg.body=confirm_link
@@ -403,7 +404,7 @@ def set_email():
             user.confirmed=False
             db.session.commit()
             confirmation_token=generate_confirmed_token(new_email)
-            confirm_link = f"http://localhost:5000/reader/confirm/{confirmation_token}"
+            confirm_link = f"http://5.135.52.74:5003/reader/confirm/{confirmation_token}"
             #confirmation_email = render_template('confirm.html',username=user.username,confirm_link=confirm_link)
             msg = Message('Confirm your account', recipients=[new_email],sender=ConfigClass.MAIL_USERNAME)
             msg.body=confirm_link

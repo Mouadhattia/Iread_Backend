@@ -13,6 +13,7 @@ class Follow_pack(db.Model):
     pack_id=db.Column(db.ForeignKey(Pack.id),primary_key=True)
     approved=db.Column(db.Boolean,default=False)
     
+    user = db.relationship(User, backref=db.backref('follow_packs', cascade='all, delete-orphan'))
     def __repr__(self):
         return '< follow_pack %s >' %self.pack_id
 

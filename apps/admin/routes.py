@@ -7,7 +7,7 @@ from uuid import uuid4
 from flask import Blueprint,request,jsonify,abort,render_template
 from flask_login import logout_user,login_required,current_user
 from extensions import login_manager,mail,db
-
+from flask_bcrypt import Bcrypt
 from models.user import User,Reader,Teacher,Admin
 from models.book_pack import Book_pack
 from models.book import Book
@@ -16,7 +16,7 @@ from models.pack import Pack
 from models.follow_session import Follow_session
 from models.teacher_postulate import Teacher_postulate
 from models.follow_pack import Follow_pack
-
+import logging
 from apps.main.email import generate_confirmed_token
 from config import ConfigClass
 from flask_mail import Message
@@ -41,14 +41,19 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-
+def user_email_exist(email):
+    user=User.query.filter_by(email=email).first()
+    if user :
+        return True
+    else:
+        return False
 
 ## @brief Creation of the blueprint for user management by administrators.
 #
 # This blueprint defines routes and views for managing users by administrators.
 # The blueprint is registered with the URL prefix '/admin'.
 admin=Blueprint('admin',__name__,url_prefix='/admin')
-
+bcrypt=Bcrypt()
 login_manager.init_app(admin)
 
 ## @brief User loader function for login manager.
@@ -131,26 +136,99 @@ def confirm(token):
 # The response is a JSON object containing various user details such as email, username, confirmation status, and admin status.
 #
 # @return: A JSON object containing information about all users.
-@admin.route('/show_all_users')
+@admin.route('/show_all_readers')
 @login_required
 @admin_required
 def show_all_users():
     try:
-        admins = Admin.query.all()
-        teachers = Teacher.query.all()
+        # Retrieve all readers
         readers = Reader.query.all()
-        
-        admin_data = [{'email': admin.email, 'username': admin.username, 'confirmed': admin.confirmed} for admin in admins]
-        teacher_data = [{'email': teacher.email, 'username': teacher.username, 'confirmed': teacher.confirmed} for teacher in teachers]
-        reader_data = [{'email': reader.email, 'username': reader.username, 'confirmed': reader.confirmed} for reader in readers]
 
+        # Collect user data associated with each reader's ID
+        user_data = []
+        for reader in readers:
+            users = User.query.filter_by(id=reader.id).all()
+            user_data = [{'email': user.email, 'username': user.username, 'confirmed': user.confirmed,"id":user.id} for user in users]
+          
         return jsonify({
-            'admins': admin_data,
-            'teachers': teacher_data,
-            'readers': reader_data
-        }),200
-    except:
+            'readers': user_data
+        }), 200
+    except Exception as e:
+        return jsonify({'message': 'Internal server error'}), 5003
+@admin.route('/get_user/<int:user_id>', methods=['GET'])
+def get_user(user_id):
+    try:
+        user = User.query.get(user_id)
+        if user:
+            user_data = {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'confirmed': user.confirmed,
+                'created_at': user.created_at,
+                'type': user.type,
+                # Add other attributes as needed
+            }
+            return jsonify(user_data), 200
+        else:
+            return jsonify({'message': 'User not found'}), 404
+    except Exception as error:
         return jsonify({'message': 'Internal server error'}), 500
+
+@admin.route('/update_user',methods=['PUT'])
+@login_required
+@admin_required
+def update_user():
+    try:
+        data = request.json
+        user_id = data.get('id')
+        email = data.get('email')
+        username = data.get('username')
+        password = data.get('password')
+
+        user = User.query.get(user_id)
+        if user:
+            user.email = email
+            user.username = username
+            user.password_hash=bcrypt.generate_password_hash(password)
+            # Assuming you're using some sort of database session management, commit the changes
+            db.session.commit()
+
+            return jsonify({'message': 'Account updated successfully'}), 200
+        else:
+            return jsonify({'message': 'Invalid id'}), 404
+    except Exception as e:
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+
+
+@admin.route('/create_user',methods=['POST'])
+@login_required
+@admin_required
+def create_user():
+    try:
+
+      
+        username=request.json['username']
+        email=request.json['email']
+        password=request.json['password']
+       
+        if user_email_exist(email):
+            return jsonify({'message':'This email is already used . Please choose another'}),409 # Conflit
+        else:
+            password_hash=bcrypt.generate_password_hash(password)
+            new_user=Reader(username=username,email=email,password_hashed=password_hash,created_at=datetime.now(),confirmed=True,approved=True)
+            db.session.add(new_user)
+            db.session.commit()
+         
+          
+           
+       
+            return jsonify({'message':'Your account has been sucessfully create.Please verify your emailbox to confirm your account','user':{'username':username,'email':email}}),201
+    except Exception as e:
+        return jsonify({'message': 'Internal server error'}), 500
+
 
 @admin.route('/approved_user',methods=['POST'])
 @login_required
@@ -184,33 +262,19 @@ def approved_user():
 @admin_required
 def delete_user():
     try:
-        email=request.json['email']
-        user=User.query.filter_by(email=email).first()
+        id = request.json['id']
+        user = User.query.get(id)
+        
         if user:
-            follow_session=Follow_session.query.filter_by(id=user.id).first()
-            follow_pack=Follow_pack.query.filter_by(id=user.id).first()
-            db.session.delete(follow_session) if follow_session else None
-            db.session.delete(follow_pack) if follow_pack else None
-            db.session.commit()
-
-            if user.type=='reader':
-                db.session.delete( Reader.query.filter_by(id=user.id).first() ) if user.type=='reader' else None
-                db.session.commit()
-            elif user.type=='teacher':
-                db.session.delete( Teacher.query.filter_by(id=user.id).first() ) if user.type=='teacher' else None
-                db.session.commit()
-            else:
-                return jsonify({'message':'Can\'t not delete admin'}),200
-            
             db.session.delete(user)
             db.session.commit()
-
-            return jsonify({'message':'Account deleted sucessfully'}),200
-        else :
-            return jsonify({'message':'Invalid email'}),404
-    except:
+            return jsonify({'message': 'Account deleted successfully'}), 200
+        else:
+            return jsonify({'message': 'Invalid ID'}), 404
+    except Exception as e:
+        # Log the error
+        logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500
-
 
 
 ## @brief Route to revoke administrator roles from another administrator.
