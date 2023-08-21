@@ -16,3 +16,4 @@ class ConfigClass:
     MAIL_USERNAME='chretienkouete@gmail.com'
     MAIL_PASSWORD='xeevsiazcybdxwpg'
     MAIL_DEBUG=False
+    FRONT_URL = 'http://5.135.52.74'

@@ -11,13 +11,17 @@ from models.book_pack import Book_pack
 from models.session import Session
 from models.user import User,Teacher
 from models.pack import Pack,StatusEnum
-
+from flask_mail import Mail, Message
+from config import ConfigClass
+from flask import render_template
+import os
 ## @brief Blueprint for the main application.
 #
 # This blueprint is used to define routes and views for the main application.
 # The `main` blueprint is created with the provided `__name__` and will be used to register views later.
 #
 main=Blueprint('main',__name__,url_prefix='/main')
+mail =Mail()
 
 
 # Initialize the login manager for the main blueprint.
@@ -60,43 +64,47 @@ def load_user(user_id):
 # @login_required
 def search_books():
 
-    try:
-        token=request.json['id']
-        books=db.session.query(Book,Session).filter(Book.id==token,Session.start_date > datetime.now())
-        book=books.first()
-        
-        book_sessions=books.join(Session, Session.book_id==Book.id).all()
-        
-        sessions=[{
-            "id":book_session.Session.id,
-            "title":book_session.Session.name,
-            "start":book_session.Session.start_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
-            "end":book_session.Session.end_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
-            "teacher":Teacher.query.filter_by(id=book_session.Session.teacher_id).first().email,
-            "pack_id":book_session.Session.pack_id,
-            "extendedProps":{
-                "location":book_session.Session.location.value,
-                "description":book_session.Session.description,
-                "category":"primary"
-                } 
-                } for book_session in book_sessions]
-        
-        if book_sessions or book:
-            return jsonify({
-                'title':book.Book.title,
-                'author':book.Book.author,
-                'page_number':book.Book.page_number,
-                'release_date':book.Book.release_date,
-                'category':book.Book.category,
-                'img':book.Book.img,
-                'desc':book.Book.desc,
-                'sessions':[session for session in sessions]
-                    
-                }),200
+  try:
+        book_id=request.json['id']
+        book = Book.query.get(book_id)
+
+        if book:
+            sessions = Session.query.filter_by(book_id=book_id).filter(Session.start_date > datetime.now()).all()
+
+            book_info = {
+                'title': book.title,
+                'author': book.author,
+                'page_number': book.page_number,
+                'release_date': book.release_date,
+                'category': book.category,
+                'img': book.img,
+                'desc': book.desc
+            }
+
+            if sessions:
+                session_info = [{
+                    "id": session.id,
+                    "title": session.name,
+                    "start": session.start_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+                    "end": session.end_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+                    "teacher": Teacher.query.get(session.teacher_id).email,
+                    "pack_id": session.pack_id,
+                    "extendedProps": {
+                        "location": session.location.value,
+                        "description": session.description,
+                        "category": "primary"
+                    }
+                } for session in sessions]
+
+                book_info['sessions'] = session_info
+            else:
+                book_info['sessions'] = []
+
+            return jsonify(book_info), 200
         else:
-            return jsonify({'message': 'Book not found or no sessions associated with this book'}),404
-    except Exception as error:
-        return jsonify({'message': str(error)}),500
+            return jsonify({'message': 'Book not found'}), 404
+  except Exception as error:
+        return jsonify({'message': str(error)}), 500
 
 
 ## @brief Route for retrieving a specific page from a book.
@@ -269,3 +277,49 @@ def get_books_from_pack():
         return jsonify({'books_in_pack': book_list}), 200
     else:
         return jsonify({'message': 'Pack not found'}), 404
+from flask import request
+
+@main.route('/send_email', methods=['POST'])
+def send_email():
+    try:
+        # Get user input from the request's JSON data
+        first_name = request.json.get('first_name')
+        last_name = request.json.get('last_name')
+        email = request.json.get('email')
+        phone = request.json.get('phone')
+        subject = request.json.get('subject')
+        message = request.json.get('message')
+
+        # Send an email to the customer
+        customer_msg = Message(
+            subject='Your Email Has Been Sent Successfully',
+            sender=ConfigClass.MAIL_USERNAME,
+            recipients=[email],
+        )
+
+        # Build the email message body for the customer
+        customer_html_body = render_template('customer_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message)
+
+        # Send the email to the customer
+        customer_msg.html = customer_html_body
+        mail.send(customer_msg)
+
+        # Send an email to yourself
+        admin_msg = Message(
+            subject='New Email Sent',
+            sender=ConfigClass.MAIL_USERNAME,
+            recipients=["attiamou3adh@gmail.com"],  # Replace with your admin email address
+        )
+
+        # Build the email message body for the admin
+        admin_html_body = render_template('admin_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message)
+
+        # Send the email to yourself
+        admin_msg.html = admin_html_body
+        mail.send(admin_msg)
+
+        return jsonify({'message': 'Email sent successfully'}), 200
+
+    except Exception as error:
+        print(str(error))  # Print the error message for debugging
+        return jsonify({'message': 'Something Went Wrong Please Try Again Later .'}), 500

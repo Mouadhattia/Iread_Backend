@@ -65,8 +65,12 @@ from flask_migrate import Migrate
 ## @brief Create the Flask application instance.
 app=Flask(__name__)
 
-
 CORS(app, resources={r"/*": {"origins": "*", "supports_credentials": True}})
+
+
+
+
+
 
 ## @brief Configure the application using the configuration class from the config.py file.
 app.config.from_object(ConfigClass)

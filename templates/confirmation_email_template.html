@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <style>
+      /* Reset some default styles */
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+      }
+
+      /* Container for the email content */
+      .container {
+        background-color: #f5f5f5;
+        padding: 20px;
+      }
+
+      /* Style the heading */
+      h1 {
+        color: #754ffe;
+      }
+
+      /* Style the paragraphs */
+      p {
+        color: #333;
+        line-height: 1.6;
+      }
+
+      /* Style the button */
+      .button {
+        display: inline-block;
+        padding: 10px 20px;
+        background-color: #6343d8;
+        color: #fff;
+        border-radius: 5px;
+        margin-top: 20px;
+        text-decoration: none;
+      }
+
+      /* Style the logo */
+      .logo {
+        max-width: 200px;
+        height: auto;
+      }
+      .footer {
+        text-align: center;
+        background-color: #333;
+        color: #fff;
+        padding: 10px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <!-- Logo -->
+      <img
+        src="http://5.135.52.74/static/media/logo.983a90038cdf0aa20e6f.png"
+        alt="Your Logo"
+        class="logo"
+      />
+
+      <h1>Confirm Your Account</h1>
+      <p>Hello {{ username }},</p>
+      <p>
+        Thank you for registering with us. Please click the link below to
+        confirm your account:
+      </p>
+      <p>
+        <a class="button" style="color: #fff" href="{{ confirm_link }}"
+          >Confirm Account</a
+        >
+      </p>
+      <p>If you didn't register on our platform, you can ignore this email.</p>
+    </div>
+    <div class="footer">
+      &copy; 2023 IRead. All rights reserved.
+      <a href="http://5.135.52.74">IRead.tn</a>
+    </div>
+  </body>
+</html>

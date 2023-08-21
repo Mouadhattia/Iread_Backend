@@ -88,13 +88,13 @@ def register():
             db.session.commit()
             confirmation_token=generate_confirmed_token(email)
             confirm_link = f"http://5.135.52.74:5003/reader/confirm/{confirmation_token}"
-            #confirmation_email = render_template('confirm.html',username=username,confirm_link=confirm_link)
-            msg = Message('Confirm your account', recipients=[email],sender=ConfigClass.MAIL_USERNAME)
-            msg.body=confirm_link
-            #msg.html = confirmation_email
+            confirmation_email = render_template('confirmation_email_template.html', username=username, confirm_link=confirm_link)
+            msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
+            msg.html = confirmation_email
             mail.send(msg)
             return jsonify({'message':'Your account has been sucessfully create.Please verify your emailbox to confirm your account','user':{'username':username,'email':email}}),201
     except Exception as error:
+        print(str(error))  # Print the error message for debugging
         return jsonify({'message':'Internal serveur error'}),500
 
 ## @brief Route for confirming the account based on the received email.
@@ -139,10 +139,9 @@ def resend_email_confirmation_link():
             username=user.username
             confirmation_token=generate_confirmed_token(email)
             confirm_link = f"http://5.135.52.74:5003/reader/confirm/{confirmation_token}"
-            #confirmation_email = render_template('confirm.html',username=username,confirm_link=confirm_link)
-            msg = Message('Confirm your account', recipients=[email],sender=ConfigClass.MAIL_USERNAME)
-            msg.body=confirm_link
-            #msg.html = confirmation_email
+            confirmation_email = render_template('confirmation_email_template.html', username=username, confirm_link=confirm_link)
+            msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
+            msg.html = confirmation_email
             mail.send(msg)
         else:
             return jsonify({'message':'Invalid email or you are not already regiter?'}),404

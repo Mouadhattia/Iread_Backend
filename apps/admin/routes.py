@@ -137,8 +137,8 @@ def confirm(token):
 #
 # @return: A JSON object containing information about all users.
 @admin.route('/show_all_readers')
-@login_required
-@admin_required
+# @login_required
+# @admin_required
 def show_all_users():
     try:
         # Retrieve all readers
@@ -148,14 +148,53 @@ def show_all_users():
         user_data = []
         for reader in readers:
             users = User.query.filter_by(id=reader.id).all()
-            user_data = [{'email': user.email, 'username': user.username, 'confirmed': user.confirmed,"id":user.id} for user in users]
-          
+            for user in users:
+                user_data.append({
+                    'email': user.email,
+                    'username': user.username,
+                    'confirmed': user.confirmed,
+                    'id': user.id,
+                    'img':user.img,
+                    'approved':user.approved
+                })
+
         return jsonify({
             'readers': user_data
         }), 200
     except Exception as e:
         return jsonify({'message': 'Internal server error'}), 5003
+
+# get all teachers
+@admin.route('/show_all_teachers')
+# @login_required
+# @admin_required
+def show_all_teacher():
+    try:
+        # Retrieve all teachers
+        teachers = Teacher.query.all()
+
+        # Collect user data associated with each teacher's ID
+        user_data = []
+        for teacher in teachers:
+            users = User.query.filter_by(id=teacher.id).all()
+            for user in users:
+                user_data.append({
+                    'email': user.email,
+                    'username': user.username,
+                    'confirmed': user.confirmed,
+                    'id': user.id,
+                    'img':user.img,
+                    'approved':user.approved
+                })
+
+        return jsonify({
+            'teachers': user_data
+        }), 200
+    except Exception as e:
+        return jsonify({'message': 'Internal server error'}), 5003
 @admin.route('/get_user/<int:user_id>', methods=['GET'])
+# @login_required
+# @admin_required
 def get_user(user_id):
     try:
         user = User.query.get(user_id)
@@ -175,26 +214,42 @@ def get_user(user_id):
     except Exception as error:
         return jsonify({'message': 'Internal server error'}), 500
 
-@admin.route('/update_user',methods=['PUT'])
-@login_required
-@admin_required
+@admin.route('/update_user', methods=['PUT'])
+# @login_required
+# @admin_required
 def update_user():
     try:
         data = request.json
         user_id = data.get('id')
-        email = data.get('email')
-        username = data.get('username')
-        password = data.get('password')
 
         user = User.query.get(user_id)
         if user:
-            user.email = email
-            user.username = username
-            user.password_hash=bcrypt.generate_password_hash(password)
+            if 'username' in data:
+                user.username = data['username']
+            if 'email' in data:
+                user.email = data['email']
+            if 'password' in data:
+                if data['password'] != "":
+                    user.password_hashed = bcrypt.generate_password_hash(data['password'])
+                else:
+                    return jsonify({'message': 'Password cannot be empty'}), 400  # Return a response for an empty password
+
             # Assuming you're using some sort of database session management, commit the changes
             db.session.commit()
+            response_data = {
+            'message': 'Teacher updated successfully',
+            'teacher': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'img': user.img,
+                'approved': user.approved,
+                
+            }
+        }
+            return jsonify(response_data), 200  # OK
 
-            return jsonify({'message': 'Account updated successfully'}), 200
+            
         else:
             return jsonify({'message': 'Invalid id'}), 404
     except Exception as e:
@@ -204,39 +259,176 @@ def update_user():
 
 
 @admin.route('/create_user',methods=['POST'])
-@login_required
-@admin_required
+# @login_required
+# @admin_required
 def create_user():
     try:
+        # Get data from the request
+        data = request.get_json()
+        username = data['username']
+        email = data['email']
+        password = data['password']
 
-      
-        username=request.json['username']
-        email=request.json['email']
-        password=request.json['password']
-       
-        if user_email_exist(email):
-            return jsonify({'message':'This email is already used . Please choose another'}),409 # Conflit
+        # Check if the email already exists
+        if Reader.query.filter_by(email=email).first():
+            return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
         else:
-            password_hash=bcrypt.generate_password_hash(password)
-            new_user=Reader(username=username,email=email,password_hashed=password_hash,created_at=datetime.now(),confirmed=True,approved=True)
+            # Hash the password
+            password_hash = bcrypt.generate_password_hash(password)
+
+            # Create a new user
+            new_user = Reader(
+                username=username,
+                email=email,
+                password_hashed=password_hash,
+                created_at=datetime.now(),
+                confirmed=True,
+
+               
+            )
+
+            # Add the user to the database
             db.session.add(new_user)
             db.session.commit()
-         
-          
-           
-       
-            return jsonify({'message':'Your account has been sucessfully create.Please verify your emailbox to confirm your account','user':{'username':username,'email':email}}),201
+
+            # Return a success response
+            response_data = {
+                'message': 'Your account has been successfully created.',
+                'user': {
+                    'username': username,
+                    'email': email,
+                    'confirmed': new_user.confirmed,
+                    'id': new_user.id,
+                    'img':new_user.img,
+                  
+                }
+            }
+            return jsonify(response_data), 201
     except Exception as e:
+        # Handle exceptions and return an error response
         return jsonify({'message': 'Internal server error'}), 500
 
 
+@admin.route('/create_teacher',methods=['POST'])
+# @login_required
+# @admin_required
+def create_teacher():
+    try:
+        # Get data from the request
+        data = request.get_json()
+        username = data['username']
+        email = data['email']
+        password = data['password']
+        description = data['description']
+        study_level = data['study_level']
+
+        # Check if the email already exists
+        if Teacher.query.filter_by(email=email).first():
+            return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
+        else:
+            # Hash the password
+            password_hash = bcrypt.generate_password_hash(password)
+
+            # Create a new user
+            new_user = Teacher(
+                username=username,
+                email=email,
+                password_hashed=password_hash,
+                created_at=datetime.now(),
+                description =description,
+                study_level= study_level,
+                confirmed=True,
+               
+            )
+
+            # Add the user to the database
+            db.session.add(new_user)
+            db.session.commit()
+
+            # Return a success response
+            response_data = {
+                'message': 'Your account has been successfully created.',
+                'user': {
+                    'username': username,
+                    'email': email,
+                    'confirmed': new_user.confirmed,
+                    'id': new_user.id,
+                    'img':new_user.img,
+                    'description' :new_user.description,
+                    'study_level' : new_user.study_level
+
+                }
+            }
+            return jsonify(response_data), 201
+    except Exception as e:
+        # Handle exceptions and return an error response
+        logging.error(f"An error occurred: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+
+@admin.route('/update_teacher', methods=['PUT'])
+# @login_required
+# @admin_required
+
+
+def update_teacher():
+
+    data = request.json
+    teacher_id = data.get('id')
+    try:
+        # Get the teacher by their ID
+        teacher = Teacher.query.get(teacher_id)
+
+        if not teacher:
+            return jsonify({'message': 'Teacher not found'}), 404  # Not Found
+
+        # Get data from the request
+       
+        # You can update any fields you want here
+        if 'username' in data:
+            teacher.username = data['username']
+        if 'email' in data:
+            teacher.email = data['email']
+        if 'password' in data:
+            # Hash the new password
+            teacher.password_hashed = bcrypt.generate_password_hash(data['password'])
+        if 'description' in data:
+            teacher.description = data['description']
+        if 'study_level' in data:
+            teacher.study_level = data['study_level']
+
+        # Commit the changes to the database
+        db.session.commit()
+
+        # Return a success response
+        response_data = {
+            'message': 'Teacher updated successfully',
+            'teacher': {
+                'id': teacher.id,
+                'username': teacher.username,
+                'email': teacher.email,
+                'img': teacher.img,
+                'description': teacher.description,
+                'study_level': teacher.study_level
+            }
+        }
+        return jsonify(response_data), 200  # OK
+
+    except Exception as e:
+        # Handle exceptions and return an error response
+        logging.error(f"An error occurred: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+
 @admin.route('/approved_user',methods=['POST'])
-@login_required
-@admin_required
+# @login_required
+# @admin_required
 def approved_user():
     try:
-        email=request.json['email']
-        user=User.query.filter_by(email=email).first()
+        id=request.json['id']
+        user=User.query.filter_by(id=id).first()
         if user:
             if user.confirmed:
                 user.approved=True
@@ -245,8 +437,9 @@ def approved_user():
             else:
                 return jsonify({'message':'The user doesn\'t confirmed his account'}),400
         else :
-            return jsonify({'message':'Invalid email'}),404
-    except:
+            return jsonify({'message':'Invalid id'}),404
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500
 
 ## @brief Route to delete a user's account.
@@ -258,8 +451,8 @@ def approved_user():
 # @param email: The email of the user whose account needs to be deleted.
 # @return: A JSON object indicating whether the account deletion was successful or not.
 @admin.route('/delete_user',methods=['POST'])
-@login_required
-@admin_required
+# @login_required
+# @admin_required
 def delete_user():
     try:
         id = request.json['id']
