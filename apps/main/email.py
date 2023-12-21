@@ -36,7 +36,8 @@ def reader_confirm_token(token):
         return False
     reader=Reader.query.filter_by(email=data.get('confirm')).first()
     if reader:
-        reader.confirmed=True
+        reader.confirmed = True
+        reader.approved = True
         db.session.commit()
         return data.get('confirm')
     else:

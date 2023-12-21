@@ -22,6 +22,8 @@ class User(db.Model, UserMixin):
     approved = db.Column(db.Boolean, default=False)
     created_at=db.Column(db.Date,nullable=False,default=datetime.now())
     type = db.Column(db.String(20))
+    quiz_id=db.Column(db.Integer)
+
 
     __mapper_args__ = {
         'polymorphic_on': type,
@@ -84,3 +86,12 @@ class Admin(User):
    
     def __repr__(self):
         return '<Admin %s>' % self.username
+class Assistant(User):
+    __tablename__ = "assistant"
+    id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    __mapper_args__ = {'polymorphic_identity': 'assistant'}
+    
+
+   
+    def __repr__(self):
+        return '<Assistant %s>' % self.username

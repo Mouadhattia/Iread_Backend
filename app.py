@@ -46,30 +46,20 @@
 # @section contact Contact
 # For any inquiries or support, please contact the development team at <intellectgabes@gmail.com>.
 
-
 ## @file
 from flask import Flask
 from flask_cors import CORS
-from models.user import User,Reader,Teacher,Admin
-from models.book import Book
-from models.book_pack import Book_pack
-from models.session import Session
-from models.follow_pack import Follow_pack
-from models.pack import Pack
-from models.follow_session import Follow_session
-from models.teacher_postulate import Teacher_postulate
 from config import ConfigClass
 from extensions import mail,login_manager,db
 from flask_migrate import Migrate
+from flask_oauthlib.client import OAuth
+
 
 ## @brief Create the Flask application instance.
 app=Flask(__name__)
 
-CORS(app, resources={r"/*": {"origins": "*", "supports_credentials": True}})
-
-
-
-
+CORS(app, resources={r"*": {"origins":"*", "supports_credentials": True}})
+oauth = OAuth(app)
 
 
 ## @brief Configure the application using the configuration class from the config.py file.
@@ -85,7 +75,8 @@ login_manager.init_app(app)
 # @param app: The application instance.
 db.init_app(app)
 
-## @brief Database migration.
+
+
 migrate=Migrate(app,db)
 
 from apps.reader.routes import reader
@@ -104,4 +95,4 @@ app.register_blueprint(admin)
 app.register_blueprint(main)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5003)  # Change the port to your desired port number
+    app.run(host='0.0.0.0', port=5003)  

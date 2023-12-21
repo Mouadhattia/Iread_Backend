@@ -189,6 +189,8 @@ These prerequisites ensure that you have the necessary tools and software to set
     - To specify a different port (e.g., port 3001), use:
       ```
       flask run --debug --port 3001
+
+
       ```
     - The default port used by Flask is 5000.
 
@@ -227,3 +229,11 @@ This project is licensed under the [MIT License](LICENSE).
 ## Contact
 
 For questions or support, please email us at teamintellect@gmail.com.
+
+
+## deploy 
+run server 
+nohup python app.py > app.log 2>&1 &
+
+stop server 
+ps aux | grep "python app.py"

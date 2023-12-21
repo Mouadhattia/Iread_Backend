@@ -13,7 +13,7 @@ class Book(db.Model):
     token=db.Column(db.String(36),unique=True)
     title=db.Column(db.String(100))
     img=db.Column(db.String(200))
-    desc=db.Column(db.String(200))
+    desc=db.Column(db.String(1000))
     author=db.Column(db.String(100),nullable=False)
     img=db.Column(db.String(300),nullable=True)
     release_date=db.Column(db.Date,nullable=True)

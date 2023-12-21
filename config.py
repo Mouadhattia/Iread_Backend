@@ -5,15 +5,19 @@ import os
 
 ## @brief Configuration of the mysql database and parameters for sending email.
 class ConfigClass:
-    SQLALCHEMY_DATABASE_URI='mysql://root:''@localhost/iread'
+    SQLALCHEMY_DATABASE_URI='mysql://root:''@localhost/testaa'
     SECRET_KEY=os.environ.get('SECRET_KEY') or 'password'
     SQLALCHEMY_TRACK_MODIFICATIONS=True
+    MAIL_SERVER='smtp.office365.com' 
+    MAIL_PORT=587 
+    MAIL_USE_SSL=False  
+    MAIL_USE_TLS=True 
+    MAIL_USERNAME='contact@intellect.education' 
+    MAIL_PASSWORD='xyydcyfddsdwfdfn'
+    MAIL_DEBUG=False 
+    FRONT_URL = 'http://iread.tn'
+    API_URL= 'http://localhost:5003'
+    QUIZ_API = 'http://quiz.iread.tn/api/'
 
-    MAIL_SERVER='smtp.googlemail.com'
-    MAIL_PORT=465 #465
-    MAIL_USE_SSL=True #True
-    MAIL_USE_TLS=False #False
-    MAIL_USERNAME='chretienkouete@gmail.com'
-    MAIL_PASSWORD='xeevsiazcybdxwpg'
-    MAIL_DEBUG=False
-    FRONT_URL = 'http://5.135.52.74'
+    # Set the session lifetime to 1 hour (3600 seconds)
+    PERMANENT_SESSION_LIFETIME = 3600

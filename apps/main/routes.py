@@ -10,7 +10,9 @@ from models.book import Book
 from models.book_pack import Book_pack
 from models.session import Session
 from models.user import User,Teacher
+from models.follow_pack import Follow_pack
 from models.pack import Pack,StatusEnum
+from models.code import Code, StatusEnum as CodeStatusEnum
 from flask_mail import Mail, Message
 from config import ConfigClass
 from flask import render_template
@@ -183,9 +185,9 @@ def show_session_details():
 @main.route('/show_all_pack')
 def show_all_pack():
     try:
-        age_filter = request.args.get('age')  # Get the 'age' parameter from the request's query parameters
-        title_search = request.args.get('title')  # Get the 'title' parameter from the request's query parameters
-
+        age_filter = request.args.get('age') 
+        title_search = request.args.get('title') 
+        
         age_enum_values = [age.value for age in StatusEnum]
 
         packs_query = Pack.query
@@ -195,10 +197,13 @@ def show_all_pack():
             packs_query = packs_query.filter(Pack.title.ilike(f'%{title_search}%'))
 
         packs = packs_query.all()
-
+       
         if packs:
-            return jsonify({'packs': [
-                {
+            packs_info = []
+            for pack in packs:
+                enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
+                num_active_codes = Code.query.filter_by(pack_id=pack.id, status=CodeStatusEnum.ACTIVE).count()
+                pack_info = {
                     'id': pack.id,
                     'title': pack.title,
                     'level': pack.level,
@@ -206,10 +211,16 @@ def show_all_pack():
                     'price': pack.price,
                     'img': pack.img,
                     'book_number': pack.book_number,
-                    'discount': pack.discount
+                    'discount': pack.discount,
+                    'faq': pack.faq,
+                    'codes': num_active_codes ,
+                    'enrolled' :enrolled,
+                    'duration':pack.duration
+                    
                 }
-                for pack in packs
-            ]}), 200
+                packs_info.append(pack_info)
+
+            return jsonify({'packs': packs_info}), 200
         else:
             return jsonify({'message': 'No packs available'}), 200
     except Exception as e:
@@ -223,7 +234,8 @@ def get_pack_details():
       
         
         pack = Pack.query.get(pack_id) 
-        
+        enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
+        num_active_codes = Code.query.filter_by(pack_id=pack.id, status=CodeStatusEnum.ACTIVE).count()
         if pack:
             return jsonify({
                 'id': pack.id,
@@ -234,7 +246,11 @@ def get_pack_details():
                 'img': pack.img,
                 'book_number': pack.book_number,
                 'discount': pack.discount,
-                'desc':pack.desc
+                'desc':pack.desc,
+                'faq':pack.faq,
+                'code':num_active_codes,
+                'enrolled' : enrolled,
+                'duration':pack.duration
             }), 200
         else:
             return jsonify({'message': 'Pack not found'}), 404
@@ -270,6 +286,7 @@ def get_books_from_pack():
                 'category': book.category,
                 'desc' : book.desc,
                 'img' :book.img
+               
             }
             for book in books_in_pack
         ]
@@ -308,11 +325,56 @@ def send_email():
         admin_msg = Message(
             subject='New Email Sent',
             sender=ConfigClass.MAIL_USERNAME,
-            recipients=["attiamou3adh@gmail.com"],  # Replace with your admin email address
+            recipients=[ConfigClass.MAIL_USERNAME],  
         )
 
         # Build the email message body for the admin
         admin_html_body = render_template('admin_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message)
+
+        # Send the email to yourself
+        admin_msg.html = admin_html_body
+        mail.send(admin_msg)
+
+        return jsonify({'message': 'Email sent successfully'}), 200
+
+    except Exception as error:
+        print(str(error))  # Print the error message for debugging
+        return jsonify({'message': 'Something Went Wrong Please Try Again Later .'}), 500
+
+@main.route('/intellect_send_email', methods=['POST'])
+def intellect_send_email():
+    try:
+        # Get user input from the request's JSON data
+        first_name = request.json.get('first_name')
+        last_name = request.json.get('last_name')
+        email = request.json.get('email')
+        phone = request.json.get('phone')
+        subject = request.json.get('subject')
+        message = request.json.get('message')
+
+        # Send an email to the customer
+        customer_msg = Message(
+            subject='Your Email Has Been Sent Successfully',
+            sender=ConfigClass.MAIL_USERNAME,
+            recipients=[email],
+        )
+
+        # Build the email message body for the customer
+        customer_html_body = render_template('intellect_customer_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message)
+
+        # Send the email to the customer
+        customer_msg.html = customer_html_body
+        mail.send(customer_msg)
+
+        # Send an email to yourself
+        admin_msg = Message(
+            subject='New Email Sent',
+            sender=ConfigClass.MAIL_USERNAME,
+            recipients=[ConfigClass.MAIL_USERNAME],  
+        )
+
+        # Build the email message body for the admin
+        admin_html_body = render_template('intellect_admin_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message)
 
         # Send the email to yourself
         admin_msg.html = admin_html_body

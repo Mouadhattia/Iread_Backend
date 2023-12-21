@@ -1,0 +1,52 @@
+{
+    "category": "History",
+    "quiz": {
+        "title": "History Quiz",
+        "description": "Test your knowledge of historical events!",
+        "max_questions": 15,
+        "pass_mark": 70
+    },
+    "questions": [
+        {
+            "question_type": "MCQ",
+            "content": "Who was the first President of the United States?",
+            "explanation": "George Washington was the first President of the United States.",
+            "answers": [
+                {"content": "Thomas Jefferson", "correct": false},
+                {"content": "John Adams", "correct": false},
+                {"content": "George Washington", "correct": true},
+                {"content": "Benjamin Franklin", "correct": false}
+            ],
+            "question-category": "American History",
+            "mark": 30
+        },
+        {
+            "question_type": "ESQ",
+            "content": "Explain the causes and consequences of World War II.",
+            "explanation": "World War II was a global conflict that lasted from 1939 to 1945. It was primarily caused by the expansionist policies of Nazi Germany, led by Adolf Hitler, and resulted in significant changes in world politics and the devastation of many countries.",
+            "question-category": "World History",
+            "mark": 30
+        },
+        {
+            "question_type": "TFQ",
+            "content": "The French Revolution began in the 18th century.",
+            "explanation": "True. The French Revolution started in 1789 and continued into the 19th century.",
+            "correct": true,
+            "question-category": "European History",
+            "mark": 20
+        },
+        {
+            "question_type": "MCQ",
+            "content": "Who wrote 'The Communist Manifesto'?",
+            "explanation": "Karl Marx and Friedrich Engels co-authored 'The Communist Manifesto' in 1848.",
+            "answers": [
+                {"content": "Vladimir Lenin", "correct": false},
+                {"content": "Karl Marx", "correct": true},
+                {"content": "Joseph Stalin", "correct": false},
+                {"content": "Mao Zedong", "correct": false}
+            ],
+            "question-category": "Political History",
+            "mark": 20
+        }
+    ]
+}

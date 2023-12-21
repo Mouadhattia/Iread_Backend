@@ -13,6 +13,7 @@ class Follow_session(db.Model):
     user_id=db.Column(db.ForeignKey(User.id),primary_key=True)
     session_id=db.Column(db.ForeignKey(Session.id),primary_key=True)
     approved=db.Column(db.Boolean,default=False)
+    presence = db.Column(db.Boolean,default=False)
     
     user = db.relationship(User, backref=db.backref('follow_session', cascade='all, delete-orphan'))
     def __repr__(self):
