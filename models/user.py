@@ -22,7 +22,7 @@ class User(db.Model, UserMixin):
     approved = db.Column(db.Boolean, default=False)
     created_at=db.Column(db.Date,nullable=False,default=datetime.now())
     type = db.Column(db.String(20))
-    quiz_id=db.Column(db.Integer)
+    quiz_id=db.Column(db.String(100))
 
 
     __mapper_args__ = {

@@ -37,6 +37,8 @@ import random
 import spacy
 from apps.admin.paserStory import get_tenses_words
 
+from apps.admin.graphDBscripts.db import Neo4jDriver,DataSetDB
+
 
 
 ## @brief Decorator to enforce admin access for a view function.
@@ -297,12 +299,13 @@ def update_user():
                 if User.query.filter(User.email == new_email, User.id != user_id).first():
                     return jsonify({'message': 'Email is already in use'}), 400
                 user.email = new_email
-                
-            if 'password' in data:
-                if data['password'] != "":
-                    user.password_hashed = bcrypt.generate_password_hash(data['password'])
-                else:
-                    return jsonify({'message': 'Password cannot be empty'}), 400  # Return a response for an empty password
+            if 'quiz_id' in data :
+                user.quiz_id =data['quiz_id']    
+            # if 'password' in data:
+            #     if data['password'] != "":
+            #         user.password_hashed = bcrypt.generate_password_hash(data['password'])
+            #     else:
+            #         return jsonify({'message': 'Password cannot be empty'}), 400 
 
             # Assuming you're using some sort of database session management, commit the changes
             db.session.commit()
@@ -2489,6 +2492,8 @@ def get_users_in_pack():
 def paser_story():
     try:
         text = request.json['text']
+
+        print(text)
         words= get_tenses_words(text)
         
         return jsonify({
@@ -2499,7 +2504,27 @@ def paser_story():
         logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500   
 
-             
+            
+@admin.route('/get_word',methods=['POST'])
+# @login_required
+# @admin_required
+def get_word():
+    try:
+        word = request.json['word']
+        driver =Neo4jDriver().get_driver()
+        result = DataSetDB.get_word_from_db(driver,word)
+
+        if result.get('code') is not None and  result['code']  == 400:
+            return jsonify({'message': result['message']}), 404  
+     
+        return jsonify({
+            "res":result
+        }), 200
+    except Exception as e:
+        # Log the error
+        logging.error(f"An error occurred: {str(e)}")
+        return jsonify({'message': 'Internal server error','e':{str(e)}}), 500  
+
 
 '''
 

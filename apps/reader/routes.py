@@ -135,72 +135,20 @@ def register():
             db.session.add(new_user)
             
 
-            # Call the external API to register a user and include the CSRF token in the headers
-            registration_data = {
-                'username': username,
-                'email': email,
-                'password': password
-            }
-            registration_data = json.dumps(registration_data).encode('utf-8')
-            try:
-                url = f'{ConfigClass.QUIZ_API}user/register'
-                req = urllib.request.Request(url, data=registration_data, headers={'X-CSRFToken': csrf_token, 'Content-Type': 'application/json'})
-                response = opener.open(req)  # Use the opener to include the cookies
-                response_data = json.loads(response.read().decode('utf-8'))
-                user_id = response_data.get('user', {}).get('id')
-                
-            except urllib.error.HTTPError as e:
-               response_data = json.loads(e.read().decode('utf-8'))
-               
-               error_message = response_data.get('message', 'Bad Request')
-               if error_message =="UNIQUE constraint failed: users_user.username":
-                return jsonify({'message': 'User name already exists'}),400
-               else : 
-                return jsonify({'message': error_message}),400
-                     
-            db.session.commit()
-            if user_id is not None:
-                # Associate the user_id with the Reader object
-                new_user.quiz_id = user_id
-                db.session.commit()
-                #logs 
-
-
-                # user_agent = request.headers.get('User-Agent')
-                # user_ip = request.remote_addr
-                # referer = request.headers.get('Referer')
-                # user_country = "Unknown"  # Default value
-                # user_city = "Unknown"  # Default value
-
-                # with Beader('/var/www/html/Iread_Backend/GeoLite2-City/GeoLite2-City.mmdb') as test:
-
-                #   try:
-
-                #     response = test.city(user_ip)
-                #     user_country = response.country.name
-                #     user_city = response.city.name
-                
-                #   except Exception as geo_error:
-                #     print(f"Error looking up IP: {geo_error}")
-
-                #   user_log = UserLog(user_agent=user_agent, user_ip=user_ip, referer=referer, user_country=user_country, user_city=user_city)
-                #   db.session.add(user_log)
-                #   db.session.commit()
+   
 
                 # Send a confirmation email as before
-                confirmation_token = generate_confirmed_token(email)
-                confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
-                confirmation_email = render_template('confirmation_email_template.html', username=username,
+            confirmation_token = generate_confirmed_token(email)
+            confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
+            confirmation_email = render_template('confirmation_email_template.html', username=username,
                                                       confirm_link=confirm_link)
-                msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
-                msg.html = confirmation_email
-                mail.send(msg)
+            msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
+            msg.html = confirmation_email
+            mail.send(msg)
 
-                return jsonify({'message': 'Your account has been successfully created. Please verify your emailbox to confirm your account',
+            return jsonify({'message': 'Your account has been successfully created. Please verify your emailbox to confirm your account',
                                 'user': {'username': username, 'email': email}}), 201
-            else:
-                # Handle the case where registration in the external API failed
-                return jsonify({'message': 'Failed to register user in external API'}), 500
+            
 
     except Exception as error:
         print(str(error))  # Print the error message for debugging
@@ -448,11 +396,11 @@ def login():
 def user_authenticate():
     
     try:
-
+        print(current_user.is_authenticated)
         if current_user.is_authenticated:
             return jsonify({'is_authenticated':current_user.is_authenticated,'username':current_user.username,'email':current_user.email,'img':current_user.img,'role':current_user.type,'quiz_id':current_user.quiz_id,'id':current_user.id})
         else:
-            return jsonify({'is_authenticated':current_user.is_authenticated})
+            return jsonify({'is_authenticated':current_user.is_authenticated}),400
     except Exception as error:
         return jsonify({'message':'Internal serveur error',"error":error}),500
 

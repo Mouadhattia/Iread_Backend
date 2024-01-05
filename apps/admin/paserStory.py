@@ -9,14 +9,20 @@ def get_tenses_words(text):
     doc = nlp(text)
 
     words = []
+ 
+    
+    for  token in doc:
+       
 
-    for token in doc:
+       
+         
         if token.pos_ == "VERB" or token.tag_ == "MD" or (token.pos_ == "AUX" and token.dep_ == "aux"):
             # Extract relevant information
             word = token.text
             lemma = token.lemma_
             pos = token.pos_
             tag = token.tag_
+            
 
             # Initialize tense as Unknown
             tense = "Unknown"
@@ -60,14 +66,14 @@ def get_tenses_words(text):
                 tense = "Present Perfect Continuous"
             # Additional logic for other tenses could be added here
 
-            words.append({"word": word, "lemma": lemma, "pos": pos, "tag": tag, "tense": tense})
+            words.append({"index":token.i,"word": word, "lemma": lemma, "pos": pos, "tag": tag, "tense": tense,"checked":0,"approved":0})
             #print({"word": word, "lemma": lemma, "pos": pos, "tag": tag, "tense": tense})
         else:
             word = token.text
             lemma = token.lemma_
             pos = token.pos_
             tag = token.tag_
-            words.append({"word": word, "lemma": lemma, "pos": pos, "tag": tag})
+            words.append({"index":token.i,"word": word, "lemma": lemma, "pos": pos, "tag": tag,"checked":0,"approved":0})
     return  words
 
 def main():
