@@ -115,28 +115,16 @@ def register():
         password = request.json['password']
 
         if user_email_exist(email):
+
             return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
         else:
-            # Make a GET request to obtain the CSRF token
-            token_url = f'{ConfigClass.QUIZ_API}user/get_csrf_token'
-            token_req = urllib.request.Request(token_url)
-
-            
-            opener = get_cookies()
-            
-            # Perform the GET request with the CookieJar
-            token_response = opener.open(token_req)
-            response_toekn = json.loads(token_response.read().decode('utf-8'))
-            csrf_token = response_toekn.get('csrf_token')
-
             # Create a new user in your Flask application
             password_hash = bcrypt.generate_password_hash(password)
+           
             new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now())
-            db.session.add(new_user)
             
-
-   
-
+            db.session.add(new_user)
+            db.session.commit()
                 # Send a confirmation email as before
             confirmation_token = generate_confirmed_token(email)
             confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
@@ -365,21 +353,26 @@ def get_cookies_fun():
 
 
 
-@reader.route('/login',methods=['POST'])
-def login():
-    
-    try:
-       
-        
+@reader.route('/login_client',methods=['POST'])
+def login_client():   
+    try:    
         email=request.json['email']
         password=request.json['password']
         user=User.query.filter_by(email=email).first()
-
+        accounts =User.query.filter_by(email=email).all()
+      
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
                     login_user(user)
-                    return jsonify({'message':'Your are logged in succesfully','role':user.type}),200
+                    accountsData=[]
+                    for account in accounts:
+                        accountsData.append({
+                            "username":account.username,  
+                            "email":account.email,
+                            "img":account.img
+                        })          
+                    return jsonify({'message':'Your are logged in succesfully','accounts':accountsData}),200
                 else:
                     return jsonify({'message':'Your are not been approved for the moment'}),403
             else:
@@ -389,14 +382,77 @@ def login():
     
     except Exception as error:
         return jsonify({'message':'Internal server error','error':str(error)}),500
+@reader.route('/login',methods=['POST'])
+def login():   
+    try:    
+        email=request.json['email']
+        password=request.json['password']
+        user=User.query.filter_by(email=email).first()
+        if user and bcrypt.check_password_hash(user.password_hashed,password):
+            if user.confirmed:
+                if user.approved:
+                    login_user(user)         
+                    return jsonify({'message':'Your are logged in succesfully','role':user.type}),200
+                else:
+                    return jsonify({'message':'Your are not been approved for the moment'}),403
+            else:
+                return jsonify({'message':'You don\'t confirm your account'}),403 # Acces interdit
+        else:  
+            return jsonify({'message':'Invalid email or password'}),404
+    
+    except Exception as error:
+        return jsonify({'message':'Internal server error','error':str(error)}),500        
+@reader.route('/select_account',methods=['POST'])
+def select_account():
+    
+    try:   
+        email=request.json['email']
+        username=request.json['username']
+        user=User.query.filter_by(email=email,username=username).first()
+        
+        if user:
+            login_user(user)       
+            return jsonify({'message':'Your are logged in succesfully','role':user.type}),200
+        else:  
+            return jsonify({'message':'Invalid account'}),404
+    
+    except Exception as error:
+        return jsonify({'message':'Internal server error','error':str(error)}),500
+@reader.route('/create_account',methods=['POST'])
+def create_account():
+    
+    try:  
+        username=request.json['username']
+        accounts =User.query.filter_by(email=current_user.email).all()
+       
+        if len(accounts) >= 3 :
+            return jsonify({'message':'You reached the maximum number of accounts (3)'}) ,400
 
+    
+        user=User.query.filter_by(email=current_user.email,username=username).first()
+
+        if user:       
+            return jsonify({'message':'Username already  exists '}),400
+        else:
+            new_account = Reader(username=username, email=current_user.email, password_hashed=current_user.password_hashed, created_at=datetime.now(),confirmed=True,approved=True)
+            db.session.add(new_account)
+            db.session.commit()
+            userData ={
+                "username":new_account.username,
+                "email":new_account.email,
+                "img":new_account.img
+            }
+            return jsonify({'message':'Your account has been created','user':userData}),201
+    
+    except Exception as error:
+        return jsonify({'message':'Internal server error','error':str(error)}),500
 
 @reader.route('/user_authenticated')
 
 def user_authenticate():
     
     try:
-        print(current_user.is_authenticated)
+        
         if current_user.is_authenticated:
             return jsonify({'is_authenticated':current_user.is_authenticated,'username':current_user.username,'email':current_user.email,'img':current_user.img,'role':current_user.type,'quiz_id':current_user.quiz_id,'id':current_user.id})
         else:
@@ -680,7 +736,7 @@ def set_image():
      
         img=request.json['img']
 
-        user=User.query.filter_by(email=current_user.email).first()
+        user=User.query.filter_by(email=current_user.email,username=current_user.username).first()
 
         if user  :
             user.img= img

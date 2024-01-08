@@ -5,7 +5,7 @@ import os
 
 ## @brief Configuration of the mysql database and parameters for sending email.
 class ConfigClass:
-    SQLALCHEMY_DATABASE_URI='mysql://root:''@localhost/testaa'
+    SQLALCHEMY_DATABASE_URI='mysql://root:''@localhost/IRead'
     SECRET_KEY=os.environ.get('SECRET_KEY') or 'password'
     SQLALCHEMY_TRACK_MODIFICATIONS=True
     MAIL_SERVER='smtp.office365.com' 

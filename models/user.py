@@ -15,8 +15,8 @@ class User(db.Model, UserMixin):
     __tablename__ = "user"
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), nullable=False)
-    email = db.Column(db.String(100), unique=True, nullable=False)
-    password_hashed = db.Column(db.String(100), unique=True, nullable=False)
+    email = db.Column(db.String(100), unique=False, nullable=False)
+    password_hashed = db.Column(db.String(100), nullable=False)
     img = db.Column(db.String(300),default="https://upload.wikimedia.org/wikipedia/commons/thumb/5/59/User-avatar.svg/2048px-User-avatar.svg.png")
     confirmed = db.Column(db.Boolean, default=False)
     approved = db.Column(db.Boolean, default=False)
