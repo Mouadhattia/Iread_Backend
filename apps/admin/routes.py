@@ -11,6 +11,7 @@ from flask_bcrypt import Bcrypt
 from models.user import User,Reader,Teacher,Admin,Assistant
 from models.book_pack import Book_pack
 from models.book import Book
+from models.Follow_book import Follow_book
 from models.user_log import UserLog
 from models.session import Session,Location
 from models.pack import Pack
@@ -22,6 +23,7 @@ from models.session_quiz import Session_quiz
 from models.about_book import About_Book
 from models.notification_user import Notification_user
 import logging
+import requests
 from apps.main.email import generate_confirmed_token
 from config import ConfigClass
 from flask_mail import Message
@@ -301,11 +303,11 @@ def update_user():
                 user.email = new_email
             if 'quiz_id' in data :
                 user.quiz_id =data['quiz_id']    
-            # if 'password' in data:
-            #     if data['password'] != "":
-            #         user.password_hashed = bcrypt.generate_password_hash(data['password'])
-            #     else:
-            #         return jsonify({'message': 'Password cannot be empty'}), 400 
+            if 'password' in data:
+                if data['password'] != "":
+                    user.password_hashed = bcrypt.generate_password_hash(data['password'])
+                else:
+                    return jsonify({'message': 'Password cannot be empty'}), 400 
 
             # Assuming you're using some sort of database session management, commit the changes
             db.session.commit()
@@ -347,22 +349,27 @@ def create_user():
         else:
             # Hash the password
             password_hash = bcrypt.generate_password_hash(password)
+             #Create a new user in quiz api
+            quiz_user ={
+                'app':f'{ConfigClass.QUIZ_API_KEY}'
+            }
+            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
+            if response.status_code == 201:
+                quiz_id = response.json()['_id']
+                # Create a new user
+                new_user = Reader(
+                    img=img,
+                    username=username,
+                    email=email,
+                    password_hashed=password_hash,
+                    created_at=datetime.now(),
+                    confirmed=True,
+                    quiz_id=quiz_id
+                    )
 
-            # Create a new user
-            new_user = Reader(
-                img=img,
-                username=username,
-                email=email,
-                password_hashed=password_hash,
-                created_at=datetime.now(),
-                confirmed=True,
-
-               
-            )
-
-            # Add the user to the database
-            db.session.add(new_user)
-            db.session.commit()
+                # Add the user to the database
+                db.session.add(new_user)
+                db.session.commit()
 
             # Return a success response
             response_data = {
@@ -373,11 +380,13 @@ def create_user():
                     'confirmed': new_user.confirmed,
                     'id': new_user.id,
                     'img':new_user.img,
+                    'quiz_id':new_user.quiz_id
                   
                 }
             }
             return jsonify(response_data), 201
     except Exception as e:
+        print(e)
         # Handle exceptions and return an error response
         return jsonify({'message': 'Internal server error'}), 500
 
@@ -1910,12 +1919,16 @@ def delete_session_follow_request():
 
         # Find the follow request by session_id and user_id.
         follow_request = Follow_session.query.filter_by(session_id=session_id, user_id=user_id).first()
-
+        session = Session.query.filter_by(id=session_id).first()
+        book_follow = Follow_book.query.filter_by(book_id=session.book_id, user_id=user_id).first()
+        
         # Check if the follow request exists.
         if follow_request is None:
             return jsonify({'message': 'Follow request not found'}), 404
 
         # Delete the follow request.
+        if book_follow :
+            db.session.delete(book_follow)
         db.session.delete(follow_request)
         db.session.commit()  # Assuming you're using SQLAlchemy and have a database session.
 

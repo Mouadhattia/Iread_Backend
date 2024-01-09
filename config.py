@@ -17,7 +17,8 @@ class ConfigClass:
     MAIL_DEBUG=False 
     FRONT_URL = 'http://iread.tn'
     API_URL= 'http://localhost:5003'
-    QUIZ_API = 'http://quiz.iread.tn/api/'
+    QUIZ_API = 'https://quiz.iread.tn/user'
+    QUIZ_API_KEY ='65800f77a2ce2e2c88ebd8bd'
 
     # Set the session lifetime to 1 hour (3600 seconds)
     PERMANENT_SESSION_LIFETIME = 3600

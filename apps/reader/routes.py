@@ -118,25 +118,33 @@ def register():
 
             return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
         else:
-            # Create a new user in your Flask application
-            password_hash = bcrypt.generate_password_hash(password)
-           
-            new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now())
-            
-            db.session.add(new_user)
-            db.session.commit()
-                # Send a confirmation email as before
-            confirmation_token = generate_confirmed_token(email)
-            confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
-            confirmation_email = render_template('confirmation_email_template.html', username=username,
-                                                      confirm_link=confirm_link)
-            msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
-            msg.html = confirmation_email
-            mail.send(msg)
 
-            return jsonify({'message': 'Your account has been successfully created. Please verify your emailbox to confirm your account',
+            #Create a new user in quiz api
+            quiz_user ={
+                'app':f'{ConfigClass.QUIZ_API_KEY}'
+            }
+            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
+            if response.status_code == 201:
+                quiz_id = response.json()['_id']
+                # Create a new user in your Flask application
+                password_hash = bcrypt.generate_password_hash(password)
+                new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),quiz_id=quiz_id)
+                db.session.add(new_user)
+                db.session.commit()
+                # Send a confirmation email as before
+                confirmation_token = generate_confirmed_token(email)
+                confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
+                confirmation_email = render_template('confirmation_email_template.html', username=username,
+                                                      confirm_link=confirm_link)
+                msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
+                msg.html = confirmation_email
+                mail.send(msg)
+
+                return jsonify({'message': 'Your account has been successfully created. Please verify your emailbox to confirm your account',
                                 'user': {'username': username, 'email': email}}), 201
-            
+            else:
+
+                return jsonify({'message':'Error creation Quiz account'}),400
 
     except Exception as error:
         print(str(error))  # Print the error message for debugging
@@ -148,60 +156,36 @@ def google_register():
         username = request.json['username']
         email = request.json['email']
         password = secrets.token_urlsafe(12) 
-
         if user_email_exist(email):
            google_user=User.query.filter_by(email=email).first()
+           accounts = User.query.filter_by(email=email).all()
            login_user(google_user)
-           return jsonify({'message':'Your are logged in succesfully','role':google_user.type}),200
+           accountsData=[]
+           for account in accounts:
+                accountsData.append({
+                    "username":account.username,  
+                    "email":account.email,
+                    "img":account.img
+                        })          
+           return jsonify({'message':'Your are logged in succesfully','accounts':accountsData}),200
         else:
-            # Make a GET request to obtain the CSRF token
-            token_url = f'{ConfigClass.QUIZ_API}user/get_csrf_token'
-            token_req = urllib.request.Request(token_url)   
-            opener = get_cookies()
-            # Perform the GET request with the CookieJar
-            token_response = opener.open(token_req)
-            response_toekn = json.loads(token_response.read().decode('utf-8'))
-            csrf_token = response_toekn.get('csrf_token')
-            # Create a new user in your Flask application
-            password_hash = bcrypt.generate_password_hash(password)
-            new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),confirmed=True,approved=True)
-            db.session.add(new_user)
-            # Call the external API to register a user and include the CSRF token in the headers
-            registration_data = {
-                'username': username,
-                'email': email,
-                'password': password
+            #Create a new user in quiz api
+            quiz_user ={
+                'app':f'{ConfigClass.QUIZ_API_KEY}'
             }
-            registration_data = json.dumps(registration_data).encode('utf-8')
-            try:
-                url = f'{ConfigClass.QUIZ_API}user/register'
-                req = urllib.request.Request(url, data=registration_data, headers={'X-CSRFToken': csrf_token, 'Content-Type': 'application/json'})
-                response = opener.open(req)  # Use the opener to include the cookies
-                response_data = json.loads(response.read().decode('utf-8'))
-                user_id = response_data.get('user', {}).get('id')
-                
-            except urllib.error.HTTPError as e:
-               response_data = json.loads(e.read().decode('utf-8'))
-               
-               error_message = response_data.get('message', 'Bad Request')
-               if error_message =="UNIQUE constraint failed: users_user.username":
-                return jsonify({'message': 'User name already exists'}),400
-               else : 
-                return jsonify({'message': error_message}),400
-               
-            db.session.commit()
-            if user_id is not None:
-                # Associate the user_id with the Reader object
-                new_user.quiz_id = user_id
-                db.session.commit()  
+            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
+            if response.status_code == 201:
+                quiz_id = response.json()['_id']
+                # Create a new user in your Flask application
+                password_hash = bcrypt.generate_password_hash(password)
+                new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id)
+                db.session.add(new_user)    
+                db.session.commit()
                 login_user(new_user)
-                return jsonify({'message':'Your are logged in succesfully','role':new_user.type}),200   
+                return jsonify({'message':'Your are logged in succesfully','accounts':[]}),200
             else:
-                # Handle the case where registration in the external API failed
-                return jsonify({'message': 'Failed to register user in external API'}), 500
-
+                return jsonify({'message': 'Internal server error'}), 500
     except Exception as error:
-        print(str(error))  # Print the error message for debugging
         return jsonify({'message': 'Internal server error'}), 500
 
 ## @brief Route for confirming the account based on the received email.
@@ -423,30 +407,60 @@ def create_account():
     
     try:  
         username=request.json['username']
+        password = request.json['password']
         accounts =User.query.filter_by(email=current_user.email).all()
-       
+
+        
         if len(accounts) >= 3 :
             return jsonify({'message':'You reached the maximum number of accounts (3)'}) ,400
 
-    
         user=User.query.filter_by(email=current_user.email,username=username).first()
-
+        if not bcrypt.check_password_hash(current_user.password_hashed,password):
+            return jsonify({'message':'Invalid password'}) ,400
         if user:       
             return jsonify({'message':'Username already  exists '}),400
         else:
-            new_account = Reader(username=username, email=current_user.email, password_hashed=current_user.password_hashed, created_at=datetime.now(),confirmed=True,approved=True)
-            db.session.add(new_account)
-            db.session.commit()
-            userData ={
-                "username":new_account.username,
-                "email":new_account.email,
-                "img":new_account.img
+            #Create a new user in quiz api
+            quiz_user ={
+                'app':f'{ConfigClass.QUIZ_API_KEY}'
             }
-            return jsonify({'message':'Your account has been created','user':userData}),201
+            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
+            if response.status_code == 201:
+                quiz_id = response.json()['_id']
+                new_account = Reader(username=username, email=current_user.email, password_hashed=current_user.password_hashed, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id)
+                db.session.add(new_account)
+                db.session.commit()
+                userData ={
+                    "username":new_account.username,
+                    "email":new_account.email,
+                    "img":new_account.img
+                    }
+                return jsonify({'message':'Your account has been created','user':userData}),201
+            else:
+                return jsonify({'message':'Error creation Quiz account'}),400    
     
     except Exception as error:
         return jsonify({'message':'Internal server error','error':str(error)}),500
+# get user account with email 
+@reader.route('/get_accounts')
+def get_accounts():
+    
+    try:  
+        accounts =User.query.filter_by(email=current_user.email).all()
+        accountsData=[]
+        for account in accounts:
 
+            accountsData.append({
+                "username":account.username,  
+                "email":account.email,
+                "img":account.img
+                        })          
+        return jsonify({'accounts':accountsData}),200
+       
+
+    
+    except Exception as error:
+        return jsonify({'message':'Internal server error','error':str(error)}),500
 @reader.route('/user_authenticated')
 
 def user_authenticate():
@@ -645,7 +659,7 @@ def set_username():
         password=request.json['password']
         new_username=request.json['new_username']
 
-        user=User.query.filter_by(email=current_user.email).first()
+        user=User.query.filter_by(email=current_user.email,username=current_user.username).first()
 
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             user.username=new_username
@@ -678,7 +692,7 @@ def set_email():
         password=request.json['password']
         new_email=request.json['new_email']
 
-        user=User.query.filter_by(email=old_email).first()
+        user=User.query.filter_by(email=old_email,username=current_user.username).first()
 
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             user.email=new_email
@@ -717,7 +731,7 @@ def set_password():
         old_password=request.json['old_password']
         new_password=request.json['new_password']
 
-        user=User.query.filter_by(email=current_user.email).first()
+        user=User.query.filter_by(email=current_user.email,username=current_user.username).first()
 
         if user and bcrypt.check_password_hash(user.password_hashed,old_password):
             user.password_hashed=bcrypt.generate_password_hash(new_password)
