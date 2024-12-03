@@ -9,7 +9,10 @@ from models.teacher_postulate import Teacher_postulate
 from models.pack import Pack
 from models.follow_pack import Follow_pack
 from models.Follow_book import Follow_book
+from models.notification_user import Notification_user
 from models.book import Book
+from models.user_shcool import User_shcool
+from models.shcool import Shcool
 from models.profile import Profile
 from models.book_pack import Book_pack
 from models.session import Session
@@ -23,7 +26,7 @@ from functools import wraps
 import logging
 import urllib.request,json,http.cookiejar
 from werkzeug.utils import secure_filename
-from models.code import Code ,StatusEnum
+from models.code import Code ,StatusEnum 
 from models.user_log import UserLog
 from geoip2.database import Reader as Beader
 import uuid
@@ -123,13 +126,25 @@ def register():
             quiz_user ={
                 'app':f'{ConfigClass.QUIZ_API_KEY}'
             }
+            invoicing_client ={
+                'appId':f'{ConfigClass.INVOICING_API_KEY}'
+            }
+            invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create' , json=invoicing_client)  
             response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
-            if response.status_code == 201:
+            if response.status_code == 201 and invoicing_response.status_code==201:
                 quiz_id = response.json()['_id']
+                client_id = invoicing_response.json()['_id']
                 # Create a new user in your Flask application
                 password_hash = bcrypt.generate_password_hash(password)
-                new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),quiz_id=quiz_id)
+                new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),quiz_id=quiz_id,client_id_invoicing_api=client_id)
                 db.session.add(new_user)
+                db.session.commit()
+                shcool=  Shcool.query.filter_by(name="IRead").first()
+                new_user_shcool = User_shcool(
+                    user_id = new_user.id,
+                    shcool_id = shcool.id
+                    )
+                db.session.add(new_user_shcool)
                 db.session.commit()
                 # Send a confirmation email as before
                 confirmation_token = generate_confirmed_token(email)
@@ -181,11 +196,20 @@ def google_register():
                 new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id)
                 db.session.add(new_user)    
                 db.session.commit()
+                shcool=  Shcool.query.filter_by(name="IRead").first()
+                new_user_shcool = User_shcool(
+                    user_id = new_user.id,
+                    shcool_id = shcool.id
+                    )
+                db.session.add(new_user_shcool)
+                db.session.commit()
                 login_user(new_user)
                 return jsonify({'message':'Your are logged in succesfully','accounts':[]}),200
             else:
+                print("here")
                 return jsonify({'message': 'Internal server error'}), 500
     except Exception as error:
+        print(error)
         return jsonify({'message': 'Internal server error'}), 500
 
 ## @brief Route for confirming the account based on the received email.
@@ -344,7 +368,7 @@ def login_client():
         password=request.json['password']
         user=User.query.filter_by(email=email).first()
         accounts =User.query.filter_by(email=email).all()
-      
+        print(accounts)
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
@@ -365,7 +389,9 @@ def login_client():
             return jsonify({'message':'Invalid email or password'}),404
     
     except Exception as error:
+        print(error)
         return jsonify({'message':'Internal server error','error':str(error)}),500
+
 @reader.route('/login',methods=['POST'])
 def login():   
     try:    
@@ -375,7 +401,8 @@ def login():
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
-                    login_user(user)         
+                    login_user(user) 
+                        
                     return jsonify({'message':'Your are logged in succesfully','role':user.type}),200
                 else:
                     return jsonify({'message':'Your are not been approved for the moment'}),403
@@ -409,7 +436,7 @@ def create_account():
         username=request.json['username']
         password = request.json['password']
         accounts =User.query.filter_by(email=current_user.email).all()
-
+        
         
         if len(accounts) >= 3 :
             return jsonify({'message':'You reached the maximum number of accounts (3)'}) ,400
@@ -434,12 +461,21 @@ def create_account():
                     "username":new_account.username,
                     "email":new_account.email,
                     "img":new_account.img
+                    
                     }
+                school  = Shcool.query.filter_by(name="IRead").first()
+                new_user_shcool = User_shcool(
+                  user_id = new_account.id,
+                  shcool_id = school.id
+                )
+                db.session.add(new_user_shcool)
+                db.session.commit()    
                 return jsonify({'message':'Your account has been created','user':userData}),201
             else:
                 return jsonify({'message':'Error creation Quiz account'}),400    
     
     except Exception as error:
+        print(error)
         return jsonify({'message':'Internal server error','error':str(error)}),500
 # get user account with email 
 @reader.route('/get_accounts')
@@ -461,18 +497,117 @@ def get_accounts():
     
     except Exception as error:
         return jsonify({'message':'Internal server error','error':str(error)}),500
-@reader.route('/user_authenticated')
 
-def user_authenticate():
-    
+
+
+#current user        
+# @reader.route('/user_authenticated')
+# def user_authenticated():
+#     try:
+#         if current_user.is_authenticated:
+#             client_id_invoicing_api = getattr(current_user, 'client_id_invoicing_api', None)
+#             quiz_id = getattr(current_user, 'quiz_id', None)
+#             if current_user.type == "admin":
+                
+#                 school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
+
+#                 school = Shcool.query.get(school_id)
+                
+#                 return jsonify({
+#                     'is_authenticated': current_user.is_authenticated,
+#                     'username': current_user.username,
+#                     'email': current_user.email,
+#                     'img': current_user.img,
+#                     'role': current_user.type,
+#                     'quiz_id': quiz_id,
+#                     'id': current_user.id,
+#                     'client_id_invoicing_api': client_id_invoicing_api,
+#                     'school_id': school.id,
+#                     'school': school.name
+#                 })
+#             else:
+#                 school_ids = User_shcool.query.filter_by(user_id=current_user.id).all()
+#                 schools = [Shcool.query.get(school_id.shcool_id) for school_id in school_ids]
+#                 return jsonify({
+#                     'is_authenticated': current_user.is_authenticated,
+#                     'username': current_user.username,
+#                     'email': current_user.email,
+#                     'img': current_user.img,
+#                     'role': current_user.type,
+#                     'quiz_id': quiz_id,
+#                     'id': current_user.id,
+#                     'client_id_invoicing_api': client_id_invoicing_api,
+#                     'schools': [{'id': school.id, 'name': school.name} for school in schools]
+#                 })     
+#     except Exception as e:     
+#         return jsonify({'error': str(e), 'message': 'Internal server error'})
+
+#current user        
+@reader.route('/user_authenticated')
+def user_authenticated():
     try:
-        
+      
         if current_user.is_authenticated:
-            return jsonify({'is_authenticated':current_user.is_authenticated,'username':current_user.username,'email':current_user.email,'img':current_user.img,'role':current_user.type,'quiz_id':current_user.quiz_id,'id':current_user.id})
-        else:
-            return jsonify({'is_authenticated':current_user.is_authenticated}),400
+     
+            client_id_invoicing_api = getattr(current_user, 'client_id_invoicing_api', None)
+            quiz_id = getattr(current_user, 'quiz_id', None)
+            if current_user.type == "admin":
+                
+                school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
+
+                school = Shcool.query.get(school_id)
+                
+                return jsonify({
+                    'is_authenticated': current_user.is_authenticated,
+                    'username': current_user.username,
+                    'email': current_user.email,
+                    'img': current_user.img,
+                    'role': current_user.type,
+                    'quiz_id': quiz_id,
+                    'id': current_user.id,
+                    'client_id_invoicing_api': client_id_invoicing_api,
+                    'school_id': school.id,
+                    'school': school.name
+                })
+
+            else:
+                school_ids = User_shcool.query.filter_by(user_id=current_user.id).all()
+                schools = [Shcool.query.get(school_id.shcool_id) for school_id in school_ids]
+                return jsonify({
+                    'is_authenticated': current_user.is_authenticated,
+                    'username': current_user.username,
+                    'email': current_user.email,
+                    'img': current_user.img,
+                    'role': current_user.type,
+                    'quiz_id': quiz_id,
+                    'id': current_user.id,
+                    'client_id_invoicing_api': client_id_invoicing_api,
+                    'schools': [{'id': school.id, 'name': school.name} for school in schools]
+                })     
+    except Exception as e:     
+        return jsonify({'error': str(e), 'message': 'Internal server error'})
+
+
+@reader.route('/create_invoice_client')
+def create_invoice_client():
+    try:
+        user=User.query.filter_by(id=current_user.id).first()
+        invoicing_client ={
+                'appId':f'{ConfigClass.INVOICING_API_KEY}'
+            }
+        invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create' , json=invoicing_client)  
+        if  invoicing_response.status_code==201:
+            client_id = invoicing_response.json()['_id']
+            user.client_id_invoicing_api =client_id
+            db.session.commit()
+
+            return jsonify({'message':'user has been linked to invoicing_api'})
+
+
     except Exception as error:
-        return jsonify({'message':'Internal serveur error',"error":error}),500
+        print(error)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
 
 
 ## @brief Route to the reader's dashboard for viewing their profile.
@@ -492,7 +627,7 @@ def dashboard():
     try:
         infos = (
             db.session.query(User, Book, Session, Follow_session)
-            .filter(User.email == current_user.email)
+            .filter(User.id == current_user.id)
             .join(Follow_session, User.id == Follow_session.user_id)
             .join(Session, Session.id == Follow_session.session_id)
             .join(Book, Book.id == Session.book_id)
@@ -521,7 +656,9 @@ def dashboard():
                 'location': session_follow.Session.location.value,
                 'date': session_follow.Session.start_date.strftime('%Y-%m-%d'),
                 'approved': session_follow.Follow_session.approved,
-                'book_img':session_follow.Book.img
+                'book_img':session_follow.Book.img,
+                'unit_id': session_follow.Session.unit_id
+
             })
 
         pending_session_data = []
@@ -547,7 +684,8 @@ def dashboard():
                 'author': session_follow.Book.author,
                 'location': session_follow.Session.location.value,
                 'date': session_follow.Session.start_date.strftime('%Y-%m-%d'),
-                'approved': session_follow.Follow_session.approved
+                'approved': session_follow.Follow_session.approved,
+                'unit_id': session_follow.Session.unit_id
             })
 
         return jsonify({
@@ -783,7 +921,8 @@ def delete_account():
         if current_user.email==email and bcrypt.check_password_hash(current_user.password_hashed,password):
             follow_sessions=Follow_session.query.filter_by(user_id=current_user.id).all()
             follow_packs=Follow_pack.query.filter_by(user_id=current_user.id).all()
-
+            notifications = Notification_user.query.filter_by(user_id=current_user.id).all()
+            [ db.session.delete(notification) for notification in notifications ]
             [ db.session.delete(follow_session) for follow_session in follow_sessions ]
             [ db.session.delete(follow_pack) for follow_pack in follow_packs ]
             db.session.commit()
@@ -814,22 +953,22 @@ def delete_account():
 @login_required
 def register_session():
     try:
-        token = request.json['id']
-        
+        token = request.json['id']    
         session_instance = db.session.query(Session).filter(Session.id == token).first()
-    
         if session_instance:
+            print(current_user.id)
             # Assuming session_instance.id is related to pack_id and book_id
-            follow_pack = Follow_pack.query.filter_by(pack_id=session_instance.pack_id, user_id=current_user.id).first()
-           
+            follow_pack = Follow_pack.query.filter_by(pack_id=session_instance.pack_id, user_id=current_user.id).first()       
             if follow_pack and follow_pack.approved:
                 follows_count = Follow_session.query.filter_by(session_id=session_instance.id).count()
                 if session_instance.capacity> follows_count:
                     #follow book 
-                    follow_book = follow = Follow_book(user_id=current_user.id, book_id=session_instance.book_id ,pack_id=session_instance.pack_id)
-                    db.session.add(follow_book)
+                    follow_book_is_excited = Follow_book.query.filter_by(user_id=current_user.id, book_id=session_instance.book_id ,pack_id=session_instance.pack_id).first()
+                    if not follow_book_is_excited:
+                        follow_book = Follow_book(user_id=current_user.id, book_id=session_instance.book_id ,pack_id=session_instance.pack_id)
+                        db.session.add(follow_book)
                     #follow session
-                    follow = Follow_session(user_id=current_user.id, session_id=session_instance.id)
+                    follow = Follow_session(user_id=current_user.id, session_id=session_instance.id,approved=True)
                     db.session.add(follow)
                     db.session.commit()
                 else :
@@ -845,7 +984,72 @@ def register_session():
         print(e)  # Print the exception for debugging purposes
         return jsonify({'message': 'Internal server error'}), 500
 
+@reader.route('/add_user_to__session', methods=['POST'])
 
+def add_user_to__session():
+    try:
+        token = request.json['token']
+        user_id = request.json['user_id']
+        
+        session_instance = db.session.query(Session).filter(Session.id == token).first()
+
+
+    
+        if session_instance:
+            # Assuming session_instance.id is related to pack_id and book_id
+            follow_pack = Follow_pack.query.filter_by(pack_id=session_instance.pack_id, user_id=user_id).first()
+           
+            if follow_pack and follow_pack.approved:
+                follows_count = Follow_session.query.filter_by(session_id=session_instance.id).count()
+                if session_instance.capacity> follows_count:
+                    #follow book 
+                    follow_book_is_excited = Follow_book.query.filter_by(user_id=user_id, book_id=session_instance.book_id ,pack_id=session_instance.pack_id).first()
+                    if not follow_book_is_excited:
+                        follow_book = Follow_book(user_id=user_id, book_id=session_instance.book_id ,pack_id=session_instance.pack_id)
+                        db.session.add(follow_book)
+                    #follow session
+                    follow = Follow_session(user_id=user_id, session_id=session_instance.id,approved=True)
+                    db.session.add(follow)
+                    db.session.commit()
+                else :
+                    return jsonify({'message': 'Session is Full'}), 404
+
+                return jsonify({'message': 'User added successfully'}), 200
+            else:
+                return jsonify({'message': 'No matching or approved Follow_pack found'}), 404
+        else:
+
+            return jsonify({'message': 'No session found'}), 404
+    except Exception as e:
+        print(e)  # Print the exception for debugging purposes
+        return jsonify({'message': 'Internal server error'}), 500
+
+@reader.route('/remove_user_from_session', methods=['POST'])
+def remove_user_from_session():
+    try:
+        token=request.json['token']
+        user_id = request.json['user_id']
+        
+
+        
+        session=db.session.query(Session).filter(Session.id == token).first()
+        if session:
+            follow_session = Follow_session.query.filter_by(user_id=user_id, session_id=session.id).first()
+            follow_book  = Follow_book.query.filter_by(user_id=user_id, book_id=session.book_id).first()
+            if follow_session:
+                
+                db.session.delete(follow_session)
+                db.session.delete(follow_book)
+                db.session.commit()
+
+
+                return jsonify({'message': 'You have successfully canceled your registration for this session'}), 200
+            else:
+                return jsonify({'message': 'Subscription not found'}), 404
+        else:
+            return jsonify({'message': 'No session found'}), 404
+    except:
+        return jsonify({'message': 'Internal server error'}), 500
 
 
 @reader.route('/cancel_register_session', methods=['POST'])
@@ -947,7 +1151,7 @@ def link_code():
 def get_followed_pack_list():
     try:
         packs = db.session.query(Pack, Follow_pack.approved).join(Follow_pack).filter(Pack.id == Follow_pack.pack_id, Follow_pack.user_id == current_user.id)
-
+        print(current_user.id)
         followed_pack_list = []
 
         for followed_pack, approved in packs:
@@ -956,7 +1160,7 @@ def get_followed_pack_list():
         if followed_pack_list:
             return jsonify({'followed_pack_list': followed_pack_list}), 200
         else:
-            return jsonify({'message': 'You have not followed any pack at the moment'}), 404
+            return jsonify({'followed_pack_list': []}), 200
     except:
         return jsonify({'message': 'Internal server error'}), 500
 
@@ -971,7 +1175,7 @@ def get_unfollowed_books():
 
         # Iterate through each followed pack
         for followed_pack, approved in followed_packs:
-            # Alias for the Follow_book table to avoid conflicts in the join
+            # Alias for the b  table to avoid conflicts in the join
             follow_book_alias = aliased(Follow_book)
             session_alias = aliased(Session)
 
@@ -989,8 +1193,7 @@ def get_unfollowed_books():
             ).outerjoin(
                 session_alias,
                 and_(
-                    session_alias.book_id == Book.id,
-                   
+                    session_alias.book_id == Book.id 
                 )
             ).filter(
                 Book_pack.pack_id == followed_pack.id,
@@ -1085,7 +1288,8 @@ def create_or_update_profile():
     try:
         existing_profile = Profile.query.filter_by(user_id=current_user.id).first()
         data = request.get_json()
-     
+        if 'birth_day' in data:
+            data['birth_day'] = datetime.strptime(data['birth_day'], '%Y-%m-%dT%H:%M:%S.%fZ').strftime('%Y-%m-%d')
         if existing_profile:
             # If a profile with the user_id already exists, update it
             for field in ['first_name', 'last_name', 'phone', 'birth_day', 'address_1', 'address_2', 'state', 'country']:
@@ -1129,6 +1333,7 @@ def create_or_update_profile():
             db.session.commit()
             return jsonify({'message': 'Profile created or updated successfully','profile':profile}), 201
     except Exception as e:
+        print(e)
         return jsonify({'error': str(e)}), 500
 
 
@@ -1498,7 +1703,55 @@ def import_quiz_json():
         print(f"Error: {str(e)}")
         return jsonify({'error': 'An unexpected error occurred'}), 500
 
+@reader.route('/get_packs_by_school')
+def get_packs_by_shcoo():
+    try:
+        age_filter = request.args.get('age') 
+        title_search = request.args.get('title') 
+        school = int(request.args.get('school'))    
+        all = int(request.args.get('all'))    
+        age_enum_values = [age.value for age in StatusEnum]
+        packs_query = Pack.query
+        if age_filter and age_filter in age_enum_values:
+            packs_query = packs_query.filter(Pack.age == age_filter)
+        if title_search:
+            packs_query = packs_query.filter(Pack.title.ilike(f'%{title_search}%'))
+        if not school :
+            
+            return jsonify({'message': 'No School ID'}),400
+        if all ==1:
+            packs = packs_query.filter_by(shcool_id=school)
+        else:
+            packs = packs_query.filter_by(shcool_id=school,public=True)
 
+        
+       
+        if packs:
+            packs_info = []
+            for pack in packs:
+                enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
+                num_active_codes = Code.query.filter_by(pack_id=pack.id, status=StatusEnum.ACTIVE).count()
+                pack_info = {
+                    'id': pack.id,
+                    'title': pack.title,
+                    'level': pack.level,
+                    'age': pack.age.value,
+                    'price': pack.price,
+                    'img': pack.img,
+                    'book_number': pack.book_number,
+                    'discount': pack.discount,
+                    'faq': pack.faq,
+                    'codes': num_active_codes ,
+                    'enrolled' :enrolled,
+                    'duration':pack.duration
+                }
+                packs_info.append(pack_info)
+
+            return jsonify({'packs': packs_info}), 200
+        else:
+            return jsonify({'message': 'No packs available'}),200
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
 
 
 

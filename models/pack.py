@@ -3,6 +3,7 @@
 
 from extensions import db
 from enum import Enum
+from models.shcool import Shcool
 
 class StatusEnum(Enum):
    
@@ -28,10 +29,12 @@ class Pack(db.Model):
     price=db.Column(db.Float,default=0)
     discount=db.Column(db.Float,default=0)
     faq = db.Column(db.JSON, nullable=True)
+    product_id_invoicing_api =db.Column(db.String(100), nullable=True)
     duration =db.Column(db.Float,default=0)
-
     # Define the relationship with Code and set the cascade option
     codes = db.relationship('Code', backref='pack', cascade='all, delete-orphan')
+    shcool_id = db.Column(db.ForeignKey(Shcool.id))
+    public = db.Column(db.Boolean,default=False)
     
     def __repr__(self):
         return '< Pack %s >' %self.title

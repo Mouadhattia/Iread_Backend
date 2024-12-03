@@ -10,10 +10,14 @@ from extensions import login_manager,mail,db
 from flask_bcrypt import Bcrypt
 from models.user import User,Reader,Teacher,Admin,Assistant
 from models.book_pack import Book_pack
+from models.shcool import Shcool
 from models.book import Book
+from models.unit import Unit
+from models.user_shcool import User_shcool
 from models.Follow_book import Follow_book
 from models.user_log import UserLog
 from models.session import Session,Location
+from models.pack_template import Pack_template
 from models.pack import Pack
 from models.code import Code ,StatusEnum
 from models.follow_session import Follow_session
@@ -155,33 +159,34 @@ def confirm(token):
 #
 # @return: A JSON object containing information about all users.
 @admin.route('/show_all_readers')
-
-
 # @login_required
 # @admin_required
-def show_all_users():
-    
+def show_all_readers():
     try:
-        # Retrieve all readers
-        readers = Reader.query.all()
 
-        # Collect user data associated with each reader's ID
-        user_data = []
-        for reader in readers:
-            users = User.query.filter_by(id=reader.id).all()
-            for user in users:
-                user_data.append({
-                    'email': user.email,
-                    'username': user.username,
-                    'confirmed': user.confirmed,
-                    'id': user.id,
-                    'img':user.img,
-                    'approved':user.approved,
-                    'quiz_id':user.quiz_id
+
+        # Retrieve all reader IDs associated with current user's school ID
+        user_school = User_shcool.query.filter_by(user_id=current_user.id).first()
+        user_shcools = User_shcool.query.filter_by(shcool_id=user_school.shcool_id).all()
+        # Extract reader IDs associated with the school
+        reader_ids = [user.user_id for user in user_shcools]
+        # Retrieve reader data for the extracted IDs
+        reader_data = []
+        for reader_id in reader_ids:
+            
+            reader = User.query.get(reader_id)
+            if reader.type=="reader":  
+                reader_data.append({
+                    'email': reader.email,
+                    'username': reader.username,
+                    'confirmed': reader.confirmed,
+                    'id': reader.id,
+                    'img': reader.img,
+                    'approved': reader.approved,
+                    'quiz_id': reader.quiz_id
                 })
-
         return jsonify({
-            'readers': user_data
+            'readers': reader_data
         }), 200
     except Exception as e:
         print(e)
@@ -191,46 +196,55 @@ def show_all_users():
 @admin.route('/show_all_teachers')
 # @login_required
 # @admin_required
-def show_all_teacher():
+def show_all_teachers():
     try:
-        # Retrieve all teachers
-        teachers = Teacher.query.all()
+        # Retrieve the school associated with the current user
+        user_school = User_shcool.query.filter_by(user_id=current_user.id).first()
+        # If user_school is None, handle the case where the current user doesn't have a school assigned
 
+        # Retrieve all user_shcools associated with the school
+        user_shcools = User_shcool.query.filter_by(shcool_id=user_school.shcool_id).all()
+        
+        # Extract user IDs associated with the school
+        user_ids = [user.user_id for user in user_shcools]
+
+        # Retrieve all teachers
         # Collect user data associated with each teacher's ID
         user_data = []
-        for teacher in teachers:
-            users = User.query.filter_by(id=teacher.id).all()
-            for user in users:
+        for user_id in user_ids:     
+            user = User.query.filter_by(id=user_id, type="teacher").first()
+            if user:
                 user_data.append({
                     'email': user.email,
                     'username': user.username,
                     'confirmed': user.confirmed,
                     'id': user.id,
-                    'img':user.img,
-                    'approved':user.approved,
-                    'quiz_id':user.quiz_id
+                    'img': user.img,
+                    'approved': user.approved,
+                    'quiz_id': user.quiz_id
                 })
 
         return jsonify({
             'teachers': user_data
         }), 200
     except Exception as e:
+        print(e)
         return jsonify({'message': 'Internal server error'}), 500
-
 
 @admin.route('/show_all_assistants')
 # @login_required
 # @admin_required
 def show_all_assistants():
     try:
-        # Retrieve all teachers
-        assistans = Assistant.query.all()
-
-        # Collect user data associated with each teacher's ID
+        user_school = User_shcool.query.filter_by(user_id=current_user.id).first()
+        user_shcools = User_shcool.query.filter_by(shcool_id=user_school.shcool_id).all()
+        user_ids = [user.user_id for user in user_shcools]
         user_data = []
-        for assistant in assistans:
-            users = User.query.filter_by(id=assistant.id).all()
-            for user in users:
+        for user_id in user_ids: 
+            user = User.query.filter_by(id=user_id,type="assistant").first()
+            if user:
+
+                    
                 user_data.append({
                     'email': user.email,
                     'username': user.username,
@@ -239,13 +253,14 @@ def show_all_assistants():
                     'img':user.img,
                     'approved':user.approved,
                     'quiz_id':user.quiz_id
-                })
+                    })
 
         return jsonify({
             'assistans': user_data
         }), 200
     except Exception as e:
-        return jsonify({'message': 'Internal server error'}), 500
+        print(e)
+        return jsonify({'message': 'Internal server error','error':e}), 500
 
 @admin.route('/get_user/<int:user_id>', methods=['GET'])
 
@@ -297,9 +312,11 @@ def update_user():
             
             if 'email' in data:
                 new_email = data['email']
+                accounts= User.query.filter(User.email == new_email).all()
+                
                 # Check if the new email is already in use
-                if User.query.filter(User.email == new_email, User.id != user_id).first():
-                    return jsonify({'message': 'Email is already in use'}), 400
+                if len(accounts)>=3:
+                    return jsonify({'message': 'You reached the limit of accounts (3)'}), 400
                 user.email = new_email
             if 'quiz_id' in data :
                 user.quiz_id =data['quiz_id']    
@@ -343,6 +360,7 @@ def create_user():
         password = data['password']
         img =data['img']
 
+
         # Check if the email already exists
         if User.query.filter_by(email=email).first():
             return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
@@ -353,9 +371,16 @@ def create_user():
             quiz_user ={
                 'app':f'{ConfigClass.QUIZ_API_KEY}'
             }
+            invoicing_client ={
+                'appId':f'{ConfigClass.INVOICING_API_KEY}'
+            }
+            invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create', json=invoicing_client)  
             response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
-            if response.status_code == 201:
+
+            if response.status_code == 201 and invoicing_response.status_code==201:
                 quiz_id = response.json()['_id']
+                client_id = invoicing_response.json()['_id']
+                
                 # Create a new user
                 new_user = Reader(
                     img=img,
@@ -364,11 +389,19 @@ def create_user():
                     password_hashed=password_hash,
                     created_at=datetime.now(),
                     confirmed=True,
-                    quiz_id=quiz_id
+                    quiz_id=quiz_id,
+                    client_id_invoicing_api=client_id
                     )
 
                 # Add the user to the database
                 db.session.add(new_user)
+                db.session.commit()
+                shcool=  User_shcool.query.filter_by(user_id=current_user.id).first() 
+                new_user_shcool = User_shcool(
+                  user_id = new_user.id,
+                  shcool_id = shcool.shcool_id
+                )
+                db.session.add(new_user_shcool)
                 db.session.commit()
 
             # Return a success response
@@ -390,7 +423,9 @@ def create_user():
         # Handle exceptions and return an error response
         return jsonify({'message': 'Internal server error'}), 500
 
-@admin.route('/create_assistant',methods=['POST'])
+
+
+@admin.route('/create_assistant', methods=['POST'])
 # @login_required
 # @admin_required
 def create_assistant():
@@ -400,48 +435,100 @@ def create_assistant():
         username = data['username']
         email = data['email']
         password = data['password']
-        img =data['img']
+        img = data['img']
 
+       
         # Check if the email already exists
         if User.query.filter_by(email=email).first():
             return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
         else:
-            # Hash the password
-            password_hash = bcrypt.generate_password_hash(password)
 
-            # Create a new user
-            new_user = Assistant(
-                img=img,
-                username=username,
-                email=email,
-                password_hashed=password_hash,
-                created_at=datetime.now(),
-                confirmed=True,
-                approved =True
+            invoicing_user = {'appId': f'{ConfigClass.INVOICING_API_KEY}'}
+            invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/user/create', json=invoicing_user)  
+            if invoicing_response.status_code == 201:
+                
+                user_id = response.json()['_id']
+                # Hash the password
+                password_hash = bcrypt.generate_password_hash(password)
 
-               
-            )
+                # Create a new user
+                new_user = Assistant(
+                    img=img,
+                    username=username,
+                    email=email,
+                    password_hashed=password_hash,
+                    created_at=datetime.now(),
+                    confirmed=True,
+                    approved=True,
+                    user_id_invoicing_api=user_id
+                )
+                # Add the user to the database
+                db.session.add(new_user)
+                db.session.commit()
+                shcool=  User_shcool.query.filter_by(user_id=current_user.id).first()
+                new_user_shcool = User_shcool(
+                    user_id = new_user.id,
+                    shcool_id = shcool.shcool_id
+                    )
+                db.session.add(new_user_shcool)
+                db.session.commit()
 
-            # Add the user to the database
-            db.session.add(new_user)
-            db.session.commit()
+                # Return a success response
+                response_data = {
+                    'message': 'Your account has been successfully created.',
+                    'user': {
+                        'username': username,
+                        'email': email,
+                        'confirmed': new_user.confirmed,
+                        'id': new_user.id,
+                        'img': new_user.img
+                    }
+                }    
+                return jsonify(response_data), 201
+            else:
+                password_hash = bcrypt.generate_password_hash(password)
 
-            # Return a success response
-            response_data = {
-                'message': 'Your account has been successfully created.',
-                'user': {
-                    'username': username,
-                    'email': email,
-                    'confirmed': new_user.confirmed,
-                    'id': new_user.id,
-                    'img':new_user.img,
-                  
-                }
-            }
-            return jsonify(response_data), 201
+                # Create a new user
+                new_user = Assistant(
+                    img=img,
+                    username=username,
+                    email=email,
+                    password_hashed=password_hash,
+                    created_at=datetime.now(),
+                    confirmed=True,
+                    approved=True
+                    
+                )
+                # Add the user to the database
+                db.session.add(new_user)
+                db.session.commit()
+                shcool=  User_shcool.query.filter_by(user_id=current_user.id).first()
+                new_user_shcool = User_shcool(
+                    user_id = new_user.id,
+                    shcool_id = shcool.shcool_id
+                    )
+                db.session.add(new_user_shcool)
+                db.session.commit()
+
+                # Return a success response
+                response_data = {
+                    'message': 'Your account has been successfully created.',
+                    'user': {
+                        'username': username,
+                        'email': email,
+                        'confirmed': new_user.confirmed,
+                        'id': new_user.id,
+                        'img': new_user.img
+                    }
+                }    
+                return jsonify(response_data), 201
+                 
+                 
     except Exception as e:
+        
         # Handle exceptions and return an error response
-        return jsonify({'message': 'Internal server error'}), 500
+        return jsonify({'message': e}), 500
+
 
 
 
@@ -483,7 +570,13 @@ def create_teacher():
             # Add the user to the database
             db.session.add(new_user)
             db.session.commit()
-
+            shcool=  User_shcool.query.filter_by(user_id=current_user.id).first()
+            new_user_shcool = User_shcool(
+                user_id = new_user.id,
+                shcool_id = shcool.shcool_id
+                )
+            db.session.add(new_user_shcool)
+            db.session.commit()
             # Return a success response
             response_data = {
                 'message': 'Your account has been successfully created.',
@@ -723,7 +816,8 @@ def get_sessions():
             'end_date': session.end_date,
             'pack_id': session.pack_id,
             'description': session.description,
-            'active': session.active
+            'active': session.active,
+            'unit_id':session.unit_id
         })
 
     return jsonify({'sessions': session_list}), 200
@@ -790,7 +884,6 @@ def user_session(code):
             session =Session.query.get(follow_request.session_id)
             # print(session)
             all_session.append({
-
                 'user_id': user.id,
                 'username': user.username,
                 'email': user.email,
@@ -914,18 +1007,24 @@ def create_session():
     try:
 
         data = request.get_json()
-      
+        unit_id = None
 
         # Validate required fields
-        required_fields = ['name', 'start_date','end_date']
+        required_fields = ['name', 'start_date','end_date','unit']
         for field in required_fields:
             if field not in data or not data[field].strip():
-                return jsonify({'message': f'{field.capitalize()} is required'}), 400
-
-
+                return jsonify({'message': f'{field.capitalize()} is required'}), 400   
         exist_session=Session.query.filter_by(name=data['name']).first()
         teacher = Teacher.query.filter_by(id=data['teacher_id']).first()
         book = Book.query.filter_by(id=data['book_id']).first()
+        exist_unit=Unit.query.filter_by(name=data['unit'],book_id=data['book_id']).first()
+        if exist_unit:
+            unit_id =exist_unit.id
+        else:
+            new_unit=Unit(name=data['unit'],book_id=data['book_id'])
+            db.session.add(new_unit)
+            db.session.commit()
+            unit_id= new_unit.id
         if exist_session :
             return jsonify({'message':'Session name already exist'}),404
         else:
@@ -939,7 +1038,8 @@ def create_session():
              end_date=data['end_date'],
              pack_id=data['pack_id'],
              description=data['description'],
-             active=data['active']
+             active=data['active'],
+             unit_id=unit_id
             )
     
         db.session.add(new_session)
@@ -964,27 +1064,53 @@ def create_session():
         return jsonify({'message': 'Session created successfully','session':session_info}), 201
     
     except Exception as e:
+        print(e)
         logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500
 
+#get session numbers 
+@admin.route('/session_count', methods=['POST'])
+def count_sessions():
+    try:
+        book_id = request.json['book_id']
+        pack_id = request.json['pack_id']
+        # Get the session related with pack bok 
+        sessions = Session.query.filter_by(book_id=book_id,pack_id=pack_id).count()
+        return jsonify({'session_number':sessions})
 
-@admin.route('/delete_session',methods=['POST'])
 
+    except Exception as e:
+        print(e)
+        return jsonify({'message': 'Internal server error'}), 500    
+
+
+
+@admin.route('/delete_session', methods=['POST'])
 def delete_session():
     try:
-        token=request.json['id']
-        
-        session=Session.query.filter_by(id=token).first()
+        token = request.json['id']
+        # Get the session to be deleted
+        session = Session.query.filter_by(id=token).first()
         if session:
-            follow=Follow_session.query.filter_by(session_id=session.id).first()
-            db.session.delete(follow) if follow is not None else None
+            # Delete all associated records in Follow_session table
+            follow_sessions = Follow_session.query.filter_by(session_id=session.id).all()
+            for follow in follow_sessions:
+                db.session.delete(follow)
+            # Delete all associated records in Session_quiz table
+            session_quizzes = Session_quiz.query.filter_by(session_id=session.id).all()
+            for session_quiz in session_quizzes:
+                db.session.delete(session_quiz)
+            # Commit the changes
             db.session.commit()
-            db.session.delete(session) if session is not None else None
+            # Delete the session
+            db.session.delete(session)
             db.session.commit()
-            return jsonify({'message':'Session is succesfully deleted'})
+
+            return jsonify({'message': 'Session and associated records successfully deleted'})
         else:
-            return jsonify({'message':'Any session matched'})
-    except:
+            return jsonify({'message': 'No matching session found'})
+    except Exception as e:
+        print(e)
         return jsonify({'message': 'Internal server error'}), 500
 
 
@@ -1011,7 +1137,8 @@ def get_session(session_id):
         'description': session.description,
         'active': session.active,
         'book_name' : book.title,
-        'teacher_name' : teacher.username
+        'teacher_name' : teacher.username,
+        'meet_link':session.meet_link
     }
 
     return jsonify({'session': session_info}), 200
@@ -1051,6 +1178,7 @@ def update_session():
         session_to_update.active = data['active'] if 'active' in data else session_to_update.active
         session_to_update.capacity = data['capacity'] if 'capacity' in data else session_to_update.capacity
         session_to_update.pack_id = data['pack_id'] if 'pack_id' in data else session_to_update.pack_id
+        session_to_update.meet_link = data['meet_link'] if 'meet_link' in data else session_to_update.meet_link
   
         db.session.commit()
 
@@ -1067,7 +1195,8 @@ def update_session():
             'description': session_to_update.description,
             'active': session_to_update.active,
             'book_name': book.title,
-            'teacher_name': teacher.username
+            'teacher_name': teacher.username,
+            'meet_link':session_to_update.meet_link
         }
         
         return jsonify({'message': 'Session details updated successfully', 'session': session_info}), 200
@@ -1148,6 +1277,147 @@ def get_all_books():
         return jsonify({'message': 'Internal server error'}), 500
 
 
+#get all units 
+@admin.route('/show_all_units/<int:id>', methods=['GET'])
+def get_all_units(id):
+    try:
+        # Query all books from the database
+        units = Unit.query.filter_by(book_id=id).all() 
+        # Create a list to store the book data
+        unit_list = []
+        # Loop through the books and create a dictionary for each book
+        for unit in units:
+            unit_data = {
+                'id': unit.id,
+                'name': unit.name,
+                'book_id': unit.book_id  
+            }
+            unit_list.append(unit_data)
+        return jsonify(unit_list), 200
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+#delete unit 
+@admin.route('/delete_unit', methods=['POST'])
+# @login_required
+# @admin_required
+def delete_unit():
+    try:
+        token = request.json['id']
+        unit = Unit.query.filter_by(id=token).first()
+        if not unit:
+            return jsonify({'message': 'Unit not found'}), 404
+        else:
+            db.session.delete(unit)  # Corrected from 'unit' to 'unit'
+            db.session.commit()
+            return jsonify({'message': 'Unit is successfully deleted'}), 200
+    except Exception as e:
+        return jsonify({'message': f'Internal server error: {str(e)}'}), 500
+
+#create unit 
+@admin.route('/create_unit',methods=['POST'])
+# @login_required
+# @admin_required
+def create_unit():
+    try:
+        data = request.get_json()
+        name=data['name']
+        book_id=data['book_id']
+        exist_unit=Unit.query.filter_by(name=name,book_id=book_id).first()
+ 
+        if exist_unit :
+            return jsonify({'message':'Name already exist'}),404
+        else:
+
+           unit=Unit(name=name,book_id=book_id)  
+           if unit:
+            db.session.add(unit)
+            db.session.commit()
+            unit_data = {
+            'id': unit.id,
+            'name': unit.name,
+            'book_id': unit.book_id,
+
+        }
+            return jsonify({'message':'Unit is sucessfully created','unit':unit_data}),201
+           else:
+            return jsonify({'message':'Somthing wrong please try later'}),404
+    except Exception as e:
+        logging.error(f" {str(e)} is required")
+        return jsonify({'message':f" {str(e)} is required"}),500
+    
+#update unit 
+@admin.route('/update_unit', methods=['PUT'])
+def update_unit():
+    try:
+        data = request.get_json()
+
+        if 'id' not in data:
+            return jsonify({'message': 'Unit ID is missing in the request body'}), 400
+
+        unit_id = data['id']
+        unit = Unit.query.get(unit_id)
+
+        if unit is None:
+            return jsonify({'message': 'Unit not found'}), 404
+
+        if 'name' in data:
+            new_name = data['name']
+
+            # Check if the new name is an empty string or if it's already in use by another unit
+            if not new_name.strip():
+                return jsonify({'message': 'Name cannot be empty'}), 400
+            elif Unit.query.filter(Unit.name == new_name, Unit.id != unit_id).first():
+                return jsonify({'message': 'Name is already in use by another unit'}), 400
+
+            unit.name = new_name
+
+        db.session.commit()
+
+        unit_data = {
+            'id': unit.id,
+            'name': unit.name,
+            'book_id': unit.book_id,
+        }
+
+        return jsonify({'message': 'Unit updated successfully', 'unit': unit_data}), 200
+
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+
+# @admin.route('/get_book/<int:id>', methods=['GET'])
+# def get_book(id):
+#     try:
+#         book = Book.query.get(id)
+
+#         if book is None:
+#             return jsonify({'message': 'Book not found'}), 404
+
+#         book_data = {
+#             'id': book.id,
+#             'title': book.title,
+#             'author': book.author,
+#             'img': book.img,
+#             'release_date': book.release_date.strftime('%Y-%m-%d'),  # Format the date as a string
+#             'page_number': book.page_number,
+#             'category': book.category,
+#             'neo4j_id': book.neo4j_id,
+#             'desc': book.desc,
+           
+#         }
+
+#         return jsonify(book_data), 200
+
+#     except Exception as e:
+#         logging.error(f"An error occurred: {str(e)}")
+#         return jsonify({'message': 'Internal server error'}), 500
+
 ## @brief Route for deleting a book from the database.
 #
 # This route is used by administrators to delete a book from the database based on the title and author provided.
@@ -1202,9 +1472,7 @@ def delete_book():
 @admin.route('/create_book',methods=['POST'])
 # @login_required
 # @admin_required
-def create_book():
-   
-    
+def create_book():   
     try:
         data = request.get_json()
 
@@ -1222,6 +1490,7 @@ def create_book():
         category=request.json['category']
         neo4j_id=request.json['neo4j_id']
         desc =request.json['desc']
+       
         
 
       
@@ -1246,8 +1515,7 @@ def create_book():
             'page_number': book.page_number,
             'category': book.category,
             'neo4j_id': book.neo4j_id,
-            'desc': book.desc
-
+            'desc': book.desc,
         }
             return jsonify({'message':'Book is sucessfully created','book':book_data}),200
            else:
@@ -1308,7 +1576,8 @@ def update_book():
             'page_number': book.page_number,
             'category': book.category,
             'neo4j_id': book.neo4j_id,
-            'desc': book.desc
+            'desc': book.desc,
+            'shcool_id':book.shcool_id
         }
 
         return jsonify({'message': 'Book updated successfully', 'book': book_data}), 200
@@ -1322,22 +1591,21 @@ def update_book():
 @admin.route('/get_book/<int:id>', methods=['GET'])
 def get_book(id):
     try:
+      
         book = Book.query.get(id)
-
         if book is None:
             return jsonify({'message': 'Book not found'}), 404
-
         book_data = {
             'id': book.id,
             'title': book.title,
             'author': book.author,
             'img': book.img,
-            'release_date': book.release_date.strftime('%Y-%m-%d'),  # Format the date as a string
+            'release_date': book.release_date.strftime('%Y-%m-%d'), 
             'page_number': book.page_number,
             'category': book.category,
             'neo4j_id': book.neo4j_id,
             'desc': book.desc,
-           
+            # 'shcool_id': book.shcool_id,
         }
 
         return jsonify(book_data), 200
@@ -1346,12 +1614,10 @@ def get_book(id):
         logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500
 
-
 @admin.route('/create_pack', methods=['POST'])
 def create_pack():
     try:
         data = request.get_json()
-
         # Validate required fields
         required_fields = ['title', 'level',]
         for field in required_fields:
@@ -1366,37 +1632,48 @@ def create_pack():
         discount = data['discount']
         desc = data['desc']
         faq = data['faq']
-        
-
+        shcool_id =request.json['school_id']
+        public=data['public']
         # Check if the title is already used
         if Pack.query.filter_by(title=title).first():
             return jsonify({'message': 'Title is already used'}), 409
-
-        # Create a new pack
-        pack = Pack(title=title, level=level, img=img, age=age, price=price, discount=discount, desc=desc,faq=faq,duration=duration)
-
-        db.session.add(pack)
-        db.session.commit()
-        pack_data = {
-            'id': pack.id,
-            'title': pack.title,
-            'level': pack.level,
-            'img': pack.img,
-            'age': pack.age.value,
-            'price': pack.price,
-            'discount': pack.discount,
-            'desc': pack.desc,
-            'book_number': pack.book_number,
-            'faq' : pack.faq,
-            'duration':pack.duration
-
-        }
-        return jsonify({'message': 'Pack is successfully created', 'pack': pack_data}), 201
+            
+        invoicing_product ={
+                'appId':f'{ConfigClass.INVOICING_API_KEY}',
+                'title': title,
+                'price': price,
+                'vat':0,
+                'quantity': 999,
+                }
+        invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/product/create', json=invoicing_product)  
+        if invoicing_response.status_code==201:
+            invoicing_data = invoicing_response.json()
+            
+            prodcut_id = invoicing_data['_id']
+            # Create a new pack
+            pack = Pack(title=title, level=level, img=img, age=age, price=price, discount=discount, desc=desc,faq=faq,duration=duration,product_id_invoicing_api=prodcut_id,shcool_id=shcool_id)
+            db.session.add(pack)
+            db.session.commit()
+            pack_data = {
+               'id': pack.id,
+               'title': pack.title,
+               'level': pack.level,
+               'img': pack.img,
+               'age': pack.age.value,
+               'price': pack.price,
+               'discount': pack.discount,
+               'desc': pack.desc,
+               'book_number': pack.book_number,
+               'faq' : pack.faq,
+               'duration':pack.duration,
+               'product_id_invoicing_api':prodcut_id,
+               'shcool_id' :pack.shcool_id,
+               'public':pack.public
+                }
+            return jsonify({'message': 'Pack is successfully created', 'pack': pack_data}), 201
     except Exception as e:
         print(e)  # Log the error for debugging
         return jsonify({'message': 'Internal server error'}), 500
-
-
 
 @admin.route('/add_book_to_pack',methods=['POST'])
 # @login_required
@@ -1538,6 +1815,7 @@ def update_pack_details():
         pack_to_update.age = data['age'] if 'age' in data else pack_to_update.age.value
         pack_to_update.desc = data['desc'] if 'desc' in data else pack_to_update.desc
         pack_to_update.duration = data['duration'] if 'duration' in data else pack_to_update.duration 
+        pack_to_update.public = data['public'] if 'public' in data else pack_to_update.public 
 
         
         db.session.commit()
@@ -1553,7 +1831,8 @@ def update_pack_details():
             'desc': pack_to_update.desc,
             'book_number': pack_to_update.book_number,
             'faq' : pack_to_update.faq,
-            'duration':pack_to_update.duration
+            'duration':pack_to_update.duration,
+            'public':pack_to_update.public 
         }
 
         return jsonify({'message': 'Pack details updated successfully', 'pack': pack_data}), 200
@@ -1658,21 +1937,22 @@ def revoke_teacher_role():
 # @admin_required
 def show_pack_follow_requests():
     try:
+        school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
         pack_follow_requests = Follow_pack.query.all()
         
         all_packs = []
         for follow_request in pack_follow_requests:
-            pack = Pack.query.filter_by(id=follow_request.pack_id).first()
+            pack = Pack.query.filter_by(id=follow_request.pack_id,shcool_id=school_id).first()
             user_info = User.query.filter_by(id=follow_request.user_id).first()
-
-            all_packs.append({
-                'pack_id': pack.id,
-                'pack_title': pack.title,
-                'user_id': user_info.id,
-                'username': user_info.username,
-                'email': user_info.email,
-                'approved':follow_request.approved
-            })
+            if pack :
+                all_packs.append({
+                    'pack_id': pack.id,
+                    'pack_title': pack.title,
+                    'user_id': user_info.id,
+                    'username': user_info.username,
+                    'email': user_info.email,
+                    'approved':follow_request.approved
+                     })
 
         return jsonify({'pack_follow_requests': all_packs}), 200
     except Exception as e:
@@ -1821,22 +2101,24 @@ def get_one_pack_follow_requests():
 # @admin_required
 def show_session_follow_requests():
     try:
+        school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
         session_follow_requests = Follow_session.query.all()
         
         all_session = []
         for follow_request in session_follow_requests:
             session = Session.query.filter_by(id=follow_request.session_id).first()
+            pack = Pack.query.filter_by(id=session.pack_id,shcool_id=school_id).first()
             user_info = User.query.filter_by(id=follow_request.user_id).first()
-
-            all_session.append({
-                'session_id': session.id,
-                'session_name': session.name,
-                'user_id': user_info.id,
-                'username': user_info.username,
-                'email': user_info.email,
-                'approved':follow_request.approved
-            })
-
+            if pack :
+                
+                all_session.append({
+                    'session_id': session.id,
+                    'session_name': session.name,
+                    'user_id': user_info.id,
+                    'username': user_info.username,
+                    'email': user_info.email,
+                    'approved':follow_request.approved
+                     })
         return jsonify({'session_follow_requests': all_session}), 200
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
@@ -2537,6 +2819,229 @@ def get_word():
         # Log the error
         logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error','e':{str(e)}}), 500  
+
+#link pack to invoice 
+
+@admin.route('/link_pack_to_invoicing')
+def link_pack_to_invoicing():
+    try:
+        pack_id = request.json['pack_id']
+        pack=Pack.query.filter_by(id=pack_id).first()
+        invoicing_product ={
+                'appId':f'{ConfigClass.INVOICING_API_KEY}',
+                'title': pack.title,
+                'price': pack.price,
+                'vat':0,
+                'quantity': 999,
+                }
+        invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/product/create', json=invoicing_product)  
+        if invoicing_response.status_code==201:
+            invoicing_data = invoicing_response.json()
+            prodcut_id = invoicing_data['_id']
+            pack.product_id_invoicing_api =prodcut_id
+            db.session.commit()
+
+            return jsonify({'message':'pack has been linked to invoicing_api'})
+
+
+    except Exception as error:
+        print(error)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+# Create
+@admin.route('/create_shcool', methods=['POST'])
+def create_shcool():
+    try:
+        data = request.get_json()
+        name = data.get('name')
+        if not name:
+            raise ValueError('Name is required')
+        new_shcool = Shcool(name=name)
+        db.session.add(new_shcool)
+        db.session.commit()
+        result = {
+            'id':new_shcool.id,
+            'name':new_shcool.name
+        }
+        return jsonify({'message': 'Shcool created successfully','shcool':result }), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+# Read
+@admin.route('/get_all_shcools', methods=['GET'])
+def get_all_shcools():
+    try:
+        shcools = Shcool.query.all()
+        result = [{'id': shcool.id, 'name': shcool.name} for shcool in shcools]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Update
+@admin.route('/update_shcool/<int:id>', methods=['PUT'])
+def update_shcool(id):
+    try:
+        shcool = Shcool.query.get_or_404(id)
+        data = request.get_json()
+        name = data.get('name')
+        if not name:
+            raise ValueError('Name is required')
+        shcool.name = name
+        db.session.commit()
+        res ={
+            'id':id,
+            'name':name
+        }
+        return jsonify({'message': 'Shcool updated successfully','shcool':res})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+# Delete
+@admin.route('/delete_shcool/<int:id>', methods=['DELETE'])
+def delete_shcool(id):
+    try:
+        shcool = Shcool.query.get_or_404(id)
+        db.session.delete(shcool)
+        db.session.commit()
+        return jsonify({'message': 'Shcool deleted successfully'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@admin.route('/get_one_shcool/<int:id>')
+def get_one_shcool(id):
+    try:
+        shcool = Shcool.query.get_or_404(id)
+        result = {'id': shcool.id, 'name': shcool.name}
+        return jsonify({'shcool': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@admin.route('/generate_template/<int:id>')
+def generate_template(id):
+    try:
+        pack = Pack.query.get_or_404(id)
+        book_packs = Book_pack.query.filter_by(pack_id=id).all()  
+        book_pack_data = [book_pack.book_id for book_pack in book_packs]
+        new_template =  Pack_template(title=pack.title,level=pack.level,desc = pack.desc,age=pack.age.value,img=pack.img,faq=pack.faq,book_pack_ids=book_pack_data)
+        db.session.add(new_template)
+        db.session.commit()
+        return jsonify({'message': 'Template generated successfully'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@admin.route('/import_template/<int:id>')
+def import_template(id):
+    try:
+       
+        pack_template = Pack_template.query.get_or_404(id)      
+        shcool_user = User_shcool.query.filter_by(user_id=current_user.id).first()
+
+        book_packs_data = pack_template.book_pack_ids
+
+        new_pack =  Pack(title=pack_template.title,level=pack_template.level,desc = pack_template.desc,age=pack_template.age,img=pack_template.img,faq=pack_template.faq,shcool_id=shcool_user.shcool_id)
+        db.session.add(new_pack)       
+        db.session.commit()
+        
+        for item in book_packs_data:
+            book_pack = Book_pack(pack_id=new_pack.id, book_id=item)
+            db.session.add(book_pack)
+            db.session.commit()
+
+        return jsonify({'message': 'Template imported successfully'}) 
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@admin.route('/pack_templates/<int:template_id>', methods=['GET'])
+def get_pack_template(template_id):
+    try:
+        # Query the database for the Pack_template object with the given ID
+        template = Pack_template.query.get(template_id)
+        
+        # Check if the template exists
+        if template is None:
+            # Return a 404 Not Found response if the template does not exist
+            return jsonify({'error': 'Template not found'}), 404
+        book_packs = []
+        for book_pack_id in template.book_pack_ids:
+
+            book = Book.query.get(book_pack_id)
+            if book:
+                book_packs.append({
+                    'id': book.id,
+                    'title': book.title,
+                    'author': book.author,
+                    'img':book.img,
+                    'desc':book.desc,
+                    'release_date':book.release_date,
+                    'page_number':book.page_number,
+                    'category':book.category
+                    })
+
+        # Serialize the Pack_template object to JSON and return it
+        return jsonify({
+            'id': template.id,
+            'title': template.title,
+            'level': template.level,
+            'desc': template.desc,
+            'age': template.age,
+            'img': template.img,
+            'faq': template.faq,
+            'books': book_packs,
+            'template_type': template.template_type.value ,
+            'book_number':len(book_packs) 
+        })
+    except Exception as e:
+        # Return a 500 Internal Server Error response if an unexpected error occurs
+        return jsonify({'error': 'Internal Server Error', 'message': str(e)}), 500
+# Define a route to handle GET requests for all Pack_template objects
+@admin.route('/pack_templates', methods=['GET'])
+def get_all_pack_templates():
+    try:
+        # Query the database to retrieve all Pack_template objects
+        templates = Pack_template.query.all()
+
+        # Serialize each Pack_template object to JSON
+        serialized_templates = []
+        for template in templates:
+            # Retrieve each book corresponding to the book pack IDs
+            book_packs = []
+            for book_pack_id in template.book_pack_ids:
+                book = Book.query.get(book_pack_id)
+                if book:
+                    book_packs.append({
+                        'id': book.id,
+                        'title': book.title,
+                        'author': book.author,
+                        'img':book.img,
+                        'desc':book.desc,
+                        'release_date':book.release_date,
+                        'page_number':book.page_number,
+                        'category':book.category
+                        })
+
+            serialized_templates.append({
+                'id': template.id,
+                'title': template.title,
+                'level': template.level,
+                'desc': template.desc,
+                'age': template.age,
+                'img': template.img,
+                'faq': template.faq,
+                'books': book_packs,
+                'template_type': template.template_type.value,
+                'book_number':len(book_packs)   
+            })
+
+        # Return the list of serialized Pack_template objects as JSON response
+        return jsonify(serialized_templates)
+    except Exception as e:
+        # Return a 500 Internal Server Error response if an unexpected error occurs
+        return jsonify({'error': 'Internal Server Error', 'message': str(e)}), 500  
 
 
 '''

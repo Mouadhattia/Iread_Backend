@@ -72,7 +72,7 @@ def search_books():
 
         if book:
             sessions = Session.query.filter_by(book_id=book_id).filter(Session.start_date > datetime.now()).all()
-
+            old_sessions = Session.query.filter_by(book_id=book_id).filter(Session.start_date <= datetime.now()).all()
             book_info = {
                 'title': book.title,
                 'author': book.author,
@@ -91,6 +91,7 @@ def search_books():
                     "end": session.end_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
                     "teacher": Teacher.query.get(session.teacher_id).email,
                     "pack_id": session.pack_id,
+                    "unit_id":session.unit_id,
                     "extendedProps": {
                         "location": session.location.value,
                         "description": session.description,
@@ -101,6 +102,25 @@ def search_books():
                 book_info['sessions'] = session_info
             else:
                 book_info['sessions'] = []
+            
+            if old_sessions :
+                old_session_info = [{
+                    "id": session.id,
+                    "title": session.name,
+                    "start": session.start_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+                    "end": session.end_date.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+                    "teacher": Teacher.query.get(session.teacher_id).email,
+                    "pack_id": session.pack_id,
+                    "unit_id":session.unit_id,
+                    "extendedProps": {
+                        "location": session.location.value,
+                        "description": session.description,
+                        "category": "primary"
+                    }
+                } for session in old_sessions]
+                book_info['old_sessions']=old_session_info    
+            else:
+                book_info['old_sessions']=[]               
 
             return jsonify(book_info), 200
         else:
@@ -196,7 +216,7 @@ def show_all_pack():
         if title_search:
             packs_query = packs_query.filter(Pack.title.ilike(f'%{title_search}%'))
 
-        packs = packs_query.all()
+        packs = packs_query.filter_by(public=True).all()
        
         if packs:
             packs_info = []
@@ -215,14 +235,14 @@ def show_all_pack():
                     'faq': pack.faq,
                     'codes': num_active_codes ,
                     'enrolled' :enrolled,
-                    'duration':pack.duration
-                    
+                    'duration':pack.duration,
+                    'public':pack.public
                 }
                 packs_info.append(pack_info)
 
             return jsonify({'packs': packs_info}), 200
         else:
-            return jsonify({'message': 'No packs available'}), 200
+            return jsonify({'message': 'No packs available'}),200
     except Exception as e:
         return jsonify({'message': str(e)}), 500
 
@@ -250,7 +270,9 @@ def get_pack_details():
                 'faq':pack.faq,
                 'code':num_active_codes,
                 'enrolled' : enrolled,
-                'duration':pack.duration
+                'duration':pack.duration,
+                'product_id_invoicing_api':pack.product_id_invoicing_api,
+                'public':pack.public
             }), 200
         else:
             return jsonify({'message': 'Pack not found'}), 404

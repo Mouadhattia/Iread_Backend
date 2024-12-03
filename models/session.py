@@ -5,6 +5,7 @@ from models.book import Book
 from models.user import Teacher
 from enum import Enum
 from models.pack import Pack
+from models.unit import Unit
 
 class Location(Enum):
     ONLINE='online'
@@ -21,6 +22,7 @@ class Session(db.Model):
     img=db.Column(db.String(100),nullable=True)
     capacity=db.Column(db.Integer,default=20)
     book_id=db.Column(db.ForeignKey(Book.id))
+    unit_id=db.Column(db.ForeignKey(Unit.id),nullable=True)
     teacher_id=db.Column(db.ForeignKey(Teacher.id))
     price=db.Column(db.Float,default=0)
     discount=db.Column(db.Float,default=0)
@@ -30,8 +32,9 @@ class Session(db.Model):
     pack_id=db.Column(db.ForeignKey(Pack.id))
     description = db.Column(db.String(200))
     active=db.Column(db.Boolean,nullable=False,default=False)
-
+    meet_link = db.Column(db.String(100),nullable=True)     
     
+  
 
     def __repr__(self):
         return '< Session %s >' %self.date

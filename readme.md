@@ -84,11 +84,11 @@ These prerequisites ensure that you have the necessary tools and software to set
     - Activate the virtual environment:
         - On Windows:
             ```
-            .venv\Scripts\activate
+            venv\Scripts\activate
             ```
         - On Linux/macOS:
             ```
-            source .venv/bin/activate
+            source venv/bin/activate
             ```
     - Your command prompt will change to show the name of the activated environment.
 

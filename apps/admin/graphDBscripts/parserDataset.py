@@ -1,5 +1,5 @@
 import csv
-from Datasets.db import DataSetDB, Neo4jDriver
+from db import DataSetDB, Neo4jDriver
 import nltk
 from nltk import word_tokenize, pos_tag
 #nltk.download('punkt')

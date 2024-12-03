@@ -53,6 +53,7 @@ class Reader(User):
     __tablename__ = "reader"
     id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
     level=db.Column(db.String(10),nullable=True)
+    client_id_invoicing_api =db.Column(db.String(100), nullable=True)
     __mapper_args__ = {'polymorphic_identity': 'reader'}
     
     def __repr__(self):
@@ -80,6 +81,7 @@ class Teacher(User):
 class Admin(User):
     __tablename__ = "admin"
     id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    user_id_invoicing_api =db.Column(db.String(100), nullable=True)
     __mapper_args__ = {'polymorphic_identity': 'admin'}
     
 
@@ -89,6 +91,7 @@ class Admin(User):
 class Assistant(User):
     __tablename__ = "assistant"
     id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    user_id_invoicing_api =db.Column(db.String(100), nullable=True)
     __mapper_args__ = {'polymorphic_identity': 'assistant'}
     
 

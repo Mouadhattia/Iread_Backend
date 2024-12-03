@@ -9,10 +9,11 @@ class Neo4jDriver:
     """
     This class provides a simple interface for creating and managing Neo4j database connections.
     """
-    DEFAULT_URI = "neo4j+ssc://01039f38.databases.neo4j.io"
+    #neo4j+ssc:// and not
+    DEFAULT_URI = "neo4j+ssc://0ed7bfb1.databases.neo4j.io" 
     #DEFAULT_URI = "bolt://localhost:7687" 
     """The default URI to use when connecting to the Neo4j database."""
-    DEFAULT_AUTH = ("neo4j", "ISLdTbysBGCHzydezsV_uc_gcUv_xsjK7PzzW0xpdfk")
+    DEFAULT_AUTH = ("neo4j", "My9yAacQR0W_K4TG377HEoBEBTWQ1sMWe-BCL48b4SI")
     #DEFAULT_AUTH = ("neo4j", "0000")
     """The default auth tuple to use when connecting to the Neo4j database."""
     def __init__(self, uri=DEFAULT_URI, auth=DEFAULT_AUTH):

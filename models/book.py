@@ -2,6 +2,7 @@
 #@class Book
 from extensions import db
 from sqlalchemy import UniqueConstraint
+from models.shcool import Shcool
 
 
 ##
@@ -20,6 +21,7 @@ class Book(db.Model):
     page_number=db.Column(db.Integer,nullable=True)
     category=db.Column(db.String(100),nullable=True)
     neo4j_id=db.Column(db.Integer,nullable=True) #False
+    
 
 
     __table_args__ = (
