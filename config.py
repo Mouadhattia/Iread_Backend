@@ -13,10 +13,10 @@ class ConfigClass:
     MAIL_USE_SSL = False
     MAIL_USE_TLS = True
     MAIL_USERNAME = 'intellect.education.contact@gmail.com'
-    MAIL_PASSWORD = 'your_app_specific_password'  # Replace with your Gmail app-specific password
+    MAIL_PASSWORD = 'gvwdouhlcazzytnp'  # Replace with your Gmail app-specific password
     MAIL_DEBUG = False   
-    FRONT_URL = 'http://iread.tn'
-    API_URL = 'http://localhost:5003'
+    FRONT_URL = 'https://iread.education'
+    API_URL = 'https://api.iread.education'
     QUIZ_API = 'https://quiz.iread.tn/user'
     QUIZ_API_KEY = '65800f77a2ce2e2c88ebd8bd'
     INVOICING_API = 'https://invoicing-api.iread.tn'

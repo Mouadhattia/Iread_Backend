@@ -24,7 +24,6 @@ class User(db.Model, UserMixin):
     type = db.Column(db.String(20))
     quiz_id=db.Column(db.String(100))
 
-
     __mapper_args__ = {
         'polymorphic_on': type,
         'polymorphic_identity': 'user'

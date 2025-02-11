@@ -68,11 +68,12 @@ def search_books():
 
   try:
         book_id=request.json['id']
+        pack_id = request.json['pack_id']
         book = Book.query.get(book_id)
 
         if book:
-            sessions = Session.query.filter_by(book_id=book_id).filter(Session.start_date > datetime.now()).all()
-            old_sessions = Session.query.filter_by(book_id=book_id).filter(Session.start_date <= datetime.now()).all()
+            sessions = Session.query.filter_by(book_id=book_id,pack_id=pack_id).filter(Session.start_date > datetime.now()).all()
+            old_sessions = Session.query.filter_by(book_id=book_id,pack_id=pack_id).filter(Session.start_date <= datetime.now()).all()
             book_info = {
                 'title': book.title,
                 'author': book.author,
@@ -92,6 +93,7 @@ def search_books():
                     "teacher": Teacher.query.get(session.teacher_id).email,
                     "pack_id": session.pack_id,
                     "unit_id":session.unit_id,
+                
                     "extendedProps": {
                         "location": session.location.value,
                         "description": session.description,
@@ -112,6 +114,7 @@ def search_books():
                     "teacher": Teacher.query.get(session.teacher_id).email,
                     "pack_id": session.pack_id,
                     "unit_id":session.unit_id,
+                  
                     "extendedProps": {
                         "location": session.location.value,
                         "description": session.description,

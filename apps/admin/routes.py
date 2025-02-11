@@ -25,6 +25,7 @@ from models.teacher_postulate import Teacher_postulate
 from models.follow_pack import Follow_pack
 from models.session_quiz import Session_quiz
 from models.about_book import About_Book
+from models.book_text import Book_text
 from models.notification_user import Notification_user
 import logging
 import requests
@@ -42,11 +43,12 @@ import webcolors
 import random
 import spacy
 from apps.admin.paserStory import get_tenses_words
-
 from apps.admin.graphDBscripts.db import Neo4jDriver,DataSetDB
+import nltk
+from nltk.corpus import wordnet
+from googletrans import Translator
 
-
-
+translator = Translator()
 ## @brief Decorator to enforce admin access for a view function.
 #
 # This decorator checks if the current user is an admin before allowing access to the decorated view function.
@@ -69,6 +71,23 @@ def user_email_exist(email):
     else:
         return False
 
+
+def get_short_definition(word):
+    try:
+        synsets = wordnet.synsets(word)
+        if synsets:
+            return synsets[0].definition()  # Return the first definition
+        return "Definition not found."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+def translate_to_arabic(text):
+    try:
+        translation = translator.translate(text, src='en', dest='ar')
+        return translation.text
+    except Exception as e:
+        return f"Translation error: {str(e)}"
 ## @brief Creation of the blueprint for user management by administrators.
 #
 # This blueprint defines routes and views for managing users by administrators.
@@ -188,9 +207,44 @@ def show_all_readers():
         return jsonify({
             'readers': reader_data
         }), 200
+
+
     except Exception as e:
         print(e)
         return jsonify({'message': 'Internal server error'}), 500
+
+
+@admin.route('/followers/<int:pack_id>', methods=['GET'])
+def get_users_following_pack(pack_id):
+    """
+    Get all users who follow a specific pack by pack_id.
+    """
+    try:
+        # Query to get the User details for the given pack_id
+        followers = (
+            db.session.query(User)
+            .join(Follow_pack, Follow_pack.user_id == User.id)
+            .filter(Follow_pack.pack_id == pack_id)
+            .all()
+        )
+
+        # Create a response with user details
+        follower_details = [
+            {
+                'email': follower.email,
+                'username': follower.username,
+                'confirmed': follower.confirmed,
+                'id': follower.id,
+                'img': follower.img,
+                'approved': follower.approved,
+                'quiz_id': follower.quiz_id
+            }
+            for follower in followers
+        ]
+
+        return jsonify({'readers': follower_details}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # get all teachers
 @admin.route('/show_all_teachers')
@@ -792,16 +846,22 @@ def get_sessions():
     teacher_color_mapping = {}  # Dictionary to store teacher colors
 
     for session in sessions:
-
         teacher_id = session.teacher_id
         teacher = Teacher.query.get(teacher_id)
-        # Check if the teacher already has a color assigned
-        if teacher_id not in teacher_color_mapping:
-            # Generate a random color for the current teacher
-            teacher_color_mapping[teacher_id] = generate_random_color()
 
-        # Use the color associated with the current teacher
-        teacher_color = teacher_color_mapping[teacher_id]
+        # Handle the case where teacher is None
+        if not teacher:
+            teacher_name = "Unknown Teacher"
+            teacher_color = "#000000"  # Default color for unknown teacher
+        else:
+            # Check if the teacher already has a color assigned
+            if teacher_id not in teacher_color_mapping:
+                # Generate a random color for the current teacher
+                teacher_color_mapping[teacher_id] = generate_random_color()
+
+            # Use the color associated with the current teacher
+            teacher_color = teacher_color_mapping[teacher_id]
+            teacher_name = teacher.username
 
         session_list.append({
             'id': session.id,
@@ -809,7 +869,7 @@ def get_sessions():
             'capacity': session.capacity,
             'book_id': session.book_id,
             'teacher_id': teacher_id,
-            'teacher_name': teacher.username,
+            'teacher_name': teacher_name,
             'teacher_color': teacher_color,
             'location': session.location.value,
             'start_date': session.start_date,
@@ -817,10 +877,11 @@ def get_sessions():
             'pack_id': session.pack_id,
             'description': session.description,
             'active': session.active,
-            'unit_id':session.unit_id
+            'unit_id': session.unit_id
         })
 
     return jsonify({'sessions': session_list}), 200
+
 
 # get session by teacher
 @admin.route('/sessions_by_teacher/<int:teacher_id>', methods=['GET'])
@@ -1250,7 +1311,7 @@ def get_all_books():
     try:
         # Query all books from the database
         books = Book.query.all()
-
+   
         # Create a list to store the book data
         book_list = []
 
@@ -2051,6 +2112,49 @@ def delete_follow_request():
         logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500
 
+#create follow pack 
+@admin.route('/create_follow_pack', methods=['POST'])
+# @login_required
+def create_follow_pack():
+    try:
+        pack_id = request.json.get('pack_id')
+        user_id = request.json.get('user_id')
+
+        if not pack_id or not user_id:
+            return jsonify({'message': 'Pack ID and User ID are required'}), 400
+
+        # Find the pack
+        pack = Pack.query.filter_by(id=pack_id).first()
+        if not pack:
+            return jsonify({'message': 'Pack not found'}), 404
+
+        # Check if the user already follows the pack
+        existing_pack = Follow_pack.query.filter_by(user_id=user_id, pack_id=pack_id).first()
+        if existing_pack:
+            return jsonify({'message': 'You already follow this pack'}), 400
+
+        # Add a new follow_pack record
+        follow_pack_entry = Follow_pack(user_id=user_id, pack_id=pack_id, approved=True)
+        db.session.add(follow_pack_entry)
+        db.session.commit()
+
+        followed_pack = {
+            'approved': follow_pack_entry.approved,
+            'id': pack.id,
+            'level': pack.level,
+            'book_number': pack.book_number,
+            'price': pack.price,
+            'title': pack.title
+        }
+
+        return jsonify({'message': 'Pack successfully added to your pack list', 'followed_pack': followed_pack}), 200
+
+    except Exception as e:
+        print(f"Error: {e}")  # Log the error for debugging
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+
 
 # Define a route to get follow requests by user and pack ID.
 @admin.route('/get_one_pack_follow_requests', methods=['POST'])
@@ -2095,6 +2199,64 @@ def get_one_pack_follow_requests():
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500
+
+
+#create follow session 
+@admin.route('/create_follow_session', methods=['POST'])
+# @login_required
+def create_follow_session():
+    try:
+        session_id = request.json.get('session_id')
+        user_id = request.json.get('user_id')
+
+        if not session_id or not user_id:
+            return jsonify({'message': 'Session ID and User ID are required'}), 400
+
+        session = Session.query.filter_by(id=session_id).first()
+        if not session:
+            return jsonify({'message': 'Session not found'}), 404
+        user = User.query.filter_by(id=user_id).first()
+        if not user :
+            return jsonify({'message': 'User not found'}), 404
+            
+        follow_pack = Follow_pack.query.filter_by(pack_id=session.pack_id, user_id=user_id).first()
+        if not follow_pack or not follow_pack.approved:
+            return jsonify({'message': 'No matching or approved Follow_pack found'}), 404
+
+        follows_count = Follow_session.query.filter_by(session_id=session.id).count()
+        if session.capacity <= follows_count:
+            return jsonify({'message': 'Session is full'}), 404
+
+        # Follow book if not already followed
+        follow_book_exists = Follow_book.query.filter_by(
+            user_id=user_id, book_id=session.book_id, pack_id=session.pack_id
+        ).first()
+        if not follow_book_exists:
+            follow_book = Follow_book(user_id=user_id, book_id=session.book_id, pack_id=session.pack_id)
+            db.session.add(follow_book)
+
+        # Follow session
+        follow = Follow_session(user_id=user_id, session_id=session_id, approved=True)
+        db.session.add(follow)
+        db.session.commit()
+        
+
+        followed_session= {
+                    'session_id': session.id,
+                    'session_name': session.name,
+                    'user_id': user.id,
+                    'username': user.username,
+                    'email': user.email,
+                    'approved':follow.approved
+                     }
+        return jsonify({'message': 'session has been created ','follow_session':followed_session}), 200
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+
+
 
 @admin.route('/show_session_follow_requests')
 # @login_required
@@ -3043,6 +3205,107 @@ def get_all_pack_templates():
         # Return a 500 Internal Server Error response if an unexpected error occurs
         return jsonify({'error': 'Internal Server Error', 'message': str(e)}), 500  
 
+
+# book Text 
+@admin.route('/book_text', methods=['POST'])
+def create_book_text():
+    try:
+        data = request.json
+        print(data)
+        if not data or not data.get('book_id') or not data.get('text'):
+            return jsonify({"error": "Missing 'book_id' or 'text'"}), 400
+     
+        new_entry = Book_text(
+            book_id=data['book_id'],
+            text=data['text']
+        )
+        db.session.add(new_entry)
+        db.session.commit()
+        return jsonify({"message": "Book text created successfully", "id": new_entry.id}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --------- READ ALL ---------
+@admin.route('/book_text', methods=['GET'])
+def get_all_book_texts():
+    try:
+        entries = Book_text.query.all()
+        result = [{
+            "id": entry.id,
+            "book_id": entry.book_id,
+            "text": entry.text
+        } for entry in entries]
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --------- READ ONE ---------
+@admin.route('/book_text/<int:book_id>', methods=['GET'])
+def get_book_text_by_book_id(book_id):
+    try:
+        entry = Book_text.query.filter_by(book_id=book_id).first()
+        if not entry:
+            return jsonify({"error": "Entry not found for the given book_id"}), 404
+        return jsonify({
+            "id": entry.id,
+            "book_id": entry.book_id,
+            "text": entry.text
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --------- UPDATE ---------
+@admin.route('/book_text/<int:book_id>', methods=['PUT'])
+def update_book_text_by_book_id(book_id):
+    try:
+        entry = Book_text.query.filter_by(book_id=book_id).first()
+        if not entry:
+            return jsonify({"error": "Entry not found for the given book_id"}), 404
+
+        data = request.json
+        if data.get('text'):
+            entry.text = data['text']
+
+        db.session.commit()
+        return jsonify({"message": "Text updated successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --------- DELETE ---------
+@admin.route('/book_text/<int:id>', methods=['DELETE'])
+def delete_book_text(id):
+    try:
+        entry = Book_text.query.get(id)
+        if not entry:
+            return jsonify({"error": "Entry not found"}), 404
+
+        db.session.delete(entry)
+        db.session.commit()
+        return jsonify({"message": "Entry deleted successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+##---------word defenition----------
+
+@admin.route('/define', methods=['GET'])
+def define_word():
+    try:
+        word = request.args.get('word')
+        if not word:
+            return jsonify({"error": "Please provide a word"}), 400
+
+        definition_en = get_short_definition(word)
+        definition_ar = translate_to_arabic(word)
+
+        return jsonify({
+            "word": word,
+            "definition_en": definition_en,
+            "definition_ar": definition_ar
+        })
+    
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 '''
 

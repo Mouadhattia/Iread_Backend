@@ -501,48 +501,6 @@ def get_accounts():
 
 
 #current user        
-# @reader.route('/user_authenticated')
-# def user_authenticated():
-#     try:
-#         if current_user.is_authenticated:
-#             client_id_invoicing_api = getattr(current_user, 'client_id_invoicing_api', None)
-#             quiz_id = getattr(current_user, 'quiz_id', None)
-#             if current_user.type == "admin":
-                
-#                 school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
-
-#                 school = Shcool.query.get(school_id)
-                
-#                 return jsonify({
-#                     'is_authenticated': current_user.is_authenticated,
-#                     'username': current_user.username,
-#                     'email': current_user.email,
-#                     'img': current_user.img,
-#                     'role': current_user.type,
-#                     'quiz_id': quiz_id,
-#                     'id': current_user.id,
-#                     'client_id_invoicing_api': client_id_invoicing_api,
-#                     'school_id': school.id,
-#                     'school': school.name
-#                 })
-#             else:
-#                 school_ids = User_shcool.query.filter_by(user_id=current_user.id).all()
-#                 schools = [Shcool.query.get(school_id.shcool_id) for school_id in school_ids]
-#                 return jsonify({
-#                     'is_authenticated': current_user.is_authenticated,
-#                     'username': current_user.username,
-#                     'email': current_user.email,
-#                     'img': current_user.img,
-#                     'role': current_user.type,
-#                     'quiz_id': quiz_id,
-#                     'id': current_user.id,
-#                     'client_id_invoicing_api': client_id_invoicing_api,
-#                     'schools': [{'id': school.id, 'name': school.name} for school in schools]
-#                 })     
-#     except Exception as e:     
-#         return jsonify({'error': str(e), 'message': 'Internal server error'})
-
-#current user        
 @reader.route('/user_authenticated')
 def user_authenticated():
     try:
@@ -733,9 +691,10 @@ def logout():
 @reader.route('/forget_password',methods=['POST'])
 def forget_password():
     try:
+        print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         email=request.json['email']
         if not user_email_exist(email):
-            return jsonify({'message':'Any account with this email'}),404
+            return jsonify({'message':' There is no account with this email'}),404
         else:
             confirmation_token=generate_confirmed_token(email)
             confirm_link = f"{ConfigClass.API_URL}/reader/password_reset/{confirmation_token}"
