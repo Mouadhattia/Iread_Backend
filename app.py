@@ -86,7 +86,7 @@ from apps.main.routes import main
 
 @app.route('/')
 def home():
-    return "<h1>Welcome to the home page</h1>"
+    return "<h3>Server is running...</h3>"
 
 ## @brief Merge the 'admin','main' and 'auth' blueprints into the app (the application).
 app.register_blueprint(reader)

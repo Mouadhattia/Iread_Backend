@@ -5,6 +5,7 @@ from datetime import datetime
 from flask import Blueprint,request,jsonify,render_template, redirect,make_response,session
 from flask_bcrypt import Bcrypt
 from models.user import User,Reader,Teacher
+from models.game_result import Game_result, GameEnum
 from models.teacher_postulate import Teacher_postulate
 from models.pack import Pack
 from models.follow_pack import Follow_pack
@@ -16,6 +17,7 @@ from models.shcool import Shcool
 from models.profile import Profile
 from models.book_pack import Book_pack
 from models.session import Session
+from models.book_text import Book_text
 from models.follow_session import Follow_session
 from apps.main.email import generate_confirmed_token,reader_confirm_token
 from extensions import mail,login_manager,db
@@ -38,6 +40,7 @@ from flask import jsonify
 from sqlalchemy import exists, and_
 import secrets 
 
+from sqlalchemy.sql import func
 
 
 
@@ -68,6 +71,23 @@ login_manager.init_app(reader)
 #
 # @param user_id: The unique identifier of the user.
 # @return: The user object corresponding to the provided user_id, or None if the user with the specified ID is not found.
+
+
+def split_words_into_stages(words, game_types, difficulty="hard"):
+    game_data = {}
+
+    for game in game_types:
+        stages = [words[i:i+3] for i in range(0, len(words), 3)]  # Split words into stages of 3
+
+        game_data[game] = {
+            "stages": stages,
+            "difficulty": difficulty,
+            "words": words
+        }
+
+    return game_data
+
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -1715,6 +1735,190 @@ def get_packs_by_shcoo():
 
 
 
+
+@reader.route('/get_book_games/<book_id>')
+def get_book_games(book_id):
+    try:
+        book_text = Book_text.query.filter_by(book_id=book_id).first()
+
+        if book_text and book_text.text:
+            words_list = book_text.text.strip().split()  # Convert text into a list of words
+         
+            
+         
+            
+            return jsonify({'words': words_list}), 200
+        else:
+            return jsonify({'message': 'No text available'}), 200
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+@reader.route('/game-result/', methods=['POST'])
+def create_game_result():
+    try:
+        data = request.get_json()
+       
+     
+        # Validate required fields
+        if not data or 'score' not in data or 'game' not in data or 'user_id' not in data or 'day' not in data:
+        
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        # Validate game enum
+        try:
+            game_status = GameEnum(data['game'])  # Convert string to enum
+        except ValueError:
+       
+            return jsonify({'error': 'Invalid game status'}), 400
+   
+        # Validate user existence
+        user = User.query.get(data['user_id'])
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        # Check if a game result already exists for the same user and day
+        existing_result = Game_result.query.filter_by(user_id=data['user_id'], day=data['day'],game=game_status,book_id=data['book_id']).first()
+
+        if existing_result:
+            result_data = {
+                'id': existing_result.id,
+                'book_id': existing_result.book_id,
+                'score': existing_result.score,
+                'game': existing_result.game.value,
+                'user_id': existing_result.user_id,
+                'day': existing_result.day,
+                'completed': existing_result.completed,
+                'words_learned': existing_result.words_learned
+            }
+         
+            if existing_result.completed:
+                return jsonify({'message': 'You have already finished the game today. Come back tomorrow!', 'result': result_data}), 200
+            else:
+                return jsonify({'message': 'You already played the game. Do you want to continue?', 'result': result_data}), 200
+
+        # If no existing result, create a new one
+        new_result = Game_result(
+            score=data['score'],
+            book_id=data['book_id'],
+            game=game_status,
+            user_id=data['user_id'],
+            day=data['day'],
+        )
+
+        db.session.add(new_result)
+        db.session.commit()
+
+        result_data = {
+            'id': new_result.id,
+            'book_id': new_result.book_id,
+            'score': new_result.score,
+            'game': new_result.game.value,
+            'user_id': new_result.user_id,
+            'day': new_result.day,
+            'completed': new_result.completed,
+            'words_learned': new_result.words_learned
+        }
+
+        return jsonify({'message': 'Game result created successfully', 'result': result_data}), 201
+
+    except Exception as e:
+        db.session.rollback()  # Rollback in case of an error
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+@reader.route('/game-result/<int:result_id>', methods=['PUT'])
+def update_game_result(result_id):
+    try:
+        data = request.get_json()
+      
+        # Fetch the existing game result
+        game_result = Game_result.query.get(result_id)
+        if not game_result:
+            return jsonify({'error': 'Game result not found'}), 404
+        
+        # Validate and update fields
+        if 'score' in data:
+            game_result.score = data['score']
+        
+        if  'words_learned' in data :
+            game_result.words_learned = data['words_learned']
+        
+        if 'completed' in data:
+            game_result.completed = data['completed']
+        
+        
+
+        db.session.commit()
+   
+        return jsonify({'message': 'Game result updated successfully'}), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+    
+
+@reader.route('/game-results', methods=['GET'])
+def get_game_results():
+    try:
+        game = request.args.get('game')
+        book_id= request.args.get('book_id')
+        
+        if not game:
+            return jsonify({'error': 'Game query parameter is required'}), 400
+        
+        try:
+            game_enum = GameEnum(game)
+        except ValueError:
+            return jsonify({'error': 'Invalid game type'}), 400
+        
+        results = (db.session.query(
+                Game_result.user_id,
+                func.sum(Game_result.score).label('total_score')
+            )
+            .filter_by(game=game_enum,book_id=book_id)
+            .group_by(Game_result.user_id)
+            .order_by(func.sum(Game_result.score).desc())
+            .all()
+        )
+        
+        response = []
+        for rank, (user_id, total_score) in enumerate(results):
+            username = User.query.get(user_id).username if user_id else None
+            response.append({
+                'username': username,
+                'score': total_score,
+                'rank': rank + 1
+            })
+        
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+@reader.route('/game-results-all', methods=['GET'])
+def get_ranked_game_results():
+     
+     
+    try:
+        book_id= request.args.get('book_id')
+        
+        results = db.session.query(
+            Game_result.user_id,
+            func.sum(Game_result.score).label('total_score')
+        
+        ).filter_by(book_id=book_id).group_by(Game_result.user_id).order_by(func.sum(Game_result.score).desc()).all()
+
+        ranked_results = [
+            {"username": User.query.get(user_id).username if user_id else None, "score": total_score, "rank": rank + 1}
+            for rank, (user_id, total_score) in enumerate(results)
+        ]
+
+        return jsonify(ranked_results)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500   
 '''
 
 
