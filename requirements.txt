@@ -42,7 +42,8 @@ mysql-connector==2.2.9
 mysqlclient==2.2.1
 neo4j==5.16.0
 nltk==3.8.1
-numpy==1.26.4
+numpy==1.24.4; python_version < "3.9"
+numpy==1.26.4; python_version >= "3.9"
 oauthlib==2.1.0
 packaging==23.2
 preshed==3.0.9
