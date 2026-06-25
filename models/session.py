@@ -32,6 +32,7 @@ class Session(db.Model):
     pack_id=db.Column(db.ForeignKey(Pack.id))
     description = db.Column(db.String(200))
     active=db.Column(db.Boolean,nullable=False,default=False)
+    jitsi_room = db.Column(db.String(255), nullable=True, unique=True, index=True)
     meet_link = db.Column(db.String(100),nullable=True)     
     
   

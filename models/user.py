@@ -3,6 +3,7 @@
 # @class Reader
 # @class Teacher
 # @class Admin
+# @class SuperAdmin
 
 from datetime import datetime
 from flask_login import UserMixin
@@ -87,6 +88,15 @@ class Admin(User):
    
     def __repr__(self):
         return '<Admin %s>' % self.username
+
+class SuperAdmin(User):
+    __tablename__ = "super_admin"
+    id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    __mapper_args__ = {'polymorphic_identity': 'super_admin'}
+
+    def __repr__(self):
+        return '<SuperAdmin %s>' % self.username
+
 class Assistant(User):
     __tablename__ = "assistant"
     id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)

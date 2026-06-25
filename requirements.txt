@@ -26,6 +26,7 @@ Flask-OAuthlib==0.9.6
 Flask-SQLAlchemy==3.0.3
 frozenlist==1.4.1
 geoip2==4.8.0
+googletrans==4.0.0rc1
 greenlet==3.0.3
 idna==3.6
 itsdangerous==2.1.2
@@ -41,12 +42,13 @@ mysql-connector==2.2.9
 mysqlclient==2.2.1
 neo4j==5.16.0
 nltk==3.8.1
-numpy==1.26.3
+numpy==1.26.4
 oauthlib==2.1.0
 packaging==23.2
 preshed==3.0.9
 pydantic==2.5.3
 pydantic_core==2.14.6
+PyJWT==2.8.0
 pytz==2023.3.post1
 regex==2024.5.15
 requests==2.31.0
@@ -61,7 +63,7 @@ srsly==2.4.8
 thinc==8.2.2
 tqdm==4.66.1
 typer==0.9.0
-typing_extensions==4.9.0
+typing_extensions==4.15.0
 ua-parser==0.18.0
 urllib3==2.1.0
 user-agents==2.2.0
@@ -69,4 +71,6 @@ wasabi==1.1.2
 weasel==0.3.4
 webcolors==1.13
 Werkzeug==2.2.3
+dtw-python==1.5.3
+whisper-timestamped==1.15.9
 yarl==1.9.4

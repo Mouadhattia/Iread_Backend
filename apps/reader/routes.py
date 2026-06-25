@@ -2,9 +2,10 @@
 # Blueprint for user readers' authentication.
 # Contains routes and functions related to user authentication.
 from datetime import datetime
-from flask import Blueprint,request,jsonify,render_template, redirect,make_response,session
+import os
+from flask import Blueprint,request,jsonify,render_template, redirect,make_response,session,send_file
 from flask_bcrypt import Bcrypt
-from models.user import User,Reader,Teacher
+from models.user import User,Reader,Teacher,Admin,SuperAdmin
 from models.game_result import Game_result, GameEnum
 from models.teacher_postulate import Teacher_postulate
 from models.pack import Pack
@@ -14,12 +15,31 @@ from models.notification_user import Notification_user
 from models.book import Book
 from models.user_shcool import User_shcool
 from models.shcool import Shcool
+from models.school_invitation_code import SchoolInvitationCode
+from models.book_story import BookStory
+from models.reader_story_progress import ReaderStoryProgress
+from models.school_book_instance import SchoolBookInstance
+from models.school_pack_instance import SchoolPackInstance
+from models.school_public_page import (
+    SchoolPublicPage,
+    default_school_public_sections,
+    generate_unique_school_slug,
+    normalize_school_slug
+)
 from models.profile import Profile
 from models.book_pack import Book_pack
 from models.session import Session
 from models.book_text import Book_text
 from models.follow_session import Follow_session
 from apps.main.email import generate_confirmed_token,reader_confirm_token
+from apps.jitsi import is_online_session, serialize_jitsi_call
+from apps.game_calendar import (
+    GameCalendarError,
+    game_error_response,
+    get_player_game_payload,
+    parse_optional_play_date,
+    split_legacy_words_from_text,
+)
 from extensions import mail,login_manager,db
 from flask_mail import Message
 from config import ConfigClass
@@ -37,7 +57,7 @@ import time
 from user_agents import parse
 from sqlalchemy.orm import aliased
 from flask import jsonify
-from sqlalchemy import exists, and_
+from sqlalchemy import exists, and_, or_
 import secrets 
 
 from sqlalchemy.sql import func
@@ -114,8 +134,730 @@ def get_cookies():
     opener = urllib.request.build_opener(cookie_handler)  
 
     return opener  
+
+def get_geolite_city_path():
+    return (
+        os.environ.get('GEOLITE_CITY_DB_PATH')
+        or os.path.join(os.getcwd(), 'GeoLite2-City', 'GeoLite2-City.mmdb')
+    )
+
 def generate_unique_user_id():
     return str(uuid.uuid4())  
+
+def normalize_invitation_code(code):
+    if not code:
+        return None
+    return str(code).strip().upper()
+
+def add_user_to_school(user_id, school_id):
+    if User_shcool.query.filter_by(user_id=user_id, shcool_id=school_id).first():
+        return False
+    db.session.add(User_shcool(user_id=user_id, shcool_id=school_id))
+    return True
+
+def get_user_schools(user_id):
+    memberships = User_shcool.query.filter_by(user_id=user_id).all()
+    schools = []
+    for membership in memberships:
+        school = Shcool.query.get(membership.shcool_id)
+        if school:
+            schools.append({'id': school.id, 'name': school.name})
+    return schools
+
+def get_valid_school_invitation(code):
+    normalized_code = normalize_invitation_code(code)
+    if not normalized_code:
+        return None, 'Invitation code is required', 400
+
+    invitation_code = SchoolInvitationCode.query.filter_by(code=normalized_code).first()
+    if not invitation_code:
+        return None, 'Invitation code not found', 404
+    if not invitation_code.active:
+        return None, 'Invitation code is inactive', 400
+    if invitation_code.max_uses is not None and invitation_code.used_count >= invitation_code.max_uses:
+        return None, 'Invitation code has reached its usage limit', 400
+
+    school = Shcool.query.get(invitation_code.shcool_id)
+    if not school:
+        return None, 'Invitation school not found', 404
+
+    return invitation_code, None, None
+
+def redeem_school_invitation_for_user(invitation_code, user_id):
+    added = add_user_to_school(user_id, invitation_code.shcool_id)
+    if added:
+        invitation_code.used_count = (invitation_code.used_count or 0) + 1
+    return added
+
+def serialize_school(school, joined=False):
+    return {
+        'id': school.id,
+        'name': school.name,
+        'joined': joined
+    }
+
+def build_school_public_url(slug):
+    relative_url = f'/schools/{slug}'
+    frontend_url = (ConfigClass.FRONT_URL or '').rstrip('/')
+    return relative_url, f'{frontend_url}{relative_url}' if frontend_url else relative_url
+
+def get_or_create_school_public_page(school):
+    page = SchoolPublicPage.query.filter_by(shcool_id=school.id).first()
+    if page:
+        return page
+
+    page = SchoolPublicPage(
+        shcool_id=school.id,
+        slug=generate_unique_school_slug(school.name),
+        active=True,
+        headline=f'Read with {school.name}',
+        description=f'Welcome to {school.name} on IREAD.',
+        sections=default_school_public_sections(school.name)
+    )
+    db.session.add(page)
+    db.session.flush()
+    return page
+
+def serialize_public_school_page(page):
+    school = page.school or Shcool.query.get(page.shcool_id)
+    relative_url, full_url = build_school_public_url(page.slug)
+    sections = page.sections or default_school_public_sections(school.name if school else 'this school')
+    return {
+        'school_id': page.shcool_id,
+        'shcool_id': page.shcool_id,
+        'school_name': school.name if school else None,
+        'slug': page.slug,
+        'active': page.active,
+        'logo': page.logo,
+        'cover_image': page.cover_image,
+        'headline': page.headline,
+        'description': page.description,
+        'sections': sections,
+        'public_url': relative_url,
+        'full_public_url': full_url
+    }
+
+def get_school_public_page_by_slug(slug, active_only=True):
+    normalized_slug = normalize_school_slug(slug)
+    query = SchoolPublicPage.query.filter(func.lower(SchoolPublicPage.slug) == normalized_slug.lower())
+    if active_only:
+        query = query.filter(SchoolPublicPage.active.is_(True))
+    return query.first()
+
+def user_belongs_to_school(user_id, school_id):
+    if not user_id or not school_id:
+        return False
+    return User_shcool.query.filter_by(user_id=user_id, shcool_id=school_id).first() is not None
+
+def set_selected_school_context(school_id):
+    session['selected_school_id'] = school_id
+
+def serialize_book_for_pack(book):
+    platform_book = bool(getattr(book, 'is_platform_book', False))
+    return {
+        'id': book.id,
+        'title': book.title,
+        'author': book.author,
+        'release_date': book.release_date.isoformat() if book.release_date else None,
+        'page_number': book.page_number,
+        'category': book.category,
+        'desc': book.desc,
+        'img': book.img,
+        'is_platform_book': platform_book,
+        'source': 'platform' if platform_book else 'school',
+        'read_only': platform_book
+    }
+
+def reader_has_school_access(school_id):
+    if not current_user.is_authenticated or not school_id:
+        return False
+    return User_shcool.query.filter_by(user_id=current_user.id, shcool_id=school_id).first() is not None
+
+def school_has_platform_book_access(school_id, book_id):
+    if not school_id or not book_id:
+        return False
+    if SchoolBookInstance.query.filter_by(shcool_id=school_id, book_id=book_id, active=True).first():
+        return True
+    return (
+        db.session.query(Book_pack)
+        .join(Pack, Book_pack.pack_id == Pack.id)
+        .filter(Book_pack.book_id == book_id, Pack.shcool_id == school_id)
+        .first()
+        is not None
+    )
+
+def school_has_global_pack_access(school_id, pack_id):
+    if not school_id or not pack_id:
+        return False
+    return SchoolPackInstance.query.filter_by(shcool_id=school_id, pack_id=pack_id, active=True).first() is not None
+
+def reader_can_access_book_in_school(book, school_id):
+    if not book or not getattr(book, 'active', True):
+        return False
+    if not reader_has_school_access(school_id):
+        return False
+    if getattr(book, 'is_platform_book', False):
+        return school_has_platform_book_access(school_id, book.id)
+    if book.shcool_id == school_id:
+        return True
+    return (
+        db.session.query(Book_pack)
+        .join(Pack, Book_pack.pack_id == Pack.id)
+        .filter(Book_pack.book_id == book.id, Pack.shcool_id == school_id)
+        .first()
+        is not None
+    )
+
+def reader_can_access_platform_book_in_any_school(book):
+    memberships = User_shcool.query.filter_by(user_id=current_user.id).all()
+    return any(
+        school_has_platform_book_access(membership.shcool_id, book.id)
+        for membership in memberships
+    )
+
+def get_reader_story_progress(story_id):
+    if not current_user.is_authenticated:
+        return None
+    return ReaderStoryProgress.query.filter_by(user_id=current_user.id, story_id=story_id).first()
+
+def serialize_reader_story(story, include_pdf_url=False):
+    progress = get_reader_story_progress(story.id)
+    story_data = {
+        'id': story.id,
+        'book_id': story.book_id,
+        'school_id': story.shcool_id,
+        'title': story.title,
+        'description': story.description,
+        'page_count': story.page_count,
+        'active': story.active,
+        'completed': progress.completed if progress else False,
+        'current_page': progress.current_page if progress else 1,
+        'zoom': progress.zoom if progress else 1,
+        'last_read_at': progress.last_read_at.isoformat() if progress and progress.last_read_at else None,
+        'completed_at': progress.completed_at.isoformat() if progress and progress.completed_at else None
+    }
+    if include_pdf_url:
+        story_data['pdf_url'] = f'/reader/stories/{story.id}/pdf'
+    return story_data
+
+def user_can_access_story(story):
+    if not current_user.is_authenticated:
+        return False
+    if current_user.type == 'super_admin':
+        return True
+    book = Book.query.get(story.book_id)
+    if not book:
+        return False
+    if story.shcool_id is not None:
+        return reader_can_access_book_in_school(book, story.shcool_id)
+
+    selected_school_id = (
+        request.args.get('school')
+        or request.args.get('school_id')
+        or request.args.get('shcool_id')
+    )
+    if selected_school_id:
+        try:
+            selected_school_id = int(selected_school_id)
+        except (TypeError, ValueError):
+            return False
+        return reader_can_access_book_in_school(book, selected_school_id)
+
+    return bool(getattr(book, 'is_platform_book', False)) and reader_can_access_platform_book_in_any_school(book)
+
+def get_accessible_story(story_id):
+    story = BookStory.query.filter_by(id=story_id, active=True).first()
+    if not story or not user_can_access_story(story):
+        return None
+    return story
+
+def get_books_in_pack(pack_id):
+    return (
+        db.session.query(Book)
+        .join(Book_pack, Book.id == Book_pack.book_id)
+        .filter(Book_pack.pack_id == pack_id, Book.active.is_(True))
+        .all()
+    )
+
+def serialize_pack_details(pack):
+    enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
+    num_active_codes = Code.query.filter_by(pack_id=pack.id, status=StatusEnum.ACTIVE).count()
+    books = [serialize_book_for_pack(book) for book in get_books_in_pack(pack.id)]
+    global_pack = bool(getattr(pack, 'is_global_pack', False))
+
+    return {
+        'id': pack.id,
+        'school_id': pack.shcool_id,
+        'owner_school_id': pack.shcool_id,
+        'is_global_pack': global_pack,
+        'source': 'global' if global_pack else 'school',
+        'read_only': global_pack,
+        'title': pack.title,
+        'level': pack.level,
+        'age': pack.age.value if pack.age else None,
+        'price': pack.price,
+        'img': pack.img,
+        'book_number': pack.book_number,
+        'discount': pack.discount,
+        'desc': pack.desc,
+        'faq': pack.faq,
+        'code': num_active_codes,
+        'codes': num_active_codes,
+        'enrolled': enrolled,
+        'duration': pack.duration,
+        'product_id_invoicing_api': pack.product_id_invoicing_api,
+        'public': pack.public,
+        'books': books,
+        'books_in_pack': books
+    }
+
+def get_request_value(*keys):
+    data = request.get_json(silent=True) or {}
+    for key in keys:
+        value = request.args.get(key)
+        if value is not None:
+            return value
+        if key in data:
+            return data.get(key)
+    return None
+
+def user_can_view_pack(pack):
+    if pack.public:
+        return True
+    if not current_user.is_authenticated:
+        return False
+    if Follow_pack.query.filter_by(user_id=current_user.id, pack_id=pack.id).first():
+        return True
+    return User_shcool.query.filter_by(user_id=current_user.id, shcool_id=pack.shcool_id).first() is not None
+
+def user_can_view_pack_in_school(pack, school_id):
+    if not pack or not getattr(pack, 'active', True):
+        return False
+    if pack.public and not getattr(pack, 'is_global_pack', False):
+        return True
+    if not current_user.is_authenticated:
+        return False
+    if User_shcool.query.filter_by(user_id=current_user.id, shcool_id=school_id).first() is None:
+        return False
+    if getattr(pack, 'is_global_pack', False):
+        return school_has_global_pack_access(school_id, pack.id)
+    return pack.shcool_id == school_id
+
+def get_pack_in_school(pack_id, school_id, public_only=False):
+    pack = Pack.query.filter_by(id=pack_id, active=True).first()
+    if not pack:
+        return None
+    if getattr(pack, 'is_global_pack', False):
+        if not school_has_global_pack_access(school_id, pack.id):
+            return None
+        if public_only and not pack.public:
+            return None
+        return pack
+    if pack.shcool_id != school_id:
+        return None
+    if public_only and not pack.public:
+        return None
+    return pack
+
+def resolve_current_user_school_id():
+    selected_school_id = (
+        request.args.get('school')
+        or request.args.get('school_id')
+        or request.args.get('shcool_id')
+    )
+    if selected_school_id is None:
+        data = request.get_json(silent=True) or {}
+        selected_school_id = data.get('school') or data.get('school_id') or data.get('shcool_id')
+
+    if selected_school_id is None:
+        selected_school_id = session.get('selected_school_id')
+
+    memberships = User_shcool.query.filter_by(user_id=current_user.id).all()
+    if not memberships:
+        return None, 'No school access', 403
+
+    if selected_school_id is None:
+        if len(memberships) == 1:
+            return memberships[0].shcool_id, None, None
+        return None, 'school_id is required', 400
+
+    try:
+        selected_school_id = int(selected_school_id)
+    except (TypeError, ValueError):
+        return None, 'school_id must be a number', 400
+
+    if not any(membership.shcool_id == selected_school_id for membership in memberships):
+        return None, 'You do not have access to this school', 403
+
+    return selected_school_id, None, None
+
+def resolve_game_school_id_from_session():
+    memberships = User_shcool.query.filter_by(user_id=current_user.id).all()
+    if not memberships:
+        return None, 'No school access', 403
+
+    selected_school_id = (
+        request.args.get('school')
+        or request.args.get('school_id')
+        or request.args.get('shcool_id')
+    )
+    if selected_school_id is None:
+        data = request.get_json(silent=True) or {}
+        selected_school_id = data.get('school') or data.get('school_id') or data.get('shcool_id')
+
+    if selected_school_id is None:
+        selected_school_id = session.get('selected_school_id')
+
+    if selected_school_id is None:
+        if len(memberships) == 1:
+            return memberships[0].shcool_id, None, None
+        return None, 'Selected school is required before opening this game', 400
+
+    try:
+        selected_school_id = int(selected_school_id)
+    except (TypeError, ValueError):
+        return None, 'Selected school is invalid', 400
+
+    if not any(membership.shcool_id == selected_school_id for membership in memberships):
+        return None, 'You do not have access to this school', 403
+
+    return selected_school_id, None, None
+
+@reader.route('/register_school_admin', methods=['POST'])
+@reader.route('/signup_school_admin', methods=['POST'])
+def register_school_admin():
+    try:
+        data = request.get_json(silent=True) or {}
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+        school_name = data.get('school_name') or data.get('shcool_name') or data.get('name')
+        img = data.get('img')
+
+        missing_fields = [
+            field
+            for field, value in {
+                'username': username,
+                'email': email,
+                'password': password,
+                'school_name': school_name
+            }.items()
+            if not value or not str(value).strip()
+        ]
+        if missing_fields:
+            return jsonify({'message': 'Missing required fields', 'fields': missing_fields}), 400
+
+        username = str(username).strip()
+        email = str(email).strip().lower()
+        school_name = str(school_name).strip()
+
+        if user_email_exist(email):
+            return jsonify({'message': 'This email is already used. Please choose another'}), 409
+
+        existing_school = Shcool.query.filter(func.lower(Shcool.name) == school_name.lower()).first()
+        if existing_school:
+            return jsonify({'message': 'This school name is already used. Please choose another'}), 409
+
+        invoicing_user_id = None
+        try:
+            invoicing_response = requests.post(
+                f'{ConfigClass.INVOICING_API}/user/create',
+                json={'appId': f'{ConfigClass.INVOICING_API_KEY}'},
+                timeout=10
+            )
+            if invoicing_response.status_code == 201:
+                invoicing_user_id = invoicing_response.json().get('_id')
+        except requests.RequestException as error:
+            logging.warning('Unable to create invoicing user for school admin signup: %s', error)
+
+        password_hash = bcrypt.generate_password_hash(password)
+        new_school = Shcool(name=school_name)
+        db.session.add(new_school)
+        db.session.flush()
+        get_or_create_school_public_page(new_school)
+
+        admin_data = {
+            'username': username,
+            'email': email,
+            'password_hashed': password_hash,
+            'created_at': datetime.now(),
+            'confirmed': True,
+            'approved': False,
+            'user_id_invoicing_api': invoicing_user_id
+        }
+        if img:
+            admin_data['img'] = img
+
+        new_admin = Admin(**admin_data)
+        db.session.add(new_admin)
+        db.session.flush()
+
+        db.session.add(User_shcool(user_id=new_admin.id, shcool_id=new_school.id))
+        db.session.commit()
+
+        return jsonify({
+            'message': 'School admin account has been created and is pending super admin approval',
+            'admin': {
+                'id': new_admin.id,
+                'username': new_admin.username,
+                'email': new_admin.email,
+                'role': new_admin.type,
+                'img': new_admin.img,
+                'confirmed': new_admin.confirmed,
+                'approved': new_admin.approved,
+                'status': 'pending_approval',
+                'user_id_invoicing_api': new_admin.user_id_invoicing_api
+            },
+            'school': {
+                'id': new_school.id,
+                'name': new_school.name,
+                'status': 'pending_admin_approval'
+            }
+        }), 201
+    except Exception as error:
+        db.session.rollback()
+        logging.error('School admin signup failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/register_super_admin', methods=['POST'])
+@reader.route('/signup_super_admin', methods=['POST'])
+def register_super_admin():
+    try:
+        existing_super_admin = SuperAdmin.query.first()
+        if existing_super_admin and not (
+            current_user.is_authenticated and
+            current_user.type == 'super_admin' and
+            current_user.confirmed and
+            current_user.approved
+        ):
+            return jsonify({'message': 'Super admin already exists'}), 403
+
+        data = request.get_json(silent=True) or {}
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+        img = data.get('img')
+
+        missing_fields = [
+            field
+            for field, value in {
+                'username': username,
+                'email': email,
+                'password': password
+            }.items()
+            if not value or not str(value).strip()
+        ]
+        if missing_fields:
+            return jsonify({'message': 'Missing required fields', 'fields': missing_fields}), 400
+
+        username = str(username).strip()
+        email = str(email).strip().lower()
+
+        if user_email_exist(email):
+            return jsonify({'message': 'This email is already used. Please choose another'}), 409
+
+        super_admin_data = {
+            'username': username,
+            'email': email,
+            'password_hashed': bcrypt.generate_password_hash(password),
+            'created_at': datetime.now(),
+            'confirmed': True,
+            'approved': True
+        }
+        if img:
+            super_admin_data['img'] = img
+
+        new_super_admin = SuperAdmin(**super_admin_data)
+        db.session.add(new_super_admin)
+        db.session.commit()
+        login_user(new_super_admin)
+
+        return jsonify({
+            'message': 'Super admin account has been created successfully',
+            'super_admin': {
+                'id': new_super_admin.id,
+                'username': new_super_admin.username,
+                'email': new_super_admin.email,
+                'role': new_super_admin.type,
+                'img': new_super_admin.img,
+                'confirmed': new_super_admin.confirmed,
+                'approved': new_super_admin.approved
+            }
+        }), 201
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Super admin signup failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/schools/<slug>/public-page', methods=['GET'])
+def get_public_school_page(slug):
+    try:
+        page = get_school_public_page_by_slug(slug, active_only=True)
+        if not page:
+            return jsonify({'message': 'School page not found'}), 404
+
+        return jsonify({'public_page': serialize_public_school_page(page)}), 200
+    except Exception as error:
+        logging.error('Unable to get public school page: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/schools/<slug>/register', methods=['POST'])
+def register_from_school_public_page(slug):
+    try:
+        page = get_school_public_page_by_slug(slug, active_only=True)
+        if not page:
+            return jsonify({'message': 'School page not found'}), 404
+
+        school = Shcool.query.get(page.shcool_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+
+        missing_fields = [
+            field
+            for field, value in {
+                'username': username,
+                'email': email,
+                'password': password
+            }.items()
+            if not value or not str(value).strip()
+        ]
+        if missing_fields:
+            return jsonify({'message': 'Missing required fields', 'fields': missing_fields}), 400
+
+        username = str(username).strip()
+        email = str(email).strip().lower()
+
+        if user_email_exist(email):
+            return jsonify({'message': 'This email is already used. Please choose another'}), 409
+
+        quiz_user = {'app': f'{ConfigClass.QUIZ_API_KEY}'}
+        invoicing_client = {'appId': f'{ConfigClass.INVOICING_API_KEY}'}
+        invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create', json=invoicing_client)
+        response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)
+        if response.status_code != 201 or invoicing_response.status_code != 201:
+            return jsonify({'message': 'Error creation Quiz account'}), 400
+
+        quiz_id = response.json()['_id']
+        client_id = invoicing_response.json()['_id']
+        password_hash = bcrypt.generate_password_hash(password)
+        new_user = Reader(
+            username=username,
+            email=email,
+            password_hashed=password_hash,
+            created_at=datetime.now(),
+            quiz_id=quiz_id,
+            client_id_invoicing_api=client_id
+        )
+        db.session.add(new_user)
+        db.session.flush()
+
+        iread_school = Shcool.query.filter_by(name='IRead').first()
+        if iread_school:
+            add_user_to_school(new_user.id, iread_school.id)
+        add_user_to_school(new_user.id, school.id)
+        db.session.commit()
+
+        confirmation_token = generate_confirmed_token(email)
+        confirm_link = f'{ConfigClass.API_URL}/reader/confirm/{confirmation_token}'
+        confirmation_email = render_template(
+            'confirmation_email_template.html',
+            username=username,
+            confirm_link=confirm_link
+        )
+        msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
+        msg.html = confirmation_email
+        mail.send(msg)
+
+        return jsonify({
+            'message': 'Your account has been successfully created. Please verify your emailbox to confirm your account',
+            'user': {'username': username, 'email': email},
+            'school_id': school.id,
+            'school': school.name,
+            'dashboard_url': f'/dashboard?school_id={school.id}'
+        }), 201
+    except Exception as error:
+        db.session.rollback()
+        logging.error('School public page signup failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/schools/<slug>/login', methods=['POST'])
+def login_from_school_public_page(slug):
+    try:
+        page = get_school_public_page_by_slug(slug, active_only=True)
+        if not page:
+            return jsonify({'message': 'School page not found'}), 404
+
+        school = Shcool.query.get(page.shcool_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        email = data.get('email')
+        password = data.get('password')
+        if not email or not password:
+            return jsonify({'message': 'Email and password are required'}), 400
+
+        email = str(email).strip().lower()
+        user = User.query.filter(func.lower(User.email) == email).first()
+        if not user or not bcrypt.check_password_hash(user.password_hashed, password):
+            return jsonify({'message': 'Invalid email or password'}), 404
+        if not user.confirmed:
+            return jsonify({'message': "You don't confirm your account"}), 403
+        if not user.approved:
+            return jsonify({'message': 'Your are not been approved for the moment'}), 403
+        if not user_belongs_to_school(user.id, school.id):
+            return jsonify({'message': 'You are not joined to this school'}), 403
+
+        login_user(user)
+        set_selected_school_context(school.id)
+        return jsonify({
+            'message': 'Your are logged in succesfully',
+            'role': user.type,
+            'school_id': school.id,
+            'school': school.name,
+            'dashboard_url': f'/dashboard?school_id={school.id}'
+        }), 200
+    except Exception as error:
+        logging.error('School public page login failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/select_school', methods=['POST'])
+@login_required
+def select_school():
+    try:
+        data = request.get_json(silent=True) or {}
+        school_id = data.get('school_id') or data.get('shcool_id') or data.get('school')
+        if school_id is None:
+            return jsonify({'message': 'school_id is required'}), 400
+        try:
+            school_id = int(school_id)
+        except (TypeError, ValueError):
+            return jsonify({'message': 'school_id must be a number'}), 400
+
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+        if not user_belongs_to_school(current_user.id, school.id):
+            return jsonify({'message': 'You do not have access to this school'}), 403
+
+        set_selected_school_context(school.id)
+        return jsonify({
+            'message': 'School selected successfully',
+            'school_id': school.id,
+            'school': school.name,
+            'dashboard_url': f'/dashboard?school_id={school.id}'
+        }), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
 ## @brief Route for registering new users.
 #
 # This route is used for registering new users in the system. The function accepts a POST request with JSON data containing the user's username, email, and password.
@@ -136,6 +878,13 @@ def register():
         username = request.json['username']
         email = request.json['email']
         password = request.json['password']
+        invitation_code_value = request.json.get('invitation_code')
+        invitation_code = None
+
+        if invitation_code_value:
+            invitation_code, invitation_error, invitation_status = get_valid_school_invitation(invitation_code_value)
+            if invitation_error:
+                return jsonify({'message': invitation_error}), invitation_status
 
         if user_email_exist(email):
 
@@ -160,11 +909,10 @@ def register():
                 db.session.add(new_user)
                 db.session.commit()
                 shcool=  Shcool.query.filter_by(name="IRead").first()
-                new_user_shcool = User_shcool(
-                    user_id = new_user.id,
-                    shcool_id = shcool.id
-                    )
-                db.session.add(new_user_shcool)
+                if shcool:
+                    add_user_to_school(new_user.id, shcool.id)
+                if invitation_code:
+                    redeem_school_invitation_for_user(invitation_code, new_user.id)
                 db.session.commit()
                 # Send a confirmation email as before
                 confirmation_token = generate_confirmed_token(email)
@@ -191,10 +939,21 @@ def google_register():
         username = request.json['username']
         email = request.json['email']
         password = secrets.token_urlsafe(12) 
+        invitation_code_value = request.json.get('invitation_code')
+        invitation_code = None
+
+        if invitation_code_value:
+            invitation_code, invitation_error, invitation_status = get_valid_school_invitation(invitation_code_value)
+            if invitation_error:
+                return jsonify({'message': invitation_error}), invitation_status
+
         if user_email_exist(email):
            google_user=User.query.filter_by(email=email).first()
            accounts = User.query.filter_by(email=email).all()
            login_user(google_user)
+           if invitation_code:
+               redeem_school_invitation_for_user(invitation_code, google_user.id)
+               db.session.commit()
            accountsData=[]
            for account in accounts:
                 accountsData.append({
@@ -217,11 +976,10 @@ def google_register():
                 db.session.add(new_user)    
                 db.session.commit()
                 shcool=  Shcool.query.filter_by(name="IRead").first()
-                new_user_shcool = User_shcool(
-                    user_id = new_user.id,
-                    shcool_id = shcool.id
-                    )
-                db.session.add(new_user_shcool)
+                if shcool:
+                    add_user_to_school(new_user.id, shcool.id)
+                if invitation_code:
+                    redeem_school_invitation_for_user(invitation_code, new_user.id)
                 db.session.commit()
                 login_user(new_user)
                 return jsonify({'message':'Your are logged in succesfully','accounts':[]}),200
@@ -335,13 +1093,17 @@ def get_cookies_fun():
                 source = referer
             user_country = "Unknown"
             user_city = "Unknown"
-            with Beader('/var/www/html/Iread_Backend/GeoLite2-City/GeoLite2-City.mmdb') as test:
-                try:
-                    response = test.city(user_ip)
-                    user_country = response.country.name
-                    user_city = response.city.name
-                except Exception as geo_error:
-                    print(f"Error looking up IP: {geo_error}")
+            geolite_city_path = get_geolite_city_path()
+            try:
+                if os.path.exists(geolite_city_path):
+                    with Beader(geolite_city_path) as test:
+                        response = test.city(user_ip)
+                        user_country = response.country.name
+                        user_city = response.city.name
+                else:
+                    logging.warning('GeoLite city database not found at %s', geolite_city_path)
+            except Exception as geo_error:
+                logging.warning('Error looking up IP: %s', geo_error)
             
             user_log = UserLog( user_agent=user_agent, user_ip=user_ip, referer=source,
             user_country=user_country, user_city=user_city,user_cookie_id=user_id,system=system,browser=browser)
@@ -442,6 +1204,10 @@ def select_account():
         user=User.query.filter_by(email=email,username=username).first()
         
         if user:
+            if not user.confirmed:
+                return jsonify({'message':'You don\'t confirm your account'}),403
+            if not user.approved:
+                return jsonify({'message':'Your are not been approved for the moment'}),403
             login_user(user)       
             return jsonify({'message':'Your are logged in succesfully','role':user.type}),200
         else:  
@@ -529,6 +1295,20 @@ def user_authenticated():
      
             client_id_invoicing_api = getattr(current_user, 'client_id_invoicing_api', None)
             quiz_id = getattr(current_user, 'quiz_id', None)
+            if current_user.type == "super_admin":
+                schools = Shcool.query.order_by(Shcool.name.asc()).all()
+                return jsonify({
+                    'is_authenticated': current_user.is_authenticated,
+                    'username': current_user.username,
+                    'email': current_user.email,
+                    'img': current_user.img,
+                    'role': current_user.type,
+                    'quiz_id': quiz_id,
+                    'id': current_user.id,
+                    'is_super_admin': True,
+                    'schools': [{'id': school.id, 'name': school.name} for school in schools]
+                })
+
             if current_user.type == "admin":
                 
                 school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
@@ -549,8 +1329,6 @@ def user_authenticated():
                 })
 
             else:
-                school_ids = User_shcool.query.filter_by(user_id=current_user.id).all()
-                schools = [Shcool.query.get(school_id.shcool_id) for school_id in school_ids]
                 return jsonify({
                     'is_authenticated': current_user.is_authenticated,
                     'username': current_user.username,
@@ -560,10 +1338,251 @@ def user_authenticated():
                     'quiz_id': quiz_id,
                     'id': current_user.id,
                     'client_id_invoicing_api': client_id_invoicing_api,
-                    'schools': [{'id': school.id, 'name': school.name} for school in schools]
+                    'schools': get_user_schools(current_user.id)
                 })     
     except Exception as e:     
         return jsonify({'error': str(e), 'message': 'Internal server error'})
+
+@reader.route('/get_all_schools', methods=['GET'])
+def get_all_schools():
+    try:
+        joined_school_ids = set()
+        if current_user.is_authenticated:
+            memberships = User_shcool.query.filter_by(user_id=current_user.id).all()
+            joined_school_ids = {membership.shcool_id for membership in memberships}
+
+        schools = Shcool.query.order_by(Shcool.name.asc()).all()
+        return jsonify({
+            'schools': [serialize_school(school, school.id in joined_school_ids) for school in schools]
+        }), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/join_school', methods=['POST'])
+@login_required
+def join_school():
+    try:
+        if current_user.type in ['admin', 'super_admin']:
+            return jsonify({'message': 'Admins cannot join schools from the reader join endpoint'}), 403
+
+        data = request.get_json(silent=True) or {}
+        school_ids = data.get('school_ids')
+        if school_ids is None:
+            school_id = data.get('school_id') or data.get('shcool_id') or data.get('id')
+            if school_id is None:
+                return jsonify({'message': 'school_id or school_ids is required'}), 400
+            school_ids = [school_id]
+
+        if not isinstance(school_ids, list) or not school_ids:
+            return jsonify({'message': 'school_ids must be a non-empty list'}), 400
+
+        normalized_school_ids = []
+        for school_id in school_ids:
+            try:
+                normalized_school_id = int(school_id)
+            except (TypeError, ValueError):
+                return jsonify({'message': 'Each school_id must be a number'}), 400
+            if normalized_school_id not in normalized_school_ids:
+                normalized_school_ids.append(normalized_school_id)
+
+        schools = Shcool.query.filter(Shcool.id.in_(normalized_school_ids)).all()
+        schools_by_id = {school.id: school for school in schools}
+        missing_school_ids = [school_id for school_id in normalized_school_ids if school_id not in schools_by_id]
+        if missing_school_ids:
+            return jsonify({'message': 'School not found', 'missing_school_ids': missing_school_ids}), 404
+
+        joined_schools = []
+        already_joined_schools = []
+        for school_id in normalized_school_ids:
+            school = schools_by_id[school_id]
+            added = add_user_to_school(current_user.id, school_id)
+            if added:
+                joined_schools.append(serialize_school(school, True))
+            else:
+                already_joined_schools.append(serialize_school(school, True))
+
+        db.session.commit()
+
+        return jsonify({
+            'message': 'School joined successfully' if joined_schools else 'You are already joined to selected school(s)',
+            'joined_schools': joined_schools,
+            'already_joined_schools': already_joined_schools,
+            'schools': get_user_schools(current_user.id)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/join_school_by_invitation', methods=['POST'])
+@login_required
+def join_school_by_invitation():
+    try:
+        if current_user.type in ['admin', 'super_admin']:
+            return jsonify({'message': 'Admins cannot join schools from the reader invitation endpoint'}), 403
+
+        data = request.get_json(silent=True) or {}
+        invitation_code, invitation_error, invitation_status = get_valid_school_invitation(data.get('code'))
+        if invitation_error:
+            return jsonify({'message': invitation_error}), invitation_status
+
+        already_joined = User_shcool.query.filter_by(
+            user_id=current_user.id,
+            shcool_id=invitation_code.shcool_id
+        ).first()
+        school = Shcool.query.get(invitation_code.shcool_id)
+
+        if already_joined:
+            return jsonify({
+                'message': 'You are already joined to this school',
+                'school': {'id': school.id, 'name': school.name},
+                'schools': get_user_schools(current_user.id)
+            }), 200
+
+        redeem_school_invitation_for_user(invitation_code, current_user.id)
+        db.session.commit()
+
+        return jsonify({
+            'message': 'School joined successfully',
+            'school': {'id': school.id, 'name': school.name},
+            'schools': get_user_schools(current_user.id)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/books/<int:book_id>/stories', methods=['GET'])
+@login_required
+def get_reader_book_stories(book_id):
+    try:
+        school_id, school_error, school_status = resolve_current_user_school_id()
+        if school_error:
+            return jsonify({'message': school_error}), school_status
+
+        book = Book.query.get(book_id)
+        if not reader_can_access_book_in_school(book, school_id):
+            return jsonify({'message': 'Book not found in this school'}), 404
+
+        if getattr(book, 'is_platform_book', False):
+            stories_query = BookStory.query.filter(
+                BookStory.book_id == book_id,
+                BookStory.shcool_id.is_(None),
+                BookStory.active.is_(True)
+            )
+        else:
+            stories_query = BookStory.query.filter_by(book_id=book_id, shcool_id=school_id, active=True)
+
+        stories = stories_query.order_by(BookStory.id.desc()).all()
+        return jsonify({'stories': [serialize_reader_story(story) for story in stories]}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/stories/<int:story_id>', methods=['GET'])
+@login_required
+def get_reader_story(story_id):
+    try:
+        story = get_accessible_story(story_id)
+        if not story:
+            return jsonify({'message': 'Story not found'}), 404
+        return jsonify({'story': serialize_reader_story(story, include_pdf_url=True)}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/stories/<int:story_id>/pdf', methods=['GET'])
+@login_required
+def get_reader_story_pdf(story_id):
+    try:
+        story = get_accessible_story(story_id)
+        if not story:
+            return jsonify({'message': 'Story not found'}), 404
+        if not story.file_path or not os.path.exists(story.file_path):
+            return jsonify({'message': 'Story PDF file not found'}), 404
+
+        return send_file(
+            story.file_path,
+            mimetype='application/pdf',
+            as_attachment=False,
+            download_name=story.original_filename
+        )
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/stories/<int:story_id>/progress', methods=['PUT'])
+@login_required
+def update_reader_story_progress(story_id):
+    try:
+        story = get_accessible_story(story_id)
+        if not story:
+            return jsonify({'message': 'Story not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        current_page = data.get('current_page')
+        zoom = data.get('zoom')
+
+        progress = ReaderStoryProgress.query.filter_by(user_id=current_user.id, story_id=story.id).first()
+        if not progress:
+            progress = ReaderStoryProgress(user_id=current_user.id, story_id=story.id)
+            db.session.add(progress)
+
+        if current_page is not None:
+            try:
+                current_page = int(current_page)
+            except (TypeError, ValueError):
+                return jsonify({'message': 'current_page must be a number'}), 400
+            if current_page < 1:
+                return jsonify({'message': 'current_page must be greater than 0'}), 400
+            if story.page_count and current_page > story.page_count:
+                current_page = story.page_count
+            progress.current_page = current_page
+
+        if zoom is not None:
+            try:
+                zoom = float(zoom)
+            except (TypeError, ValueError):
+                return jsonify({'message': 'zoom must be a number'}), 400
+            if zoom <= 0:
+                return jsonify({'message': 'zoom must be greater than 0'}), 400
+            progress.zoom = zoom
+
+        progress.last_read_at = datetime.now()
+        db.session.commit()
+        return jsonify({'progress': serialize_reader_story(story)}), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@reader.route('/stories/<int:story_id>/complete', methods=['POST'])
+@login_required
+def complete_reader_story(story_id):
+    try:
+        story = get_accessible_story(story_id)
+        if not story:
+            return jsonify({'message': 'Story not found'}), 404
+
+        progress = ReaderStoryProgress.query.filter_by(user_id=current_user.id, story_id=story.id).first()
+        if not progress:
+            progress = ReaderStoryProgress(user_id=current_user.id, story_id=story.id)
+            db.session.add(progress)
+
+        if story.page_count:
+            progress.current_page = story.page_count
+        progress.completed = True
+        progress.completed_at = datetime.now()
+        progress.last_read_at = datetime.now()
+        db.session.commit()
+
+        return jsonify({
+            'message': 'Story completed',
+            'progress': {
+                'story_id': story.id,
+                'current_page': progress.current_page,
+                'zoom': progress.zoom,
+                'completed': progress.completed,
+                'completed_at': progress.completed_at.isoformat() if progress.completed_at else None
+            }
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 
 @reader.route('/create_invoice_client')
@@ -603,12 +1622,29 @@ def create_invoice_client():
 @login_required
 def dashboard():
     try:
+        school_id, school_error, school_status = resolve_current_user_school_id()
+        if school_error:
+            return jsonify({'message': school_error}), school_status
+
         infos = (
-            db.session.query(User, Book, Session, Follow_session)
+            db.session.query(User, Book, Session, Follow_session, Pack)
             .filter(User.id == current_user.id)
             .join(Follow_session, User.id == Follow_session.user_id)
             .join(Session, Session.id == Follow_session.session_id)
             .join(Book, Book.id == Session.book_id)
+            .join(Pack, Session.pack_id == Pack.id)
+            .outerjoin(
+                SchoolPackInstance,
+                and_(
+                    SchoolPackInstance.pack_id == Pack.id,
+                    SchoolPackInstance.shcool_id == school_id,
+                    SchoolPackInstance.active.is_(True)
+                )
+            )
+            .filter(
+                Pack.active.is_(True),
+                or_(Pack.shcool_id == school_id, SchoolPackInstance.id.isnot(None))
+            )
         )
 
         followed_sessions = infos.filter(
@@ -625,15 +1661,23 @@ def dashboard():
 
         followed_sessions_data = []
         for session_follow in followed_sessions:
+            is_global = bool(getattr(session_follow.Pack, 'is_global_pack', False))
             followed_sessions_data.append({
                 'session_name': session_follow.Session.name,
                 'id': session_follow.Session.id,
+                'pack_id': session_follow.Session.pack_id,
+                'school_id': school_id if is_global else session_follow.Pack.shcool_id,
+                'owner_school_id': session_follow.Pack.shcool_id,
+                'is_global_pack': is_global,
+                'source': 'global' if is_global else 'school',
+                'read_only': is_global,
                 'book_title': session_follow.Book.title,
                 'book_id': session_follow.Book.id,
                 'author': session_follow.Book.author,
                 'location': session_follow.Session.location.value,
                 'date': session_follow.Session.start_date.strftime('%Y-%m-%d'),
                 'approved': session_follow.Follow_session.approved,
+                'video_call_available': is_online_session(session_follow.Session) and bool(session_follow.Follow_session.approved),
                 'book_img':session_follow.Book.img,
                 'unit_id': session_follow.Session.unit_id
 
@@ -641,34 +1685,51 @@ def dashboard():
 
         pending_session_data = []
         for pending_session in pending_sessions:
+            is_global = bool(getattr(pending_session.Pack, 'is_global_pack', False))
             pending_session_data.append({
                 'session_name': pending_session.Session.name,
                 'id': pending_session.Session.id,
+                'pack_id': pending_session.Session.pack_id,
+                'school_id': school_id if is_global else pending_session.Pack.shcool_id,
+                'owner_school_id': pending_session.Pack.shcool_id,
+                'is_global_pack': is_global,
+                'source': 'global' if is_global else 'school',
+                'read_only': is_global,
                 'book_title': pending_session.Book.title,
                 'book_id': pending_session.Book.id,
                 'author': pending_session.Book.author,
                 'location': pending_session.Session.location.value,
                 'date': pending_session.Session.start_date.strftime('%Y-%m-%d'),
-                'approved': pending_session.Follow_session.approved
+                'approved': pending_session.Follow_session.approved,
+                'video_call_available': False
             })
 
         current_session_followed_data = []
         for session_follow in current_session_followed:
+            is_global = bool(getattr(session_follow.Pack, 'is_global_pack', False))
             current_session_followed_data.append({
                 'session_name': session_follow.Session.name,
                 'id': session_follow.Session.id,
+                'pack_id': session_follow.Session.pack_id,
+                'school_id': school_id if is_global else session_follow.Pack.shcool_id,
+                'owner_school_id': session_follow.Pack.shcool_id,
+                'is_global_pack': is_global,
+                'source': 'global' if is_global else 'school',
+                'read_only': is_global,
                 'book_title': session_follow.Book.title,
                 'book_id': session_follow.Book.id,
                 'author': session_follow.Book.author,
                 'location': session_follow.Session.location.value,
                 'date': session_follow.Session.start_date.strftime('%Y-%m-%d'),
                 'approved': session_follow.Follow_session.approved,
+                'video_call_available': is_online_session(session_follow.Session) and bool(session_follow.Follow_session.approved),
                 'unit_id': session_follow.Session.unit_id
             })
 
         return jsonify({
             'username': current_user.username,
             'email': current_user.email,
+            'school_id': school_id,
             'followed_sessions': followed_sessions_data,
             'pending_sessions': pending_session_data,
             'current_session_followed': current_session_followed_data
@@ -711,7 +1772,7 @@ def logout():
 @reader.route('/forget_password',methods=['POST'])
 def forget_password():
     try:
-        print("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+       
         email=request.json['email']
         if not user_email_exist(email):
             return jsonify({'message':' There is no account with this email'}),404
@@ -928,6 +1989,40 @@ def delete_account():
 # @retval 404: If the formation is not found in the database.
 # @retval 405: If the HTTP method is not allowed (only POST is allowed).
 #
+@reader.route('/sessions/<int:session_id>/video-call', methods=['GET'])
+@login_required
+def get_reader_session_video_call(session_id):
+    try:
+        school_id, school_error, school_status = resolve_current_user_school_id()
+        if school_error:
+            return jsonify({'message': school_error}), school_status
+
+        session_instance = Session.query.get(session_id)
+        if not session_instance:
+            return jsonify({'message': 'Session not found'}), 404
+        if not is_online_session(session_instance):
+            return jsonify({'message': 'Video call is available only for online sessions'}), 400
+
+        pack = get_pack_in_school(session_instance.pack_id, school_id)
+        if not pack:
+            return jsonify({'message': 'Session not found in this school'}), 404
+
+        follow_session = Follow_session.query.filter_by(
+            user_id=current_user.id,
+            session_id=session_instance.id
+        ).first()
+        if not follow_session or not follow_session.approved:
+            return jsonify({'message': 'You are not approved for this session'}), 403
+
+        call_data = serialize_jitsi_call(session_instance, current_user, is_moderator=False)
+        db.session.commit()
+        return jsonify(call_data), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to generate reader session video call: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
 @reader.route('/register_session', methods=['POST'])
 @login_required
 def register_session():
@@ -1129,26 +2224,68 @@ def link_code():
 @login_required
 def get_followed_pack_list():
     try:
-        packs = db.session.query(Pack, Follow_pack.approved).join(Follow_pack).filter(Pack.id == Follow_pack.pack_id, Follow_pack.user_id == current_user.id)
-        print(current_user.id)
+        school_id, school_error, school_status = resolve_current_user_school_id()
+        if school_error:
+            return jsonify({'message': school_error}), school_status
+
+        packs = (
+            db.session.query(Pack, Follow_pack.approved)
+            .join(Follow_pack)
+            .outerjoin(
+                SchoolPackInstance,
+                and_(
+                    SchoolPackInstance.pack_id == Pack.id,
+                    SchoolPackInstance.shcool_id == school_id,
+                    SchoolPackInstance.active.is_(True)
+                )
+            )
+            .filter(
+                Pack.id == Follow_pack.pack_id,
+                Follow_pack.user_id == current_user.id,
+                Pack.active.is_(True),
+                or_(Pack.shcool_id == school_id, SchoolPackInstance.id.isnot(None))
+            )
+        )
         followed_pack_list = []
 
         for followed_pack, approved in packs:
-            followed_pack_list.append({'title': followed_pack.title, 'id': followed_pack.id, 'approved': approved ,'level':followed_pack.level,'price':followed_pack.price,'book_number':followed_pack.book_number,'img':followed_pack.img})
+            is_global = bool(getattr(followed_pack, 'is_global_pack', False))
+            followed_pack_list.append({'title': followed_pack.title, 'id': followed_pack.id, 'school_id': school_id if is_global else followed_pack.shcool_id, 'owner_school_id': followed_pack.shcool_id, 'is_global_pack': is_global, 'source': 'global' if is_global else 'school', 'read_only': is_global, 'approved': approved ,'level':followed_pack.level,'price':followed_pack.price,'book_number':followed_pack.book_number,'img':followed_pack.img})
 
         if followed_pack_list:
-            return jsonify({'followed_pack_list': followed_pack_list}), 200
+            return jsonify({'school_id': school_id, 'followed_pack_list': followed_pack_list}), 200
         else:
-            return jsonify({'followed_pack_list': []}), 200
-    except:
-        return jsonify({'message': 'Internal server error'}), 500
+            return jsonify({'school_id': school_id, 'followed_pack_list': []}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @reader.route('/get_unfollowed_books')
 @login_required
 def get_unfollowed_books():
     try:
+        school_id, school_error, school_status = resolve_current_user_school_id()
+        if school_error:
+            return jsonify({'message': school_error}), school_status
+
         # Get the packs that the user is following
-        followed_packs = db.session.query(Pack, Follow_pack.approved).join(Follow_pack).filter(Pack.id == Follow_pack.pack_id, Follow_pack.user_id == current_user.id)
+        followed_packs = (
+            db.session.query(Pack, Follow_pack.approved)
+            .join(Follow_pack)
+            .outerjoin(
+                SchoolPackInstance,
+                and_(
+                    SchoolPackInstance.pack_id == Pack.id,
+                    SchoolPackInstance.shcool_id == school_id,
+                    SchoolPackInstance.active.is_(True)
+                )
+            )
+            .filter(
+                Pack.id == Follow_pack.pack_id,
+                Follow_pack.user_id == current_user.id,
+                Pack.active.is_(True),
+                or_(Pack.shcool_id == school_id, SchoolPackInstance.id.isnot(None))
+            )
+        )
 
         unfollowed_books_list = []
 
@@ -1172,7 +2309,8 @@ def get_unfollowed_books():
             ).outerjoin(
                 session_alias,
                 and_(
-                    session_alias.book_id == Book.id 
+                    session_alias.book_id == Book.id,
+                    session_alias.pack_id == followed_pack.id
                 )
             ).filter(
                 Book_pack.pack_id == followed_pack.id,
@@ -1182,10 +2320,16 @@ def get_unfollowed_books():
 
             # Append the information to the list
             for book, book_pack, follow_book in unfollowed_books:
+                is_global = bool(getattr(followed_pack, 'is_global_pack', False))
                 unfollowed_books_list.append({
                     'title': book.title,
                     'book_id': book.id,
                     'pack_id': followed_pack.id,
+                    'school_id': school_id if is_global else followed_pack.shcool_id,
+                    'owner_school_id': followed_pack.shcool_id,
+                    'is_global_pack': is_global,
+                    'source': 'global' if is_global else 'school',
+                    'read_only': is_global,
                     'pack_title': followed_pack.title,
                     'approved': approved,
                     'level': followed_pack.level,
@@ -1195,7 +2339,7 @@ def get_unfollowed_books():
                 })
 
         if unfollowed_books_list:
-            return jsonify({'unfollowed_books_list': unfollowed_books_list}), 200
+            return jsonify({'school_id': school_id, 'unfollowed_books_list': unfollowed_books_list}), 200
         else:
             return jsonify({'message': 'No unfollowed books found'}), 404
     except Exception as e:
@@ -1690,7 +2834,21 @@ def get_packs_by_shcoo():
         school = int(request.args.get('school'))    
         all = int(request.args.get('all'))    
         age_enum_values = [age.value for age in StatusEnum]
-        packs_query = Pack.query
+        packs_query = (
+            Pack.query
+            .outerjoin(
+                SchoolPackInstance,
+                and_(
+                    SchoolPackInstance.pack_id == Pack.id,
+                    SchoolPackInstance.shcool_id == school,
+                    SchoolPackInstance.active.is_(True)
+                )
+            )
+            .filter(
+                Pack.active.is_(True),
+                or_(Pack.shcool_id == school, SchoolPackInstance.id.isnot(None))
+            )
+        )
         if age_filter and age_filter in age_enum_values:
             packs_query = packs_query.filter(Pack.age == age_filter)
         if title_search:
@@ -1698,10 +2856,10 @@ def get_packs_by_shcoo():
         if not school :
             
             return jsonify({'message': 'No School ID'}),400
-        if all ==1:
-            packs = packs_query.filter_by(shcool_id=school)
-        else:
-            packs = packs_query.filter_by(shcool_id=school,public=True)
+        if all != 1:
+            packs_query = packs_query.filter(Pack.public.is_(True))
+
+        packs = packs_query.distinct().all()
 
         
        
@@ -1724,6 +2882,12 @@ def get_packs_by_shcoo():
                     'enrolled' :enrolled,
                     'duration':pack.duration
                 }
+                is_global = bool(getattr(pack, 'is_global_pack', False))
+                pack_info['owner_school_id'] = pack.shcool_id
+                pack_info['school_id'] = school if is_global else pack.shcool_id
+                pack_info['is_global_pack'] = is_global
+                pack_info['source'] = 'global' if is_global else 'school'
+                pack_info['read_only'] = is_global
                 packs_info.append(pack_info)
 
             return jsonify({'packs': packs_info}), 200
@@ -1733,7 +2897,94 @@ def get_packs_by_shcoo():
         return jsonify({'message': str(e)}), 500
 
 
+@reader.route('/get_pack_details', methods=['GET', 'POST'])
+def get_school_pack_details():
+    try:
+        pack_id = get_request_value('id', 'pack_id')
+        school_id = get_request_value('school', 'school_id', 'shcool_id')
 
+        if pack_id is None:
+            return jsonify({'message': 'Pack ID is required'}), 400
+        if school_id is None:
+            return jsonify({'message': 'School ID is required'}), 400
+
+        try:
+            pack_id = int(pack_id)
+            school_id = int(school_id)
+        except (TypeError, ValueError):
+            return jsonify({'message': 'Pack ID and School ID must be numbers'}), 400
+
+        pack = get_pack_in_school(pack_id, school_id)
+        if not pack:
+            return jsonify({'message': 'Pack not found in this school'}), 404
+        if not user_can_view_pack_in_school(pack, school_id):
+            return jsonify({'message': 'You do not have access to this pack'}), 403
+
+        pack_details = serialize_pack_details(pack)
+        if getattr(pack, 'is_global_pack', False):
+            pack_details['school_id'] = school_id
+            pack_details['shcool_id'] = school_id
+        return jsonify({'pack': pack_details, **pack_details}), 200
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+
+@reader.route('/get_books_from_pack', methods=['GET', 'POST'])
+def get_school_books_from_pack():
+    try:
+        pack_id = get_request_value('id', 'pack_id')
+        school_id = get_request_value('school', 'school_id', 'shcool_id')
+
+        if pack_id is None:
+            return jsonify({'message': 'Pack ID is required'}), 400
+        if school_id is None:
+            return jsonify({'message': 'School ID is required'}), 400
+
+        try:
+            pack_id = int(pack_id)
+            school_id = int(school_id)
+        except (TypeError, ValueError):
+            return jsonify({'message': 'Pack ID and School ID must be numbers'}), 400
+
+        pack = get_pack_in_school(pack_id, school_id)
+        if not pack:
+            return jsonify({'message': 'Pack not found in this school'}), 404
+        if not user_can_view_pack_in_school(pack, school_id):
+            return jsonify({'message': 'You do not have access to this pack'}), 403
+
+        books = [serialize_book_for_pack(book) for book in get_books_in_pack(pack.id)]
+        return jsonify({'school_id': school_id, 'pack_id': pack.id, 'books_in_pack': books, 'books': books}), 200
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+
+
+
+
+@reader.route('/get_book_games/<int:book_id>/<game_type>')
+@login_required
+def get_book_games_for_type(book_id, game_type):
+    try:
+        school_id, school_error, school_status = resolve_game_school_id_from_session()
+        if school_error:
+            return jsonify({'message': school_error, 'code': 'SCHOOL_CONTEXT_REQUIRED'}), school_status
+
+        book = Book.query.get(book_id)
+        if not reader_can_access_book_in_school(book, school_id):
+            return jsonify({'message': 'Book not found', 'code': 'BOOK_NOT_FOUND'}), 404
+
+        school = Shcool.query.get(school_id)
+        play_date = parse_optional_play_date(request.args.get('date'), 'date')
+        payload = get_player_game_payload(school_id, book.id, game_type, play_date=play_date, school=school)
+        return jsonify(payload), 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Get book game payload failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 
 @reader.route('/get_book_games/<book_id>')
@@ -1742,17 +2993,69 @@ def get_book_games(book_id):
         book_text = Book_text.query.filter_by(book_id=book_id).first()
 
         if book_text and book_text.text:
-            words_list = book_text.text.strip().split()  # Convert text into a list of words
-         
-            
-         
-            
-            return jsonify({'words': words_list}), 200
+            words_list = split_legacy_words_from_text(book_text.text)
+            return jsonify({'words': words_list, 'deprecated': True}), 200
         else:
             return jsonify({'message': 'No text available'}), 200
     except Exception as e:
-        return jsonify({'message': str(e)}), 500
+        logging.error('Legacy get_book_games failed: %s', e, exc_info=True)
+        return jsonify({'message': 'Internal server error'}), 500
 
+
+def normalize_game_result_enum(value):
+    if value is None:
+        raise ValueError('game is required')
+    normalized = str(value).strip()
+    aliases = {
+        'word-explorer': 'Word-explorer',
+        'Word Explorer': 'Word-explorer',
+        'word_explorer': 'Word-explorer',
+        'intellect_link': 'intellect-link',
+        'think_word': 'think-word',
+        'bee_genius': 'bee-genius',
+    }
+    normalized = aliases.get(normalized, normalized)
+    return GameEnum(normalized)
+
+
+def parse_result_day(value):
+    if not value:
+        return datetime.now().date()
+    if hasattr(value, 'date') and not isinstance(value, str):
+        return value
+    return datetime.strptime(str(value), '%Y-%m-%d').date()
+
+
+def parse_non_negative_seconds(value):
+    if value in (None, ''):
+        return 0
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, seconds)
+
+
+def serialize_game_result(result, rank=None, current_user_id=None):
+    user = User.query.get(result.user_id) if result.user_id else None
+    return {
+        'id': result.id,
+        'rank': rank,
+        'book_id': result.book_id,
+        'score': result.score,
+        'game': result.game.value,
+        'user_id': result.user_id,
+        'username': user.username if user else None,
+        'user_img': user.img if user else None,
+        'day': result.day.isoformat() if result.day else None,
+        'completed': result.completed,
+        'words_learned': result.words_learned or [],
+        'time_spent_seconds': result.time_spent_seconds or 0,
+        'is_current_user': bool(current_user_id and result.user_id == current_user_id),
+    }
+
+
+@reader.route('/game-result', methods=['POST'])
 @reader.route('/game-result/', methods=['POST'])
 def create_game_result():
     try:
@@ -1760,36 +3063,32 @@ def create_game_result():
        
      
         # Validate required fields
-        if not data or 'score' not in data or 'game' not in data or 'user_id' not in data or 'day' not in data:
+        if not data or 'score' not in data or 'game' not in data or 'book_id' not in data:
         
             return jsonify({'error': 'Missing required fields'}), 400
         
         # Validate game enum
         try:
-            game_status = GameEnum(data['game'])  # Convert string to enum
+            game_status = normalize_game_result_enum(data['game'])  # Convert string to enum
         except ValueError:
        
             return jsonify({'error': 'Invalid game status'}), 400
    
         # Validate user existence
-        user = User.query.get(data['user_id'])
+        user_id = data.get('user_id') or (current_user.id if current_user.is_authenticated else None)
+        if not user_id:
+            return jsonify({'error': 'User not found'}), 404
+
+        user = User.query.get(user_id)
         if not user:
             return jsonify({'error': 'User not found'}), 404
 
         # Check if a game result already exists for the same user and day
-        existing_result = Game_result.query.filter_by(user_id=data['user_id'], day=data['day'],game=game_status,book_id=data['book_id']).first()
+        result_day = parse_result_day(data.get('day'))
+        existing_result = Game_result.query.filter_by(user_id=user_id, day=result_day,game=game_status,book_id=data['book_id']).first()
 
         if existing_result:
-            result_data = {
-                'id': existing_result.id,
-                'book_id': existing_result.book_id,
-                'score': existing_result.score,
-                'game': existing_result.game.value,
-                'user_id': existing_result.user_id,
-                'day': existing_result.day,
-                'completed': existing_result.completed,
-                'words_learned': existing_result.words_learned
-            }
+            result_data = serialize_game_result(existing_result, current_user_id=user_id)
          
             if existing_result.completed:
                 return jsonify({'message': 'You have already finished the game today. Come back tomorrow!', 'result': result_data}), 200
@@ -1801,23 +3100,15 @@ def create_game_result():
             score=data['score'],
             book_id=data['book_id'],
             game=game_status,
-            user_id=data['user_id'],
-            day=data['day'],
+            user_id=user_id,
+            day=result_day,
+            time_spent_seconds=parse_non_negative_seconds(data.get('time_spent_seconds')),
         )
 
         db.session.add(new_result)
         db.session.commit()
 
-        result_data = {
-            'id': new_result.id,
-            'book_id': new_result.book_id,
-            'score': new_result.score,
-            'game': new_result.game.value,
-            'user_id': new_result.user_id,
-            'day': new_result.day,
-            'completed': new_result.completed,
-            'words_learned': new_result.words_learned
-        }
+        result_data = serialize_game_result(new_result, current_user_id=user_id)
 
         return jsonify({'message': 'Game result created successfully', 'result': result_data}), 201
 
@@ -1847,12 +3138,18 @@ def update_game_result(result_id):
         
         if 'completed' in data:
             game_result.completed = data['completed']
+
+        if 'time_spent_seconds' in data:
+            game_result.time_spent_seconds = parse_non_negative_seconds(data.get('time_spent_seconds'))
         
         
 
         db.session.commit()
    
-        return jsonify({'message': 'Game result updated successfully'}), 200
+        return jsonify({
+            'message': 'Game result updated successfully',
+            'result': serialize_game_result(game_result, current_user_id=game_result.user_id)
+        }), 200
     
     except Exception as e:
         db.session.rollback()
@@ -1869,7 +3166,7 @@ def get_game_results():
             return jsonify({'error': 'Game query parameter is required'}), 400
         
         try:
-            game_enum = GameEnum(game)
+            game_enum = normalize_game_result_enum(game)
         except ValueError:
             return jsonify({'error': 'Invalid game type'}), 400
         
@@ -1919,6 +3216,71 @@ def get_ranked_game_results():
         return jsonify(ranked_results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500   
+
+
+@reader.route('/game-leaderboard', methods=['GET'])
+def get_daily_game_leaderboard():
+    try:
+        game = request.args.get('game')
+        book_id = request.args.get('book_id') or request.args.get('id')
+        day = parse_result_day(request.args.get('day') or request.args.get('date'))
+        limit = request.args.get('limit', 50)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 100))
+
+        if not game:
+            return jsonify({'error': 'game query parameter is required'}), 400
+        if not book_id:
+            return jsonify({'error': 'book_id query parameter is required'}), 400
+
+        try:
+            book_id = int(book_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'book_id must be a number'}), 400
+
+        try:
+            game_enum = normalize_game_result_enum(game)
+        except ValueError:
+            return jsonify({'error': 'Invalid game type'}), 400
+
+        current_user_id = current_user.id if current_user.is_authenticated else None
+        query = (
+            Game_result.query
+            .filter_by(book_id=book_id, game=game_enum, day=day, completed=True)
+            .order_by(Game_result.id.asc())
+        )
+        all_results = sorted(
+            query.all(),
+            key=lambda result: (
+                not bool(result.time_spent_seconds and result.time_spent_seconds > 0),
+                result.time_spent_seconds or 0,
+                result.id
+            )
+        )
+        entries = []
+        current_user_entry = None
+
+        for index, result in enumerate(all_results, start=1):
+            serialized = serialize_game_result(result, rank=index, current_user_id=current_user_id)
+            if index <= limit:
+                entries.append(serialized)
+            if current_user_id and result.user_id == current_user_id:
+                current_user_entry = serialized
+
+        return jsonify({
+            'book_id': book_id,
+            'game': game_enum.value,
+            'day': day.isoformat(),
+            'total_players': len(all_results),
+            'entries': entries,
+            'current_user_entry': current_user_entry
+        }), 200
+    except Exception as e:
+        logging.error('Get game leaderboard failed: %s', e, exc_info=True)
+        return jsonify({'error': str(e)}), 500   
 '''
 
 

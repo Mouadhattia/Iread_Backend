@@ -249,22 +249,48 @@ def show_all_pack():
     except Exception as e:
         return jsonify({'message': str(e)}), 500
 
+def serialize_book_for_pack(book):
+    return {
+        'id': book.id,
+        'title': book.title,
+        'author': book.author,
+        'release_date': book.release_date.isoformat() if book.release_date else None,
+        'page_number': book.page_number,
+        'category': book.category,
+        'desc': book.desc,
+        'img': book.img
+    }
+
+def get_books_in_pack(pack_id):
+    return (
+        db.session.query(Book)
+        .join(Book_pack, Book.id == Book_pack.book_id)
+        .filter(Book_pack.pack_id == pack_id)
+        .all()
+    )
+
 
 @main.route('/get_pack_details', methods=['POST'])
 def get_pack_details():
     try:
         pack_id = request.json['id']
-      
-        
-        pack = Pack.query.get(pack_id) 
-        enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
-        num_active_codes = Code.query.filter_by(pack_id=pack.id, status=CodeStatusEnum.ACTIVE).count()
+        school_id = request.json.get('school') or request.json.get('school_id') or request.json.get('shcool_id')
+
+        packs_query = Pack.query.filter_by(id=pack_id)
+        if school_id:
+            packs_query = packs_query.filter_by(shcool_id=school_id)
+
+        pack = packs_query.first()
         if pack:
+            enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
+            num_active_codes = Code.query.filter_by(pack_id=pack.id, status=CodeStatusEnum.ACTIVE).count()
+            books = [serialize_book_for_pack(book) for book in get_books_in_pack(pack.id)]
             return jsonify({
                 'id': pack.id,
+                'school_id': pack.shcool_id,
                 'title': pack.title,
                 'level': pack.level,
-                'age': pack.age.value,
+                'age': pack.age.value if pack.age else None,
                 'price': pack.price,
                 'img': pack.img,
                 'book_number': pack.book_number,
@@ -275,11 +301,15 @@ def get_pack_details():
                 'enrolled' : enrolled,
                 'duration':pack.duration,
                 'product_id_invoicing_api':pack.product_id_invoicing_api,
-                'public':pack.public
+                'public':pack.public,
+                'books': books,
+                'books_in_pack': books
             }), 200
         else:
             return jsonify({'message': 'Pack not found'}), 404
     except KeyError:
+        return jsonify({'message': 'Invalid input'}), 400
+    except ValueError:
         return jsonify({'message': 'Invalid input'}), 400
 
 
@@ -287,36 +317,25 @@ def get_pack_details():
 def get_books_from_pack():
     try:
         pack_id = request.json['id']
+        school_id = request.json.get('school') or request.json.get('school_id') or request.json.get('shcool_id')
     except KeyError:
         return jsonify({'message': 'Invalid input'}), 400
     
-    pack = Pack.query.get(pack_id)
+    packs_query = Pack.query.filter_by(id=pack_id)
+    if school_id:
+        packs_query = packs_query.filter_by(shcool_id=school_id)
+
+    pack = packs_query.first()
     
     if pack:
-        books_in_pack = (
-            db.session.query(Book)
-            .join(Book_pack)
-            .join(Pack)
-            .filter(Pack.id == pack_id)
-            .all()
-        )
+        books_in_pack = get_books_in_pack(pack.id)
         
         book_list = [
-            {  
-                'id' : book.id,
-                'title': book.title,
-                'author': book.author,
-                'release_date': book.release_date,
-                'page_number': book.page_number,
-                'category': book.category,
-                'desc' : book.desc,
-                'img' :book.img
-               
-            }
+            serialize_book_for_pack(book)
             for book in books_in_pack
         ]
         
-        return jsonify({'books_in_pack': book_list}), 200
+        return jsonify({'school_id': pack.shcool_id, 'pack_id': pack.id, 'books_in_pack': book_list, 'books': book_list}), 200
     else:
         return jsonify({'message': 'Pack not found'}), 404
 from flask import request

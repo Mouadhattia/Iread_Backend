@@ -21,6 +21,10 @@ class Book(db.Model):
     page_number=db.Column(db.Integer,nullable=True)
     category=db.Column(db.String(100),nullable=True)
     neo4j_id=db.Column(db.Integer,nullable=True) #False
+    shcool_id = db.Column(db.ForeignKey(Shcool.id), nullable=True)
+    is_platform_book = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
+    active = db.Column(db.Boolean, nullable=False, default=True, index=True)
     
 
 

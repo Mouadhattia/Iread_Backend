@@ -25,6 +25,7 @@ class Game_result(db.Model):
     day = db.Column(db.Date, default=date.today)
     completed = db.Column(db.Boolean, default=False)
     words_learned = db.Column(db.JSON,default=[])
+    time_spent_seconds = db.Column(db.Integer, default=0)
  
     def __repr__(self):
         return '<Game_result %s>' % self.game

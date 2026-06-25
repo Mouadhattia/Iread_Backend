@@ -35,6 +35,9 @@ class Pack(db.Model):
     codes = db.relationship('Code', backref='pack', cascade='all, delete-orphan')
     shcool_id = db.Column(db.ForeignKey(Shcool.id))
     public = db.Column(db.Boolean,default=False)
+    is_global_pack = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
+    active = db.Column(db.Boolean, nullable=False, default=True, index=True)
     
     def __repr__(self):
         return '< Pack %s >' %self.title

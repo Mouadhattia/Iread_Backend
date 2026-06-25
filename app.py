@@ -83,6 +83,7 @@ from apps.reader.routes import reader
 from apps.teacher.routes import teacher
 from apps.admin.routes import admin
 from apps.main.routes import main
+from apps.audiobooks.routes import admin_audiobooks, teacher_audiobooks, reader_audiobooks
 
 @app.route('/')
 def home():
@@ -93,6 +94,9 @@ app.register_blueprint(reader)
 app.register_blueprint(teacher)
 app.register_blueprint(admin)
 app.register_blueprint(main)
+app.register_blueprint(admin_audiobooks)
+app.register_blueprint(teacher_audiobooks)
+app.register_blueprint(reader_audiobooks)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5003)  
+    app.run(host='0.0.0.0', port=5003)
