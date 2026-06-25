@@ -12,6 +12,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout latest code
+        uses: actions/checkout@v4
+
       - name: Deploy over SSH
         env:
           SSH_KEY: ${{ secrets.SSH_KEY }}
@@ -46,29 +49,34 @@ jobs:
           set -euo pipefail
 
           APP_DIR="${SERVER_PATH:-/var/www/html/iread/backend}"
-          BRANCH="main"
 
-          echo "Deploying iRead backend from origin/$BRANCH in $APP_DIR"
+          echo "Preparing iRead backend directory at $APP_DIR"
+          mkdir -p "$APP_DIR"
+          EOF
 
-          if [ ! -d "$APP_DIR/.git" ]; then
-            echo "Remote project directory was not found or is not a git repository: $APP_DIR" >&2
-            echo "Current directory details:" >&2
-            ls -la "$APP_DIR" 2>/dev/null || true
-            echo "Parent directory details:" >&2
-            ls -la "$(dirname "$APP_DIR")" 2>/dev/null || true
-            echo "Clone the repo there, or set the SERVER_PATH repository variable to the correct path." >&2
-            exit 1
-          fi
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/iread_deploy_key -p $SERVER_PORT" \
+            --exclude ".git/" \
+            --exclude ".github/" \
+            --exclude "venv/" \
+            --exclude "uploads/" \
+            --exclude "__pycache__/" \
+            --exclude "*.pyc" \
+            --exclude "*.log" \
+            --exclude "*.sql" \
+            --exclude ".env" \
+            --exclude "config.py" \
+            ./ "$SERVER_USER@$SERVER_IP:${SERVER_PATH:-/var/www/html/iread/backend}/"
 
+          ssh -i ~/.ssh/iread_deploy_key \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_IP" \
+            "$remote_command" <<'EOF'
+          set -euo pipefail
+
+          APP_DIR="${SERVER_PATH:-/var/www/html/iread/backend}"
+          echo "Running iRead backend deploy commands in $APP_DIR"
           cd "$APP_DIR"
-
-          git fetch origin "$BRANCH"
-          if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
-            git checkout "$BRANCH"
-          else
-            git checkout -b "$BRANCH" "origin/$BRANCH"
-          fi
-          git pull --ff-only origin "$BRANCH"
 
           if [ ! -d venv ]; then
             python3 -m venv venv
