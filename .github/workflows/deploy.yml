@@ -52,6 +52,10 @@ jobs:
 
           if [ ! -d "$APP_DIR/.git" ]; then
             echo "Remote project directory was not found or is not a git repository: $APP_DIR" >&2
+            echo "Current directory details:" >&2
+            ls -la "$APP_DIR" 2>/dev/null || true
+            echo "Parent directory details:" >&2
+            ls -la "$(dirname "$APP_DIR")" 2>/dev/null || true
             echo "Clone the repo there, or set the SERVER_PATH repository variable to the correct path." >&2
             exit 1
           fi
