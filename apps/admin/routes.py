@@ -78,6 +78,17 @@ from apps.game_calendar import (
     serialize_game_setting,
     upsert_calendar_entry,
 )
+from apps.notifications import (
+    commit_notification_event,
+    get_session_audience_ids,
+    notify_book_added_to_pack,
+    notify_daily_game_created,
+    notify_global_pack_created,
+    notify_school_pack_created,
+    notify_session_created,
+    notify_session_deleted,
+    notify_session_updated,
+)
 import secrets
 import string
 import json
@@ -2048,6 +2059,7 @@ def super_create_global_pack():
         apply_pack_metadata(pack, data)
         db.session.add(pack)
         db.session.commit()
+        commit_notification_event(notify_global_pack_created, pack)
 
         return jsonify({
             'message': 'Global pack created successfully',
@@ -2156,6 +2168,7 @@ def super_add_book_to_global_pack(pack_id, book_id):
         pack.book_number = (pack.book_number or 0) + 1
         db.session.add(pack)
         db.session.commit()
+        commit_notification_event(notify_book_added_to_pack, pack, book)
         return jsonify({
             'message': 'Book added to global pack successfully',
             'pack': serialize_global_pack(pack, include_details=True),
@@ -2342,6 +2355,7 @@ def super_create_global_pack_session(pack_id, unit_id):
         db.session.flush()
         ensure_jitsi_room(session)
         db.session.commit()
+        commit_notification_event(notify_session_created, session)
         return jsonify({'message': 'Global pack session created successfully', 'session': serialize_session(session)}), 201
     except ValueError as error:
         db.session.rollback()
@@ -2362,6 +2376,7 @@ def super_update_global_pack_session(pack_id, session_id):
         if not session:
             return jsonify({'message': 'Session not found'}), 404
 
+        was_online = is_online_session(session)
         data = request.get_json(silent=True) or {}
         if 'name' in data:
             name = str(data.get('name') or '').strip()
@@ -2405,6 +2420,7 @@ def super_update_global_pack_session(pack_id, session_id):
             session.meet_link = data.get('meet_link')
         ensure_jitsi_room(session)
         db.session.commit()
+        commit_notification_event(notify_session_updated, session, became_online=(not was_online and is_online_session(session)))
         return jsonify({'message': 'Global pack session updated successfully', 'session': serialize_session(session)}), 200
     except ValueError as error:
         db.session.rollback()
@@ -2423,9 +2439,18 @@ def super_delete_global_pack_session(pack_id, session_id):
         session = Session.query.filter_by(id=session_id, pack_id=pack_id).first()
         if not session:
             return jsonify({'message': 'Session not found'}), 404
+        notification_user_ids = get_session_audience_ids(session)
+        session_notification_data = {
+            'id': session.id,
+            'name': session.name,
+            'pack_id': session.pack_id,
+            'book_id': session.book_id,
+            'school_id': None
+        }
         Follow_session.query.filter_by(session_id=session.id).delete(synchronize_session=False)
         db.session.delete(session)
         db.session.commit()
+        commit_notification_event(notify_session_deleted, session_notification_data, notification_user_ids)
         return jsonify({'message': 'Global pack session deleted successfully'}), 200
     except Exception as error:
         db.session.rollback()
@@ -3894,6 +3919,7 @@ def create_session():
         db.session.flush()
         ensure_jitsi_room(new_session)
         db.session.commit()
+        commit_notification_event(notify_session_created, new_session)
         session_info = {
 
              'id': new_session.id,
@@ -3947,6 +3973,15 @@ def delete_session():
         # Get the session to be deleted
         session = get_school_session(token)
         if session:
+            pack = Pack.query.get(session.pack_id) if session.pack_id else None
+            notification_user_ids = get_session_audience_ids(session)
+            session_notification_data = {
+                'id': session.id,
+                'name': session.name,
+                'pack_id': session.pack_id,
+                'book_id': session.book_id,
+                'school_id': pack.shcool_id if pack else None
+            }
             # Delete all associated records in Follow_session table
             follow_sessions = Follow_session.query.filter_by(session_id=session.id).all()
             for follow in follow_sessions:
@@ -3960,6 +3995,7 @@ def delete_session():
             # Delete the session
             db.session.delete(session)
             db.session.commit()
+            commit_notification_event(notify_session_deleted, session_notification_data, notification_user_ids)
 
             return jsonify({'message': 'Session and associated records successfully deleted'})
         else:
@@ -4042,6 +4078,7 @@ def update_session():
         if not session_to_update:
             return jsonify({'message': 'Session not found'}), 404
         
+        was_online = is_online_session(session_to_update)
         teacher = Teacher.query.filter_by(id=session_to_update.teacher_id).first()
         book = Book.query.filter_by(id=session_to_update.book_id).first()
         
@@ -4072,6 +4109,7 @@ def update_session():
         ensure_jitsi_room(session_to_update)
   
         db.session.commit()
+        commit_notification_event(notify_session_updated, session_to_update, became_online=(not was_online and is_online_session(session_to_update)))
         teacher = Teacher.query.filter_by(id=session_to_update.teacher_id).first()
         book = Book.query.filter_by(id=session_to_update.book_id).first()
 
@@ -4752,14 +4790,16 @@ def upsert_admin_book_game_calendar_day(book_id, game_type, play_date):
             return error_response, error_status
 
         data = request.get_json(silent=True) or {}
+        normalized_game_type = normalize_game_type(game_type)
         entry, created = upsert_calendar_entry(
             school_id,
             book.id,
-            game_type,
+            normalized_game_type,
             play_date,
             data.get('words')
         )
         db.session.commit()
+        commit_notification_event(notify_daily_game_created, school_id, book, normalized_game_type, entry.play_date)
         return jsonify({
             'message': 'Calendar entry created' if created else 'Calendar entry updated',
             'entry': serialize_calendar_entry(entry)
@@ -4824,8 +4864,17 @@ def generate_admin_book_game_calendar(book_id, game_type):
                 overwrite = False
             else:
                 raise GameCalendarError('overwrite must be true or false', 'INVALID_OVERWRITE', 400)
-        result = generate_calendar_entries(school_id, book.id, game_type, start_date, overwrite=overwrite)
+        normalized_game_type = normalize_game_type(game_type)
+        result = generate_calendar_entries(school_id, book.id, normalized_game_type, start_date, overwrite=overwrite)
         db.session.commit()
+        if result.get('created') or result.get('updated'):
+            commit_notification_event(
+                notify_daily_game_created,
+                school_id,
+                book,
+                normalized_game_type,
+                parse_play_date(result['start_date'], 'start_date')
+            )
         return jsonify({
             'message': 'Game calendar generated',
             'result': result
@@ -4992,6 +5041,20 @@ def import_admin_book_game_calendar_json(book_id, game_type):
                 setting_payload = serialize_game_setting(setting)
 
         db.session.commit()
+        if result.get('created') or result.get('updated'):
+            imported_dates = [
+                entry.get('date')
+                for entry in result.get('valid_entries', [])
+                if entry.get('date')
+            ]
+            if imported_dates:
+                commit_notification_event(
+                    notify_daily_game_created,
+                    school_id,
+                    book,
+                    game_type,
+                    min(imported_dates)
+                )
         response_payload = {
             'message': 'Game calendar imported',
             'result': public_game_calendar_import_result(result)
@@ -5268,6 +5331,7 @@ def create_pack():
             )
             db.session.add(pack)
             db.session.commit()
+            commit_notification_event(notify_school_pack_created, pack)
             pack_data = {
                'id': pack.id,
                'title': pack.title,
@@ -5308,6 +5372,7 @@ def add_book_to_pack():
                     db.session.add(book_pack)
                     db.session.add(pack)
                     db.session.commit()
+                    commit_notification_event(notify_book_added_to_pack, pack, book)
                     book_data = {
                         'id': book.id,
                         'title': book.title,

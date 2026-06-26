@@ -18,6 +18,7 @@ from models.shcool import Shcool
 from models.school_invitation_code import SchoolInvitationCode
 from models.book_story import BookStory
 from models.reader_story_progress import ReaderStoryProgress
+from models.reader_notification import ReaderNotification
 from models.school_book_instance import SchoolBookInstance
 from models.school_pack_instance import SchoolPackInstance
 from models.school_public_page import (
@@ -33,6 +34,7 @@ from models.book_text import Book_text
 from models.follow_session import Follow_session
 from apps.main.email import generate_confirmed_token,reader_confirm_token
 from apps.jitsi import is_online_session, serialize_jitsi_call
+from apps.notifications import serialize_reader_notification
 from apps.game_calendar import (
     GameCalendarError,
     game_error_response,
@@ -78,6 +80,141 @@ bcrypt=Bcrypt()
 
 # Initialize the login manager for the authentication blueprint.
 login_manager.init_app(reader)
+
+
+def get_reader_notification_query():
+    return (
+        ReaderNotification.query
+        .filter(
+            ReaderNotification.user_id == current_user.id,
+            or_(
+                ReaderNotification.expires_at.is_(None),
+                ReaderNotification.expires_at >= datetime.utcnow()
+            )
+        )
+    )
+
+
+def parse_notification_pagination():
+    try:
+        page = int(request.args.get('page', 1))
+        per_page = int(request.args.get('per_page', 20))
+    except (TypeError, ValueError):
+        page = 1
+        per_page = 20
+    return max(page, 1), min(max(per_page, 1), 100)
+
+
+@reader.route('/notifications', methods=['GET'])
+@login_required
+def get_reader_notifications():
+    try:
+        page, per_page = parse_notification_pagination()
+        query = get_reader_notification_query()
+        notification_type = request.args.get('type')
+        if notification_type:
+            query = query.filter(ReaderNotification.type == notification_type)
+        if str(request.args.get('unread', '')).lower() in ['1', 'true', 'yes']:
+            query = query.filter(ReaderNotification.read_at.is_(None))
+
+        total = query.order_by(None).count()
+        notifications = (
+            query
+            .order_by(ReaderNotification.created_at.desc(), ReaderNotification.id.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+        pages = (total + per_page - 1) // per_page if total else 0
+        unread_count = get_reader_notification_query().filter(ReaderNotification.read_at.is_(None)).count()
+        return jsonify({
+            'notifications': [serialize_reader_notification(notification) for notification in notifications],
+            'unread_count': unread_count,
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total,
+                'pages': pages,
+                'has_next': page < pages,
+                'has_prev': page > 1
+            }
+        }), 200
+    except Exception as error:
+        logging.error('Unable to get reader notifications: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/notifications/unread-count', methods=['GET'])
+@login_required
+def get_reader_notifications_unread_count():
+    try:
+        unread_count = get_reader_notification_query().filter(ReaderNotification.read_at.is_(None)).count()
+        return jsonify({'unread_count': unread_count}), 200
+    except Exception as error:
+        logging.error('Unable to count reader notifications: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/notifications/<int:notification_id>', methods=['GET'])
+@login_required
+def get_reader_notification(notification_id):
+    try:
+        notification = get_reader_notification_query().filter(ReaderNotification.id == notification_id).first()
+        if not notification:
+            return jsonify({'message': 'Notification not found'}), 404
+        return jsonify({'notification': serialize_reader_notification(notification)}), 200
+    except Exception as error:
+        logging.error('Unable to get reader notification: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/notifications/<int:notification_id>/read', methods=['PUT', 'PATCH'])
+@login_required
+def mark_reader_notification_read(notification_id):
+    try:
+        notification = get_reader_notification_query().filter(ReaderNotification.id == notification_id).first()
+        if not notification:
+            return jsonify({'message': 'Notification not found'}), 404
+        if notification.read_at is None:
+            notification.read_at = datetime.utcnow()
+            db.session.commit()
+        return jsonify({'notification': serialize_reader_notification(notification)}), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to mark reader notification read: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/notifications/read-all', methods=['PUT', 'PATCH'])
+@login_required
+def mark_all_reader_notifications_read():
+    try:
+        now = datetime.utcnow()
+        notifications = get_reader_notification_query().filter(ReaderNotification.read_at.is_(None)).all()
+        for notification in notifications:
+            notification.read_at = now
+        db.session.commit()
+        return jsonify({'message': 'Notifications marked as read', 'updated': len(notifications)}), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to mark reader notifications read: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@reader.route('/notifications/<int:notification_id>', methods=['DELETE'])
+@login_required
+def delete_reader_notification(notification_id):
+    try:
+        notification = get_reader_notification_query().filter(ReaderNotification.id == notification_id).first()
+        if not notification:
+            return jsonify({'message': 'Notification not found'}), 404
+        db.session.delete(notification)
+        db.session.commit()
+        return jsonify({'message': 'Notification deleted'}), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to delete reader notification: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 
 
@@ -1962,6 +2099,7 @@ def delete_account():
             follow_sessions=Follow_session.query.filter_by(user_id=current_user.id).all()
             follow_packs=Follow_pack.query.filter_by(user_id=current_user.id).all()
             notifications = Notification_user.query.filter_by(user_id=current_user.id).all()
+            ReaderNotification.query.filter_by(user_id=current_user.id).delete(synchronize_session=False)
             [ db.session.delete(notification) for notification in notifications ]
             [ db.session.delete(follow_session) for follow_session in follow_sessions ]
             [ db.session.delete(follow_pack) for follow_pack in follow_packs ]
