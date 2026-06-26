@@ -71,6 +71,8 @@ class AudioBookPage(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint('audio_book_id', 'page_number', name='uq_audio_book_page_number'),
+        db.Index('ix_audio_book_page_book_active_page', 'audio_book_id', 'active', 'page_number'),
+        db.Index('ix_audio_book_page_book_active_status', 'audio_book_id', 'active', 'alignment_status'),
     )
 
     def __repr__(self):
