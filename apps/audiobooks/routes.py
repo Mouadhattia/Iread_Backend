@@ -559,6 +559,18 @@ def mark_alignment_reviewed(alignment, role=None):
         pass
 
     reviewed_alignment['review'] = review
+    reviewed_words = []
+    for word in reviewed_alignment.get('words') or []:
+        if not isinstance(word, dict):
+            reviewed_words.append(word)
+            continue
+        if word.get('status') != 'interpolated':
+            reviewed_words.append(word)
+            continue
+        reviewed_word = dict(word)
+        reviewed_word['status'] = 'manually-edited'
+        reviewed_words.append(reviewed_word)
+    reviewed_alignment['words'] = reviewed_words
     return reviewed_alignment
 
 

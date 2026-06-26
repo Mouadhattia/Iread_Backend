@@ -11,6 +11,10 @@ from config import ConfigClass
 
 WORD_PATTERN = re.compile(r'\S+')
 NORMALIZE_PATTERN = re.compile(r"[^\w']+", re.UNICODE)
+INTERPOLATED_TIMING_WARNING = (
+    'Word-level alignment failed, so timings were estimated from segment timestamps. '
+    'Review and save the timestamps before approval.'
+)
 
 
 class AudioAlignmentUnavailable(RuntimeError):
@@ -113,6 +117,7 @@ def get_transcript_words(transcript_result):
                 'startMs': max(start_ms, 0),
                 'endMs': max(end_ms, start_ms + 1),
                 'confidence': word.get('confidence'),
+                'status': word.get('status'),
             })
     return transcript_words
 
@@ -178,6 +183,7 @@ def append_extra_transcript_words(extra_words, transcript_words):
             'startMs': transcript_word['startMs'],
             'endMs': transcript_word['endMs'],
             'confidence': transcript_word.get('confidence'),
+            'status': transcript_word.get('status'),
         })
 
 
@@ -190,6 +196,7 @@ def build_alignment_from_transcript(
 ):
     official_words = split_text_words(official_text)
     transcript_words = get_transcript_words(transcript_result)
+    has_interpolated_timings = any(word.get('status') == 'interpolated' for word in transcript_words)
     official_norm = [normalize_word(word['text']) for word in official_words]
     transcript_norm = [word['normalized'] for word in transcript_words]
 
@@ -214,7 +221,7 @@ def build_alignment_from_transcript(
                 aligned_words_by_index[official_word['index']] = build_matched_word(
                     official_word,
                     transcript_word,
-                    'matched'
+                    transcript_word.get('status') or 'matched'
                 )
                 matched_count += 1
             continue
@@ -225,7 +232,7 @@ def build_alignment_from_transcript(
                     aligned_words_by_index[official_word['index']] = build_matched_word(
                         official_word,
                         transcript_word,
-                        'matched'
+                        transcript_word.get('status') or 'matched'
                     )
                     matched_count += 1
                 else:
@@ -250,7 +257,8 @@ def build_alignment_from_transcript(
         for word in official_words
     ]
     similarity = matched_count / len(official_words) if official_words else 0
-    requires_review = bool(unmatched_official_words or extra_transcribed_words)
+    requires_review = bool(unmatched_official_words or extra_transcribed_words or has_interpolated_timings)
+    warnings = [INTERPOLATED_TIMING_WARNING] if has_interpolated_timings else []
 
     return {
         'version': 1,
@@ -265,7 +273,7 @@ def build_alignment_from_transcript(
             'requiresReview': requires_review,
             'unmatchedOfficialWords': unmatched_official_words,
             'extraTranscribedWords': extra_transcribed_words,
-            'warnings': []
+            'warnings': warnings
         }
     }
 
@@ -279,6 +287,7 @@ def build_alignment_from_audio_transcript(
     transcript_words = get_transcript_words(transcript_result)
     if not transcript_words:
         raise AudioAlignmentError('The model did not find spoken words in this audio')
+    has_interpolated_timings = any(word.get('status') == 'interpolated' for word in transcript_words)
 
     official_text = format_transcribed_text(transcript_result, transcript_words)
     if not official_text:
@@ -301,16 +310,16 @@ def build_alignment_from_audio_transcript(
                 'text': word['text'],
                 'startMs': word['startMs'],
                 'endMs': word['endMs'],
-                'status': 'matched',
+                'status': word.get('status') or 'matched',
                 'confidence': word.get('confidence'),
             }
             for index, word in enumerate(transcript_words)
         ],
         'review': {
-            'requiresReview': False,
+            'requiresReview': has_interpolated_timings,
             'unmatchedOfficialWords': [],
             'extraTranscribedWords': [],
-            'warnings': []
+            'warnings': [INTERPOLATED_TIMING_WARNING] if has_interpolated_timings else []
         }
     }
 
@@ -325,6 +334,125 @@ def get_whisper_timestamped_model(model_name, device):
         ) from error
 
     return whisper.load_model(model_name, device=device)
+
+
+def is_infinite_logprob_error(error):
+    return 'infinite logprob' in str(error or '').lower()
+
+
+def get_timestamped_transcribe_attempts(language=None, options=None):
+    options = options or {}
+    base_kwargs = {
+        'temperature': 0,
+    }
+    if language:
+        base_kwargs['language'] = language
+    if options.get('vad') is not None:
+        base_kwargs['vad'] = options.get('vad')
+
+    stable_kwargs = dict(base_kwargs)
+    stable_kwargs.update({
+        'temperature': 0.2,
+        'condition_on_previous_text': False,
+        'compute_word_confidence': False,
+    })
+
+    minimal_kwargs = {'language': language} if language else {}
+    attempts = [base_kwargs, stable_kwargs, minimal_kwargs]
+    unique_attempts = []
+    seen = set()
+    for attempt in attempts:
+        key = tuple(sorted(attempt.items()))
+        if key not in seen:
+            seen.add(key)
+            unique_attempts.append(attempt)
+    return unique_attempts
+
+
+def transcribe_with_timestamped_retries(whisper, model, audio, language=None, options=None):
+    last_error = None
+    for transcribe_kwargs in get_timestamped_transcribe_attempts(language, options):
+        try:
+            return whisper.transcribe(model, audio, **transcribe_kwargs)
+        except TypeError as error:
+            last_error = error
+        except Exception as error:
+            last_error = error
+            if not is_infinite_logprob_error(error):
+                raise
+    if last_error:
+        raise last_error
+    raise AudioAlignmentError('Unable to generate model alignment')
+
+
+def seconds_to_float(value, default=0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def estimate_segment_words(text, start_seconds, end_seconds):
+    words = split_text_words(text)
+    if not words:
+        return []
+
+    start_ms = max(int(round(seconds_to_float(start_seconds) * 1000)), 0)
+    end_ms = max(int(round(seconds_to_float(end_seconds, start_seconds) * 1000)), start_ms + len(words))
+    duration_ms = max(end_ms - start_ms, len(words))
+    step_ms = duration_ms / len(words)
+
+    estimated_words = []
+    for index, word in enumerate(words):
+        word_start_ms = int(round(start_ms + index * step_ms))
+        word_end_ms = int(round(start_ms + (index + 1) * step_ms))
+        estimated_words.append({
+            'text': word['text'],
+            'start': word_start_ms / 1000,
+            'end': max(word_end_ms, word_start_ms + 1) / 1000,
+            'confidence': None,
+            'status': 'interpolated',
+        })
+    return estimated_words
+
+
+def run_openai_whisper_segment_fallback(model, audio, language=None):
+    try:
+        import whisper as openai_whisper
+    except ImportError as error:
+        raise AudioAlignmentUnavailable(
+            'whisper-timestamped failed and openai-whisper fallback is not installed.'
+        ) from error
+
+    transcribe_kwargs = {
+        'temperature': 0,
+        'condition_on_previous_text': False,
+    }
+    if language:
+        transcribe_kwargs['language'] = language
+
+    try:
+        result = openai_whisper.transcribe(model, audio, **transcribe_kwargs)
+    except TypeError:
+        minimal_kwargs = {'language': language} if language else {}
+        result = openai_whisper.transcribe(model, audio, **minimal_kwargs)
+
+    segments = []
+    for segment in result.get('segments') or []:
+        text = str(segment.get('text') or '').strip()
+        if not text:
+            continue
+        estimated_segment = dict(segment)
+        estimated_segment['words'] = estimate_segment_words(
+            text,
+            segment.get('start'),
+            segment.get('end')
+        )
+        segments.append(estimated_segment)
+
+    fallback_result = dict(result)
+    fallback_result['segments'] = segments
+    return fallback_result
 
 
 def run_whisper_timestamped(audio_path, language=None, options=None):
@@ -355,28 +483,29 @@ def run_whisper_timestamped(audio_path, language=None, options=None):
     except Exception as error:
         raise AudioAlignmentError(f'Unable to read audio file: {error}') from error
 
-    transcribe_kwargs = {
-        'temperature': 0,
+    metadata = {
+        'provider': 'whisper-timestamped',
+        'id': model_name,
+        'device': device,
     }
-    if language:
-        transcribe_kwargs['language'] = language
-    if options.get('vad') is not None:
-        transcribe_kwargs['vad'] = options.get('vad')
 
     try:
-        return whisper.transcribe(model, audio, **transcribe_kwargs), {
-            'provider': 'whisper-timestamped',
-            'id': model_name,
-            'device': device,
-        }
-    except TypeError:
-        minimal_kwargs = {'language': language} if language else {}
-        return whisper.transcribe(model, audio, **minimal_kwargs), {
-            'provider': 'whisper-timestamped',
-            'id': model_name,
-            'device': device,
-        }
+        return transcribe_with_timestamped_retries(
+            whisper,
+            model,
+            audio,
+            language=language,
+            options=options,
+        ), metadata
     except Exception as error:
+        if is_infinite_logprob_error(error):
+            fallback_metadata = dict(metadata)
+            fallback_metadata.update({
+                'provider': 'openai-whisper-segment-fallback',
+                'fallbackFrom': 'whisper-timestamped',
+                'warning': INTERPOLATED_TIMING_WARNING,
+            })
+            return run_openai_whisper_segment_fallback(model, audio, language=language), fallback_metadata
         raise AudioAlignmentError(f'Unable to generate model alignment: {error}') from error
 
 
