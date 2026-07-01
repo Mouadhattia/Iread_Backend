@@ -41,6 +41,15 @@ def default_school_public_sections(school_name):
     }]
 
 
+HERO_TYPES = ('cover', 'split', 'minimal')
+DEFAULT_HERO_TYPE = 'cover'
+
+
+def normalize_hero_type(value):
+    value = str(value or '').strip().lower()
+    return value if value in HERO_TYPES else DEFAULT_HERO_TYPE
+
+
 def normalize_public_page_sections(sections):
     if not isinstance(sections, list):
         raise ValueError('sections must be a list')
@@ -82,6 +91,9 @@ class SchoolPublicPage(db.Model):
     headline = db.Column(db.String(255), nullable=True)
     description = db.Column(db.String(1000), nullable=True)
     sections = db.Column(db.JSON, nullable=False, default=list)
+    hero_type = db.Column(db.String(30), nullable=False, default=DEFAULT_HERO_TYPE)
+    draft_data = db.Column(db.JSON, nullable=True)
+    published_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
 

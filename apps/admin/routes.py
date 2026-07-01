@@ -21,8 +21,10 @@ from models.school_pack_instance import SchoolPackInstance
 from models.global_teacher import GlobalTeacher
 from models.school_public_page import (
     SchoolPublicPage,
+    DEFAULT_HERO_TYPE,
     default_school_public_sections,
     generate_unique_school_slug,
+    normalize_hero_type,
     normalize_public_page_sections,
     normalize_school_slug
 )
@@ -45,15 +47,17 @@ from models.session_quiz import Session_quiz
 from models.about_book import About_Book
 from models.book_text import Book_text
 from models.notification_user import Notification_user
+from models.reader_notification import ReaderNotification
 from models.profile import Profile
+from models.chat import Chat
 import logging
 import requests
 from apps.main.email import generate_confirmed_token
 from config import ConfigClass
 from flask_mail import Message
 from functools import wraps
-from datetime import datetime
-from sqlalchemy import func, or_, and_
+from datetime import datetime, timedelta, date
+from sqlalchemy import func, or_, and_, case
 from apps.main.email import admin_confirm_token
 from apps.jitsi import ensure_jitsi_room, is_online_session, serialize_jitsi_call
 from apps.game_calendar import (
@@ -221,6 +225,7 @@ def serialize_school_public_page(page):
     school = page.school or Shcool.query.get(page.shcool_id)
     relative_url, full_url = build_school_public_url(page.slug)
     sections = page.sections or default_school_public_sections(school.name if school else 'this school')
+    draft = page.draft_data
 
     return {
         'id': page.id,
@@ -234,22 +239,72 @@ def serialize_school_public_page(page):
         'headline': page.headline,
         'description': page.description,
         'sections': sections,
+        'hero_type': page.hero_type,
         'public_url': relative_url,
         'full_public_url': full_url,
         'created_at': page.created_at.isoformat() if page.created_at else None,
-        'updated_at': page.updated_at.isoformat() if page.updated_at else None
+        'updated_at': page.updated_at.isoformat() if page.updated_at else None,
+        'published_at': page.published_at.isoformat() if page.published_at else None,
+        'has_unpublished_changes': draft is not None,
+        'draft': {
+            'logo': draft.get('logo'),
+            'cover_image': draft.get('cover_image'),
+            'headline': draft.get('headline'),
+            'description': draft.get('description'),
+            'hero_type': draft.get('hero_type'),
+            'sections': draft.get('sections')
+        } if draft is not None else None
     }
+
+CONTENT_FIELDS = ['logo', 'cover_image', 'headline', 'description']
+
+def normalize_public_page_content_fields(data):
+    fields = {}
+
+    for field in CONTENT_FIELDS:
+        if field in data:
+            fields[field] = normalize_optional_text(data.get(field))
+
+    if 'hero_type' in data:
+        fields['hero_type'] = normalize_hero_type(data.get('hero_type'))
+
+    if 'sections' in data:
+        fields['sections'] = normalize_public_page_sections(data.get('sections'))
+
+    return fields
+
+def live_content_snapshot(page):
+    return {
+        'logo': page.logo,
+        'cover_image': page.cover_image,
+        'headline': page.headline,
+        'description': page.description,
+        'hero_type': page.hero_type,
+        'sections': page.sections
+    }
+
+def apply_content_to_live(page, fields):
+    for key, value in fields.items():
+        setattr(page, key, value)
+    page.updated_at = datetime.now()
+    db.session.add(page)
+    return page
+
+def apply_content_to_draft(page, fields):
+    if not fields:
+        return page
+    current_draft = dict(page.draft_data) if page.draft_data else live_content_snapshot(page)
+    current_draft.update(fields)
+    page.draft_data = current_draft
+    page.updated_at = datetime.now()
+    db.session.add(page)
+    return page
 
 def apply_school_public_page_payload(page, data, allow_slug=False):
     if 'active' in data:
         page.active = parse_bool_value(data.get('active'), 'active')
 
-    for field in ['logo', 'cover_image', 'headline', 'description']:
-        if field in data:
-            setattr(page, field, normalize_optional_text(data.get(field)))
-
-    if 'sections' in data:
-        page.sections = normalize_public_page_sections(data.get('sections'))
+    apply_content_to_live(page, normalize_public_page_content_fields(data))
 
     if allow_slug and 'slug' in data:
         requested_slug = normalize_school_slug(data.get('slug'))
@@ -736,6 +791,7 @@ def serialize_admin_book(book, school_id=None):
         'read_only': platform_book,
         'instance_id': instance.id if instance else None,
         'active': getattr(book, 'active', True),
+        'archived': getattr(book, 'archived', False),
         'pack_ids': pack_ids
     }
 
@@ -759,6 +815,120 @@ def serialize_admin_pack_details(pack):
         'books_in_pack': books
     })
     return pack_data
+
+def compute_pack_engagement_impact(pack_ids):
+    pack_ids = list(pack_ids or [])
+    if not pack_ids:
+        return {
+            'subscribed_students': 0,
+            'approved_subscribed_students': 0,
+            'pending_subscribed_students': 0,
+            'active_students': 0,
+            'active_session_students': 0,
+            'active_book_students': 0
+        }
+
+    approved_user_ids = [
+        user_id for (user_id,) in (
+            db.session.query(Follow_pack.user_id)
+            .filter(
+                Follow_pack.pack_id.in_(pack_ids),
+                Follow_pack.approved.is_(True)
+            )
+            .distinct()
+            .all()
+        )
+    ]
+
+    active_session_user_ids = set()
+    active_book_user_ids = set()
+
+    if approved_user_ids:
+        active_session_user_ids = {
+            user_id
+            for (user_id,) in (
+                db.session.query(Follow_session.user_id)
+                .join(Session, Follow_session.session_id == Session.id)
+                .filter(
+                    Session.pack_id.in_(pack_ids),
+                    Follow_session.approved.is_(True),
+                    Follow_session.user_id.in_(approved_user_ids)
+                )
+                .distinct()
+                .all()
+            )
+        }
+        active_book_user_ids = {
+            user_id
+            for (user_id,) in (
+                db.session.query(Follow_book.user_id)
+                .filter(
+                    Follow_book.pack_id.in_(pack_ids),
+                    Follow_book.user_id.in_(approved_user_ids)
+                )
+                .distinct()
+                .all()
+            )
+        }
+
+    active_user_ids = active_session_user_ids | active_book_user_ids
+
+    subscribed_user_ids = {
+        user_id for (user_id,) in (
+            db.session.query(Follow_pack.user_id)
+            .filter(Follow_pack.pack_id.in_(pack_ids))
+            .distinct()
+            .all()
+        )
+    }
+    pending_user_ids = {
+        user_id for (user_id,) in (
+            db.session.query(Follow_pack.user_id)
+            .filter(Follow_pack.pack_id.in_(pack_ids), Follow_pack.approved.is_(False))
+            .distinct()
+            .all()
+        )
+    }
+
+    return {
+        'subscribed_students': len(subscribed_user_ids),
+        'approved_subscribed_students': len(approved_user_ids),
+        'pending_subscribed_students': len(pending_user_ids),
+        'active_students': len(active_user_ids),
+        'active_session_students': len(active_session_user_ids),
+        'active_book_students': len(active_book_user_ids)
+    }
+
+def get_pack_delete_impact(pack):
+    impact = compute_pack_engagement_impact([pack.id])
+    impact.update({
+        'books': Book_pack.query.filter_by(pack_id=pack.id).count(),
+        'sessions': Session.query.filter_by(pack_id=pack.id).count(),
+        'codes': Code.query.filter_by(pack_id=pack.id).count()
+    })
+    return impact
+
+def get_book_delete_impact(book):
+    school_id = get_current_school_id()
+    pack_ids = [
+        pack_id for (pack_id,) in (
+            db.session.query(Pack.id)
+            .join(Book_pack, Pack.id == Book_pack.pack_id)
+            .filter(Book_pack.book_id == book.id, Pack.shcool_id == school_id)
+            .distinct()
+            .all()
+        )
+    ] if school_id else []
+
+    impact = compute_pack_engagement_impact(pack_ids)
+    impact.update({
+        'packs': len(pack_ids),
+        'sessions': (
+            Session.query.filter(Session.book_id == book.id, Session.pack_id.in_(pack_ids)).count()
+            if pack_ids else 0
+        )
+    })
+    return impact
 
 def get_pack_request_id():
     data = request.get_json(silent=True) or {}
@@ -3966,6 +4136,129 @@ def count_sessions():
 
 
 
+GAME_TYPE_LABELS = {
+    'bee-genius': 'Bee Genius',
+    'word-explorer': 'Word Explorer',
+    'think-word': 'Think Word',
+    'intellect-link': 'Intellect Link'
+}
+
+@admin.route('/packs/<int:pack_id>/publish-readiness', methods=['GET'])
+def get_pack_publish_readiness(pack_id):
+    try:
+        pack = get_school_accessible_pack(pack_id)
+        if not pack:
+            return jsonify({'message': 'Pack not found'}), 404
+
+        school_id = get_current_school_id()
+
+        books = (
+            db.session.query(Book.id, Book.title)
+            .join(Book_pack, Book_pack.book_id == Book.id)
+            .filter(Book_pack.pack_id == pack.id)
+            .all()
+        )
+        book_ids = [book.id for book in books]
+
+        scheduled_by_book = {}
+        if book_ids:
+            game_rows = (
+                db.session.query(GameCalendarEntry.book_id, GameCalendarEntry.game_type)
+                .filter(
+                    GameCalendarEntry.shcool_id == school_id,
+                    GameCalendarEntry.book_id.in_(book_ids)
+                )
+                .distinct()
+                .all()
+            )
+            for book_id, game_type in game_rows:
+                scheduled_by_book.setdefault(book_id, set()).add(game_type)
+
+        session_count_by_book = {}
+        if book_ids:
+            session_rows = (
+                db.session.query(Session.book_id, func.count(Session.id))
+                .filter(Session.pack_id == pack.id, Session.book_id.in_(book_ids))
+                .group_by(Session.book_id)
+                .all()
+            )
+            session_count_by_book = dict(session_rows)
+
+        books_payload = []
+        books_ready = 0
+        for book in books:
+            scheduled = scheduled_by_book.get(book.id, set())
+            missing = [g for g in SUPPORTED_GAME_TYPES if g not in scheduled]
+            all_scheduled = not missing
+            session_count = session_count_by_book.get(book.id, 0)
+            has_sessions = session_count > 0
+            ready = all_scheduled and has_sessions
+            if ready:
+                books_ready += 1
+
+            books_payload.append({
+                'id': book.id,
+                'title': book.title,
+                'games': {
+                    'scheduled': [GAME_TYPE_LABELS.get(g, g) for g in SUPPORTED_GAME_TYPES if g in scheduled],
+                    'missing': [GAME_TYPE_LABELS.get(g, g) for g in missing],
+                    'all_scheduled': all_scheduled
+                },
+                'sessions': {
+                    'count': session_count,
+                    'has_sessions': has_sessions
+                },
+                'ready': ready
+            })
+
+        return jsonify({
+            'pack': {'id': pack.id, 'title': pack.title, 'public': pack.public},
+            'summary': {'books_total': len(books), 'books_ready': books_ready},
+            'books': books_payload
+        }), 200
+    except Exception as error:
+        logging.error('Unable to compute pack publish readiness: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/packs/<int:pack_id>/publish', methods=['POST'])
+def publish_pack(pack_id):
+    try:
+        pack = get_school_pack(pack_id)
+        if not pack:
+            return jsonify({'message': 'Pack not found'}), 404
+        pack.public = True
+        db.session.add(pack)
+        db.session.commit()
+        return jsonify({
+            'message': 'Pack published successfully',
+            'pack': {'id': pack.id, 'public': pack.public}
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to publish pack: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/packs/<int:pack_id>/unpublish', methods=['POST'])
+def unpublish_pack(pack_id):
+    try:
+        pack = get_school_pack(pack_id)
+        if not pack:
+            return jsonify({'message': 'Pack not found'}), 404
+        pack.public = False
+        db.session.add(pack)
+        db.session.commit()
+        return jsonify({
+            'message': 'Pack unpublished successfully',
+            'pack': {'id': pack.id, 'public': pack.public}
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to unpublish pack: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
 @admin.route('/delete_session', methods=['POST'])
 def delete_session():
     try:
@@ -4453,6 +4746,58 @@ def delete_book():
 
             return jsonify({'message': 'Book has been removed from this school'}), 200
     except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/books/<int:book_id>/delete-impact', methods=['GET'])
+def get_book_delete_impact_preview(book_id):
+    try:
+        book, error_message, error_status = require_school_owned_editable_book(book_id)
+        if not book:
+            return jsonify({'message': error_message}), error_status
+        return jsonify({
+            'book': {
+                'id': book.id,
+                'title': book.title,
+                'author': book.author
+            },
+            'impact': get_book_delete_impact(book)
+        }), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/books/<int:book_id>/archive', methods=['POST'])
+def archive_book(book_id):
+    try:
+        book, error_message, error_status = require_school_owned_editable_book(book_id)
+        if not book:
+            return jsonify({'message': error_message}), error_status
+        book.archived = True
+        db.session.commit()
+        return jsonify({
+            'message': 'Book archived successfully',
+            'book': serialize_admin_book(book)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/books/<int:book_id>/unarchive', methods=['POST'])
+def unarchive_book(book_id):
+    try:
+        book, error_message, error_status = require_school_owned_editable_book(book_id)
+        if not book:
+            return jsonify({'message': error_message}), error_status
+        book.archived = False
+        db.session.commit()
+        return jsonify({
+            'message': 'Book unarchived successfully',
+            'book': serialize_admin_book(book)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 
@@ -5218,12 +5563,22 @@ def get_school_packs():
             return jsonify({'message': 'Current admin has no school assigned'}), 403
 
         search = request.args.get('search') or request.args.get('title')
+        level = str(request.args.get('level') or '').strip()
+        age = parse_pack_age(request.args.get('age'))
+        sort_order = str(request.args.get('sort_order') or 'desc').strip().lower()
         packs_query = school_accessible_pack_query()
 
         if search:
             packs_query = packs_query.filter(Pack.title.ilike(f'%{search}%'))
+        if level:
+            packs_query = packs_query.filter(func.lower(Pack.level) == level.lower())
+        if age:
+            packs_query = packs_query.filter(Pack.age == age)
 
-        packs_query = packs_query.order_by(Pack.id.desc())
+        if sort_order not in ['asc', 'desc']:
+            raise ValueError('sort_order must be asc or desc')
+
+        packs_query = packs_query.order_by(Pack.id.asc() if sort_order == 'asc' else Pack.id.desc())
         response = paginate_super_admin_query(
             packs_query,
             lambda pack: serialize_super_pack(pack, school_id),
@@ -5250,6 +5605,25 @@ def get_admin_pack_details():
         return jsonify({'pack': pack_details, **pack_details}), 200
     except ValueError as error:
         return jsonify({'message': str(error)}), 400
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/packs/<int:pack_id>/delete-impact', methods=['GET'])
+def get_pack_delete_impact_preview(pack_id):
+    try:
+        pack = get_school_pack(pack_id)
+        if not pack:
+            return jsonify({'message': 'Pack not found'}), 404
+
+        return jsonify({
+            'pack': {
+                'id': pack.id,
+                'title': pack.title,
+                'level': pack.level,
+                'age': pack.age.value if pack.age else None
+            },
+            'impact': get_pack_delete_impact(pack)
+        }), 200
     except Exception as error:
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
@@ -5431,29 +5805,49 @@ def delete_book_from_pack():
 # @admin_required
 def delete_pack():
     try:
-        token=request.json['id']
-        pack=get_school_pack(token)
-        if pack:
-            book_packs=Book_pack.query.filter_by(pack_id=pack.id).all()
-            code_packs=Code.query.filter_by(pack_id=pack.id).all()
-            follow_packs=Follow_pack.query.filter_by(pack_id=pack.id).all()
-            sessions=Session.query.filter_by(pack_id=pack.id).all()
+        token = (request.get_json(silent=True) or {}).get('id')
+        pack = get_school_pack(token)
+        if not pack:
+            return jsonify({'message': 'Pack not found'}), 404
 
+        impact = get_pack_delete_impact(pack)
+        session_ids = [
+            session_id for (session_id,) in (
+                db.session.query(Session.id)
+                .filter(Session.pack_id == pack.id)
+                .all()
+            )
+        ]
 
-            [db.session.delete(book_pack) for book_pack in book_packs if book_pack]
-            [db.session.delete(code_pack) for code_pack in code_packs if code_pack]
-            [db.session.delete(follow_pack) for follow_pack in follow_packs if follow_pack]
-            [db.session.delete(session) for session in sessions if session]
-            db.session.commit()
+        notification_filter = ReaderNotification.pack_id == pack.id
+        if session_ids:
+            notification_filter = or_(
+                ReaderNotification.pack_id == pack.id,
+                ReaderNotification.session_id.in_(session_ids)
+            )
+            Chat.query.filter(Chat.session_id.in_(session_ids)).delete(synchronize_session=False)
+            Session_quiz.query.filter(Session_quiz.session_id.in_(session_ids)).delete(synchronize_session=False)
+            Follow_session.query.filter(Follow_session.session_id.in_(session_ids)).delete(synchronize_session=False)
 
-            db.session.delete(pack)
-            db.session.commit()
-            return jsonify({'message':'Pack is succesfully deleled'}), 200
-        else:
-            return jsonify({'message':'Pack not found'}), 404
+        ReaderNotification.query.filter(notification_filter).delete(synchronize_session=False)
+        Follow_book.query.filter_by(pack_id=pack.id).delete(synchronize_session=False)
+        Follow_pack.query.filter_by(pack_id=pack.id).delete(synchronize_session=False)
+        Book_pack.query.filter_by(pack_id=pack.id).delete(synchronize_session=False)
+        Code.query.filter_by(pack_id=pack.id).delete(synchronize_session=False)
+        SchoolPackInstance.query.filter_by(pack_id=pack.id).delete(synchronize_session=False)
+        Session.query.filter_by(pack_id=pack.id).delete(synchronize_session=False)
+        Unit.query.filter_by(pack_id=pack.id).delete(synchronize_session=False)
+        db.session.delete(pack)
+        db.session.commit()
+
+        return jsonify({
+            'message': 'Pack is successfully deleted',
+            'impact': impact
+        }), 200
     except Exception as error:
-        print(error)
-        return jsonify({'message':'Internal server error'}), 500
+        db.session.rollback()
+        logging.error('Unable to delete pack: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
         
 
 
@@ -6562,7 +6956,587 @@ def get_dashboard_admin():
         return jsonify(result)
 
     except Exception as error:
-        return jsonify({'message': 'Error retrieving logs', 'error': str(error)}), 500  
+        return jsonify({'message': 'Error retrieving logs', 'error': str(error)}), 500
+
+
+## @brief Reading-domain dashboard helpers (school-admin Overview/Analytics pages).
+#
+# Resolves a `range` query param into a (period_start, period_end, bucket_granularity, range_key) tuple.
+def resolve_dashboard_range(range_param):
+    now = datetime.now()
+    range_key = (range_param or '30d').strip().lower()
+    if range_key == '3m':
+        start = now - timedelta(days=90)
+        granularity = 'week'
+    elif range_key == '12m':
+        start = now - timedelta(days=365)
+        granularity = 'month'
+    else:
+        range_key = '30d'
+        start = now - timedelta(days=30)
+        granularity = 'day'
+    return start, now, granularity, range_key
+
+
+## @brief Builds an ordered list of (bucket_start, bucket_end, label) tuples covering [start, end].
+def bucket_dates(start, end, granularity):
+    buckets = []
+    if granularity == 'day':
+        cursor = datetime(start.year, start.month, start.day)
+        end_day = datetime(end.year, end.month, end.day)
+        while cursor <= end_day:
+            bucket_end = cursor + timedelta(days=1)
+            buckets.append((cursor, bucket_end, cursor.strftime('%b %d')))
+            cursor = bucket_end
+    elif granularity == 'week':
+        cursor = datetime(start.year, start.month, start.day)
+        end_boundary = datetime(end.year, end.month, end.day) + timedelta(days=1)
+        while cursor < end_boundary:
+            bucket_end = cursor + timedelta(days=7)
+            buckets.append((cursor, bucket_end, cursor.strftime('%b %d')))
+            cursor = bucket_end
+    else:
+        cursor_year, cursor_month = start.year, start.month
+        end_year, end_month = end.year, end.month
+        while (cursor_year, cursor_month) <= (end_year, end_month):
+            bucket_start = datetime(cursor_year, cursor_month, 1)
+            if cursor_month == 12:
+                next_year, next_month = cursor_year + 1, 1
+            else:
+                next_year, next_month = cursor_year, cursor_month + 1
+            bucket_end = datetime(next_year, next_month, 1)
+            buckets.append((bucket_start, bucket_end, bucket_start.strftime('%b %Y')))
+            cursor_year, cursor_month = next_year, next_month
+    return buckets
+
+
+## @brief Counts rows into buckets produced by bucket_dates(), using date_getter(row) to locate each row.
+def count_in_buckets(rows, date_getter, buckets):
+    counts = [0] * len(buckets)
+    for row in rows:
+        value = date_getter(row)
+        if value is None:
+            continue
+        if isinstance(value, date) and not isinstance(value, datetime):
+            value = datetime(value.year, value.month, value.day)
+        for index, (bucket_start, bucket_end, _label) in enumerate(buckets):
+            if bucket_start <= value < bucket_end:
+                counts[index] += 1
+                break
+    return counts
+
+
+GAME_DISPLAY_LABELS = {
+    'BEE': 'Bee Genius',
+    'WORDEXPLORER': 'Word Explorer',
+    'THINKWORD': 'Think Word',
+    'INTELLECTLNK': 'Intellect Link'
+}
+GAME_DISPLAY_ORDER = ['BEE', 'WORDEXPLORER', 'THINKWORD', 'INTELLECTLNK']
+
+
+## @brief School-admin Overview page: KPI snapshot, 6-month trend, top packs, recent activity feed.
+@admin.route('/dashboard/overview-summary', methods=['GET'])
+def get_dashboard_overview_summary():
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+
+        school_user_ids = get_current_school_user_ids()
+        now = datetime.now()
+
+        readers_query = User.query.filter(User.id.in_(school_user_ids), User.type == 'reader')
+        readers_total = readers_query.count()
+        readers_approved = readers_query.filter(User.approved.is_(True)).count()
+        readers_pending = readers_total - readers_approved
+
+        teachers_query = Teacher.query.filter(Teacher.id.in_(school_user_ids))
+        teachers_total = teachers_query.count()
+        teachers_approved = teachers_query.filter(Teacher.approved.is_(True)).count()
+        teachers_available = teachers_query.filter(Teacher.available.is_(True)).count()
+
+        pending_packs = Follow_pack.query.filter(
+            Follow_pack.user_id.in_(school_user_ids),
+            Follow_pack.approved.is_(False)
+        ).count()
+        pending_teachers = User.query.filter(
+            User.id.in_(school_user_ids), User.type == 'teacher', User.approved.is_(False)
+        ).count()
+
+        books_own = Book.query.filter_by(shcool_id=school_id, active=True).count()
+        books_adopted = SchoolBookInstance.query.filter_by(shcool_id=school_id, active=True).count()
+        packs_own = Pack.query.filter_by(shcool_id=school_id, active=True).count()
+        packs_adopted = SchoolPackInstance.query.filter_by(shcool_id=school_id, active=True).count()
+
+        # Trailing 6 calendar months, independent of any period selector.
+        trend_year, trend_month = now.year, now.month
+        for _ in range(5):
+            if trend_month == 1:
+                trend_year -= 1
+                trend_month = 12
+            else:
+                trend_month -= 1
+        trend_start = datetime(trend_year, trend_month, 1)
+        month_buckets = bucket_dates(trend_start, now, 'month')
+
+        new_reader_rows = User.query.filter(
+            User.id.in_(school_user_ids), User.type == 'reader', User.created_at >= trend_start.date()
+        ).with_entities(User.created_at).all()
+        new_readers_trend = count_in_buckets(new_reader_rows, lambda r: r.created_at, month_buckets)
+
+        session_rows = school_accessible_session_query().filter(
+            Session.start_date >= trend_start, Session.start_date <= now
+        ).with_entities(Session.start_date).all()
+        sessions_held_trend = count_in_buckets(session_rows, lambda r: r.start_date, month_buckets)
+
+        completed_story_rows = ReaderStoryProgress.query.filter(
+            ReaderStoryProgress.user_id.in_(school_user_ids),
+            ReaderStoryProgress.completed.is_(True),
+            ReaderStoryProgress.completed_at >= trend_start
+        ).with_entities(ReaderStoryProgress.completed_at).all()
+        stories_completed_trend = count_in_buckets(completed_story_rows, lambda r: r.completed_at, month_buckets)
+
+        accessible_pack_ids_subquery = school_accessible_pack_query().with_entities(Pack.id).subquery()
+        top_pack_rows = (
+            db.session.query(
+                Pack.id,
+                Pack.title,
+                Pack.is_global_pack,
+                func.count(Follow_pack.user_id).label('followers'),
+                func.sum(case((Follow_pack.approved.is_(True), 1), else_=0)).label('approved_count')
+            )
+            .select_from(Pack)
+            .outerjoin(Follow_pack, and_(
+                Follow_pack.pack_id == Pack.id,
+                Follow_pack.user_id.in_(school_user_ids)
+            ))
+            .filter(Pack.id.in_(accessible_pack_ids_subquery))
+            .group_by(Pack.id)
+            .order_by(func.count(Follow_pack.user_id).desc())
+            .limit(5)
+            .all()
+        )
+        top_packs = []
+        for row in top_pack_rows:
+            followers = row.followers or 0
+            approved_count = int(row.approved_count or 0)
+            top_packs.append({
+                'id': row.id,
+                'title': row.title,
+                'source': 'global' if row.is_global_pack else 'school',
+                'followers': followers,
+                'approved': approved_count,
+                'pending': followers - approved_count
+            })
+
+        recent_readers = User.query.filter(
+            User.id.in_(school_user_ids), User.type == 'reader'
+        ).order_by(User.created_at.desc()).limit(8).all()
+        recent_reader_events = [{
+            'type': 'new_reader',
+            'label': f'{user.username} joined as a reader',
+            'timestamp': user.created_at.isoformat(),
+            'ref_id': user.id
+        } for user in recent_readers if user.created_at]
+
+        recent_completion_rows = (
+            db.session.query(ReaderStoryProgress, User, BookStory)
+            .join(User, User.id == ReaderStoryProgress.user_id)
+            .join(BookStory, BookStory.id == ReaderStoryProgress.story_id)
+            .filter(
+                ReaderStoryProgress.user_id.in_(school_user_ids),
+                ReaderStoryProgress.completed.is_(True),
+                ReaderStoryProgress.completed_at.isnot(None)
+            )
+            .order_by(ReaderStoryProgress.completed_at.desc())
+            .limit(8)
+            .all()
+        )
+        recent_completion_events = [{
+            'type': 'story_completed',
+            'label': f'{user.username} finished "{story.title}"',
+            'timestamp': progress.completed_at.isoformat(),
+            'ref_id': story.id
+        } for progress, user, story in recent_completion_rows]
+
+        recent_session_rows = (
+            school_accessible_session_query()
+            .filter(Session.start_date <= now)
+            .order_by(Session.start_date.desc())
+            .limit(8)
+            .all()
+        )
+        recent_session_events = [{
+            'type': 'session_held',
+            'label': f'Session "{session.name}" took place',
+            'timestamp': session.start_date.isoformat(),
+            'ref_id': session.id
+        } for session in recent_session_rows]
+
+        recent_activity = sorted(
+            recent_reader_events + recent_completion_events + recent_session_events,
+            key=lambda event: event['timestamp'],
+            reverse=True
+        )[:8]
+
+        result = {
+            'readers': {'total': readers_total, 'approved': readers_approved, 'pending': readers_pending},
+            'teachers': {'total': teachers_total, 'approved': teachers_approved, 'available': teachers_available},
+            'pending_approvals': {
+                'packs': pending_packs,
+                'teachers': pending_teachers,
+                'total': pending_packs + pending_teachers
+            },
+            'catalog': {
+                'books_total': books_own + books_adopted,
+                'books_own': books_own,
+                'books_adopted': books_adopted,
+                'packs_total': packs_own + packs_adopted,
+                'packs_own': packs_own,
+                'packs_adopted': packs_adopted
+            },
+            'trend': {
+                'months': [label for (_s, _e, label) in month_buckets],
+                'new_readers': new_readers_trend,
+                'sessions_held': sessions_held_trend,
+                'stories_completed': stories_completed_trend
+            },
+            'top_packs': top_packs,
+            'recent_activity': recent_activity
+        }
+        return jsonify(result), 200
+    except Exception as error:
+        return jsonify({'message': 'Error retrieving dashboard overview', 'error': str(error)}), 500
+
+
+## @brief School-admin Analytics page: reader growth, reading activity, sessions, packs, games — time-bound by `range`.
+@admin.route('/dashboard/reading-analytics', methods=['GET'])
+def get_dashboard_reading_analytics():
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+
+        school_user_ids = get_current_school_user_ids()
+        period_start, period_end, granularity, range_key = resolve_dashboard_range(request.args.get('range'))
+        buckets = bucket_dates(period_start, period_end, granularity)
+        bucket_labels = [label for (_s, _e, label) in buckets]
+
+        accessible_session_ids_subquery = school_accessible_session_query().with_entities(Session.id).subquery()
+        reader_ids = [r.id for r in User.query.filter(
+            User.id.in_(school_user_ids), User.type == 'reader'
+        ).with_entities(User.id).all()]
+
+        # ---- Section A: reader growth & engagement ----
+        new_readers = User.query.filter(
+            User.id.in_(school_user_ids), User.type == 'reader',
+            User.created_at >= period_start.date(), User.created_at <= period_end.date()
+        ).count()
+
+        active_via_sessions = set(r[0] for r in db.session.query(Follow_session.user_id)
+            .join(Session, Session.id == Follow_session.session_id)
+            .filter(
+                Follow_session.user_id.in_(reader_ids),
+                Follow_session.presence.is_(True),
+                Session.start_date >= period_start, Session.start_date <= period_end
+            ).distinct().all()) if reader_ids else set()
+
+        active_via_stories = set(r[0] for r in db.session.query(ReaderStoryProgress.user_id)
+            .filter(
+                ReaderStoryProgress.user_id.in_(reader_ids),
+                ReaderStoryProgress.last_read_at >= period_start,
+                ReaderStoryProgress.last_read_at <= period_end
+            ).distinct().all()) if reader_ids else set()
+
+        active_via_games = set(r[0] for r in db.session.query(Game_result.user_id)
+            .filter(
+                Game_result.user_id.in_(reader_ids),
+                Game_result.day >= period_start.date(), Game_result.day <= period_end.date()
+            ).distinct().all()) if reader_ids else set()
+
+        active_reader_ids = active_via_sessions | active_via_stories | active_via_games
+        active_readers_rate = (len(active_reader_ids) / len(reader_ids) * 100) if reader_ids else 0.0
+
+        total_follow_session_rows = (
+            Follow_session.query
+            .join(Session, Session.id == Follow_session.session_id)
+            .filter(
+                Follow_session.user_id.in_(reader_ids),
+                Session.start_date >= period_start, Session.start_date <= period_end
+            ).count()
+        ) if reader_ids else 0
+        avg_sessions_per_reader = (total_follow_session_rows / len(reader_ids)) if reader_ids else 0.0
+
+        signup_rows = User.query.filter(
+            User.id.in_(school_user_ids), User.type == 'reader',
+            User.created_at >= period_start.date(), User.created_at <= period_end.date()
+        ).with_entities(User.created_at).all()
+        signups_over_time = count_in_buckets(signup_rows, lambda r: r.created_at, buckets)
+
+        # ---- Section B: reading activity ----
+        stories_completed = ReaderStoryProgress.query.filter(
+            ReaderStoryProgress.user_id.in_(school_user_ids),
+            ReaderStoryProgress.completed.is_(True),
+            ReaderStoryProgress.completed_at >= period_start, ReaderStoryProgress.completed_at <= period_end
+        ).count()
+
+        stories_started = ReaderStoryProgress.query.filter(
+            ReaderStoryProgress.user_id.in_(school_user_ids),
+            ReaderStoryProgress.last_read_at >= period_start, ReaderStoryProgress.last_read_at <= period_end
+        ).count()
+        completion_rate = (stories_completed / stories_started * 100) if stories_started else 0.0
+
+        books_actively_read = db.session.query(func.count(func.distinct(BookStory.book_id))).select_from(BookStory).join(
+            ReaderStoryProgress, ReaderStoryProgress.story_id == BookStory.id
+        ).filter(
+            ReaderStoryProgress.user_id.in_(school_user_ids),
+            ReaderStoryProgress.last_read_at >= period_start, ReaderStoryProgress.last_read_at <= period_end
+        ).scalar() or 0
+
+        stories_month_buckets = bucket_dates(period_start, period_end, 'month')
+        started_rows = ReaderStoryProgress.query.filter(
+            ReaderStoryProgress.user_id.in_(school_user_ids),
+            ReaderStoryProgress.last_read_at >= period_start, ReaderStoryProgress.last_read_at <= period_end
+        ).with_entities(ReaderStoryProgress.last_read_at).all()
+        completed_rows = ReaderStoryProgress.query.filter(
+            ReaderStoryProgress.user_id.in_(school_user_ids),
+            ReaderStoryProgress.completed.is_(True),
+            ReaderStoryProgress.completed_at >= period_start, ReaderStoryProgress.completed_at <= period_end
+        ).with_entities(ReaderStoryProgress.completed_at).all()
+        stories_started_series = count_in_buckets(started_rows, lambda r: r.last_read_at, stories_month_buckets)
+        stories_completed_series = count_in_buckets(completed_rows, lambda r: r.completed_at, stories_month_buckets)
+
+        top_book_rows = (
+            db.session.query(
+                Book.id,
+                Book.title,
+                func.count(func.distinct(ReaderStoryProgress.user_id)).label('readers'),
+                func.sum(case((ReaderStoryProgress.completed.is_(True), 1), else_=0)).label('completed_count'),
+                func.count(ReaderStoryProgress.story_id).label('progress_rows')
+            )
+            .join(BookStory, BookStory.book_id == Book.id)
+            .join(ReaderStoryProgress, ReaderStoryProgress.story_id == BookStory.id)
+            .filter(ReaderStoryProgress.user_id.in_(school_user_ids))
+            .group_by(Book.id)
+            .order_by(func.count(func.distinct(ReaderStoryProgress.user_id)).desc())
+            .limit(10)
+            .all()
+        )
+        top_books = []
+        for row in top_book_rows:
+            progress_rows = row.progress_rows or 0
+            completed_count = int(row.completed_count or 0)
+            top_books.append({
+                'id': row.id,
+                'title': row.title,
+                'readers': row.readers or 0,
+                'completion_rate': round(completed_count / progress_rows * 100, 1) if progress_rows else 0.0
+            })
+
+        quizzes_scheduled = Session_quiz.query.filter(
+            Session_quiz.session_id.in_(accessible_session_ids_subquery),
+            Session_quiz.release_date >= period_start.date(), Session_quiz.release_date <= period_end.date()
+        ).count()
+
+        # ---- Section C: sessions & attendance ----
+        sessions_held = school_accessible_session_query().filter(
+            Session.start_date >= period_start, Session.start_date <= period_end
+        ).count()
+
+        def attendance_ratios(extra_filter=None):
+            query = (
+                db.session.query(
+                    Session.id,
+                    func.sum(case((Follow_session.approved.is_(True), 1), else_=0)).label('approved_count'),
+                    func.sum(case((and_(
+                        Follow_session.approved.is_(True), Follow_session.presence.is_(True)
+                    ), 1), else_=0)).label('present_count')
+                )
+                .select_from(Session)
+                .outerjoin(Follow_session, Follow_session.session_id == Session.id)
+                .filter(
+                    Session.id.in_(accessible_session_ids_subquery),
+                    Session.start_date >= period_start, Session.start_date <= period_end
+                )
+            )
+            if extra_filter is not None:
+                query = query.filter(extra_filter)
+            rows = query.group_by(Session.id).all()
+            return [row.present_count / row.approved_count for row in rows if row.approved_count]
+
+        session_ratios = attendance_ratios()
+        avg_attendance_rate = (sum(session_ratios) / len(session_ratios) * 100) if session_ratios else 0.0
+
+        upcoming_sessions = school_accessible_session_query().filter(Session.start_date > period_end).count()
+
+        sessions_per_month_buckets = bucket_dates(period_start, period_end, 'month')
+        online_rows = school_accessible_session_query().filter(
+            Session.location == Location.ONLINE,
+            Session.start_date >= period_start, Session.start_date <= period_end
+        ).with_entities(Session.start_date).all()
+        classroom_rows = school_accessible_session_query().filter(
+            Session.location == Location.CLASSROOM,
+            Session.start_date >= period_start, Session.start_date <= period_end
+        ).with_entities(Session.start_date).all()
+        sessions_online_series = count_in_buckets(online_rows, lambda r: r.start_date, sessions_per_month_buckets)
+        sessions_classroom_series = count_in_buckets(classroom_rows, lambda r: r.start_date, sessions_per_month_buckets)
+
+        teacher_rows = (
+            db.session.query(
+                Teacher.id,
+                Teacher.username.label('teacher_name'),
+                func.count(func.distinct(Session.id)).label('sessions_count')
+            )
+            .select_from(Teacher)
+            .join(Session, Session.teacher_id == Teacher.id)
+            .filter(
+                Session.id.in_(accessible_session_ids_subquery),
+                Session.start_date >= period_start, Session.start_date <= period_end
+            )
+            .group_by(Teacher.id, Teacher.username)
+            .order_by(func.count(func.distinct(Session.id)).desc())
+            .all()
+        )
+        teacher_activity = []
+        for row in teacher_rows:
+            ratios = attendance_ratios(Session.teacher_id == row.id)
+            avg_rate = (sum(ratios) / len(ratios) * 100) if ratios else 0.0
+            teacher_activity.append({
+                'id': row.id,
+                'name': row.teacher_name,
+                'sessions': row.sessions_count,
+                'avg_attendance_rate': round(avg_rate, 1)
+            })
+
+        # ---- Section D: pack adoption & approvals ----
+        accessible_pack_ids_subquery = school_accessible_pack_query().with_entities(Pack.id).subquery()
+        pack_rows = (
+            db.session.query(
+                Pack.id,
+                Pack.title,
+                func.count(Follow_pack.user_id).label('followers'),
+                func.sum(case((Follow_pack.approved.is_(True), 1), else_=0)).label('approved_count')
+            )
+            .select_from(Pack)
+            .outerjoin(Follow_pack, and_(
+                Follow_pack.pack_id == Pack.id,
+                Follow_pack.user_id.in_(school_user_ids)
+            ))
+            .filter(Pack.id.in_(accessible_pack_ids_subquery))
+            .group_by(Pack.id)
+            .order_by(func.count(Follow_pack.user_id).desc())
+            .limit(10)
+            .all()
+        )
+        section_d_top_packs = []
+        for row in pack_rows:
+            followers = row.followers or 0
+            approved_count = int(row.approved_count or 0)
+            section_d_top_packs.append({
+                'id': row.id,
+                'title': row.title,
+                'followers': followers,
+                'approved': approved_count,
+                'pending': followers - approved_count,
+                'approval_rate': round(approved_count / followers * 100, 1) if followers else 0.0
+            })
+
+        invitation_codes = SchoolInvitationCode.query.filter_by(shcool_id=school_id).order_by(
+            SchoolInvitationCode.id.desc()
+        ).all()
+        invitation_codes_payload = [serialize_school_invitation_code(code) for code in invitation_codes]
+
+        # ---- Section E: games engagement ----
+        total_plays = Game_result.query.filter(
+            Game_result.user_id.in_(school_user_ids),
+            Game_result.day >= period_start.date(), Game_result.day <= period_end.date()
+        ).count()
+
+        try:
+            total_words_learned = db.session.query(
+                func.coalesce(func.sum(func.json_length(Game_result.words_learned)), 0)
+            ).filter(
+                Game_result.user_id.in_(school_user_ids),
+                Game_result.day >= period_start.date(), Game_result.day <= period_end.date()
+            ).scalar()
+        except Exception:
+            db.session.rollback()
+            word_rows = Game_result.query.filter(
+                Game_result.user_id.in_(school_user_ids),
+                Game_result.day >= period_start.date(), Game_result.day <= period_end.date()
+            ).with_entities(Game_result.words_learned).all()
+            total_words_learned = sum(len(row.words_learned or []) for row in word_rows)
+
+        avg_time_spent_seconds = db.session.query(func.avg(Game_result.time_spent_seconds)).filter(
+            Game_result.user_id.in_(school_user_ids),
+            Game_result.day >= period_start.date(), Game_result.day <= period_end.date()
+        ).scalar() or 0.0
+
+        plays_by_type_rows = db.session.query(Game_result.game, func.count(Game_result.id)).filter(
+            Game_result.user_id.in_(school_user_ids),
+            Game_result.day >= period_start.date(), Game_result.day <= period_end.date()
+        ).group_by(Game_result.game).all()
+        plays_by_type_counts = {game_enum.name: count for game_enum, count in plays_by_type_rows}
+        plays_by_type = {
+            'labels': [GAME_DISPLAY_LABELS[name] for name in GAME_DISPLAY_ORDER],
+            'data': [plays_by_type_counts.get(name, 0) for name in GAME_DISPLAY_ORDER]
+        }
+
+        game_day_rows = Game_result.query.filter(
+            Game_result.user_id.in_(school_user_ids),
+            Game_result.day >= period_start.date(), Game_result.day <= period_end.date()
+        ).with_entities(Game_result.day).all()
+        plays_over_time_series = count_in_buckets(game_day_rows, lambda r: r.day, buckets)
+
+        result = {
+            'range': range_key,
+            'period_start': period_start.isoformat(),
+            'period_end': period_end.isoformat(),
+            'section_a_growth': {
+                'new_readers': new_readers,
+                'active_readers_rate': round(active_readers_rate, 1),
+                'avg_sessions_per_reader': round(avg_sessions_per_reader, 2),
+                'signups_over_time': {'labels': bucket_labels, 'data': signups_over_time}
+            },
+            'section_b_reading': {
+                'stories_completed': stories_completed,
+                'completion_rate': round(completion_rate, 1),
+                'books_actively_read': books_actively_read,
+                'stories_started_vs_completed': {
+                    'labels': [label for (_s, _e, label) in stories_month_buckets],
+                    'started': stories_started_series,
+                    'completed': stories_completed_series
+                },
+                'top_books': top_books,
+                'quizzes_scheduled': quizzes_scheduled
+            },
+            'section_c_sessions': {
+                'sessions_held': sessions_held,
+                'avg_attendance_rate': round(avg_attendance_rate, 1),
+                'upcoming_sessions': upcoming_sessions,
+                'sessions_per_month': {
+                    'labels': [label for (_s, _e, label) in sessions_per_month_buckets],
+                    'online': sessions_online_series,
+                    'classroom': sessions_classroom_series
+                },
+                'teacher_activity': teacher_activity
+            },
+            'section_d_packs': {
+                'top_packs': section_d_top_packs,
+                'invitation_codes': invitation_codes_payload
+            },
+            'section_e_games': {
+                'total_plays': total_plays,
+                'total_words_learned': int(total_words_learned or 0),
+                'avg_time_spent_seconds': round(float(avg_time_spent_seconds or 0), 1),
+                'plays_by_type': plays_by_type,
+                'plays_over_time': {'labels': bucket_labels, 'data': plays_over_time_series}
+            }
+        }
+        return jsonify(result), 200
+    except Exception as error:
+        return jsonify({'message': 'Error retrieving reading analytics', 'error': str(error)}), 500
 
 
 @admin.route('/create_about_book/<int:book_id>', methods=['POST'])
@@ -6894,10 +7868,15 @@ def update_current_school_public_page():
 
         data = request.get_json(silent=True) or {}
         page = get_or_create_school_public_page(school)
-        apply_school_public_page_payload(page, data, allow_slug=False)
+
+        if 'active' in data:
+            page.active = parse_bool_value(data.get('active'), 'active')
+            db.session.add(page)
+
+        apply_content_to_draft(page, normalize_public_page_content_fields(data))
         db.session.commit()
         return jsonify({
-            'message': 'School public page updated successfully',
+            'message': 'Draft saved successfully',
             'public_page': serialize_school_public_page(page)
         }), 200
     except ValueError as error:
@@ -6906,6 +7885,68 @@ def update_current_school_public_page():
     except Exception as error:
         db.session.rollback()
         logging.error('Unable to update school public page: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/school_public_page/publish', methods=['POST'])
+@login_required
+def publish_current_school_public_page():
+    try:
+        if not is_admin_role():
+            return jsonify({'message': 'Admin access is required'}), 401
+
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        page = get_or_create_school_public_page(school)
+        if page.draft_data is None:
+            return jsonify({'message': 'There are no unpublished changes to publish'}), 400
+
+        apply_content_to_live(page, page.draft_data)
+        page.draft_data = None
+        page.published_at = datetime.now()
+        db.session.commit()
+        return jsonify({
+            'message': 'School public page published successfully',
+            'public_page': serialize_school_public_page(page)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to publish school public page: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/school_public_page/draft', methods=['DELETE'])
+@login_required
+def discard_current_school_public_page_draft():
+    try:
+        if not is_admin_role():
+            return jsonify({'message': 'Admin access is required'}), 401
+
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        page = get_or_create_school_public_page(school)
+        page.draft_data = None
+        db.session.add(page)
+        db.session.commit()
+        return jsonify({
+            'message': 'Draft discarded',
+            'public_page': serialize_school_public_page(page)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Unable to discard school public page draft: %s', error, exc_info=True)
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 

@@ -25,7 +25,8 @@ class Book(db.Model):
     is_platform_book = db.Column(db.Boolean, nullable=False, default=False, index=True)
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, index=True)
     active = db.Column(db.Boolean, nullable=False, default=True, index=True)
-    
+    archived = db.Column(db.Boolean, nullable=False, default=False, index=True)
+
 
 
     __table_args__ = (

@@ -32,6 +32,7 @@ from models.book_pack import Book_pack
 from models.session import Session
 from models.book_text import Book_text
 from models.follow_session import Follow_session
+from models.audio_book import AudioBook, AudioBookPage
 from apps.main.email import generate_confirmed_token,reader_confirm_token
 from apps.jitsi import is_online_session, serialize_jitsi_call
 from apps.notifications import serialize_reader_notification
@@ -370,6 +371,7 @@ def serialize_public_school_page(page):
         'headline': page.headline,
         'description': page.description,
         'sections': sections,
+        'hero_type': page.hero_type,
         'public_url': relative_url,
         'full_public_url': full_url
     }
@@ -389,8 +391,33 @@ def user_belongs_to_school(user_id, school_id):
 def set_selected_school_context(school_id):
     session['selected_school_id'] = school_id
 
-def serialize_book_for_pack(book):
+def get_published_audio_book_ids_by_book(book_ids, school_id):
+    if not book_ids:
+        return {}
+    query = (
+        db.session.query(AudioBook.book_id, AudioBook.id, AudioBook.updated_at)
+        .join(AudioBookPage, AudioBookPage.audio_book_id == AudioBook.id)
+        .filter(
+            AudioBook.book_id.in_(book_ids),
+            AudioBook.active.is_(True),
+            AudioBook.status == 'published',
+            AudioBookPage.active.is_(True),
+            AudioBookPage.alignment_status == 'approved'
+        )
+    )
+    if school_id:
+        query = query.filter(or_(AudioBook.shcool_id == school_id, AudioBook.shcool_id.is_(None)))
+    else:
+        query = query.filter(AudioBook.shcool_id.is_(None))
+
+    audio_map = {}
+    for book_id, audio_book_id, updated_at in query.distinct().order_by(AudioBook.updated_at.desc()).all():
+        audio_map.setdefault(book_id, audio_book_id)
+    return audio_map
+
+def serialize_book_for_pack(book, audio_map=None):
     platform_book = bool(getattr(book, 'is_platform_book', False))
+    audio_book_id = (audio_map or {}).get(book.id)
     return {
         'id': book.id,
         'title': book.title,
@@ -402,7 +429,9 @@ def serialize_book_for_pack(book):
         'img': book.img,
         'is_platform_book': platform_book,
         'source': 'platform' if platform_book else 'school',
-        'read_only': platform_book
+        'read_only': platform_book,
+        'has_audio_book': audio_book_id is not None,
+        'audio_book_id': audio_book_id
     }
 
 def reader_has_school_access(school_id):
@@ -3090,7 +3119,11 @@ def get_school_books_from_pack():
         if not user_can_view_pack_in_school(pack, school_id):
             return jsonify({'message': 'You do not have access to this pack'}), 403
 
-        books = [serialize_book_for_pack(book) for book in get_books_in_pack(pack.id)]
+        books_in_pack = get_books_in_pack(pack.id)
+        audio_map = get_published_audio_book_ids_by_book(
+            [book.id for book in books_in_pack], school_id
+        )
+        books = [serialize_book_for_pack(book, audio_map) for book in books_in_pack]
         return jsonify({'school_id': school_id, 'pack_id': pack.id, 'books_in_pack': books, 'books': books}), 200
     except Exception as e:
         return jsonify({'message': str(e)}), 500
