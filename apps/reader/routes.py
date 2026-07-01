@@ -1,7 +1,7 @@
 ## @file
 # Blueprint for user readers' authentication.
 # Contains routes and functions related to user authentication.
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from flask import Blueprint,request,jsonify,render_template, redirect,make_response,session,send_file
 from flask_bcrypt import Bcrypt
@@ -1310,8 +1310,8 @@ def get_cookies_fun():
 
 
 @reader.route('/login_client',methods=['POST'])
-def login_client():   
-    try:    
+def login_client():
+    try:
         email=request.json['email']
         password=request.json['password']
         user=User.query.filter_by(email=email).first()
@@ -1321,14 +1321,18 @@ def login_client():
             if user.confirmed:
                 if user.approved:
                     login_user(user)
+                    pin_required = len(accounts) > 1
                     accountsData=[]
                     for account in accounts:
                         accountsData.append({
-                            "username":account.username,  
+                            "username":account.username,
                             "email":account.email,
-                            "img":account.img
-                        })          
-                    return jsonify({'message':'Your are logged in succesfully','accounts':accountsData}),200
+                            "img":account.img,
+                            "is_primary":account.is_primary,
+                            "pin_required":pin_required,
+                            "has_pin":bool(account.pin_hash)
+                        })
+                    return jsonify({'message':'Your are logged in succesfully','accounts':accountsData,'pin_required':pin_required}),200
                 else:
                     return jsonify({'message':'Your are not been approved for the moment'}),403
             else:
@@ -1361,52 +1365,93 @@ def login():
     
     except Exception as error:
         return jsonify({'message':'Internal server error','error':str(error)}),500        
+PIN_MAX_ATTEMPTS = 5
+PIN_LOCKOUT_MINUTES = 15
+
 @reader.route('/select_account',methods=['POST'])
+@login_required
 def select_account():
-    
-    try:   
+
+    try:
         email=request.json['email']
         username=request.json['username']
+
+        if email != current_user.email:
+            return jsonify({'message':'Forbidden'}),403
+
         user=User.query.filter_by(email=email,username=username).first()
-        
+
         if user:
             if not user.confirmed:
                 return jsonify({'message':'You don\'t confirm your account'}),403
             if not user.approved:
                 return jsonify({'message':'Your are not been approved for the moment'}),403
-            login_user(user)       
-            return jsonify({'message':'Your are logged in succesfully','role':user.type}),200
-        else:  
+
+            siblings_count = User.query.filter_by(email=email).count()
+            # Profiles created before the PIN feature existed (or the split
+            # second between account creation and setting a PIN) have no
+            # pin_hash yet: let the switch through once instead of locking the
+            # profile out forever, but the frontend must prompt to set a PIN
+            # right after. Ownership was already verified above, so this only
+            # ever benefits someone who is already an authenticated sibling.
+            if siblings_count > 1 and user.pin_hash:
+                if user.pin_locked_until and user.pin_locked_until > datetime.now():
+                    return jsonify({'message':'Too many incorrect PIN attempts, please try again later'}),429
+
+                pin = request.json.get('pin')
+                if not pin or not bcrypt.check_password_hash(user.pin_hash,pin):
+                    user.pin_failed_attempts = (user.pin_failed_attempts or 0) + 1
+                    if user.pin_failed_attempts >= PIN_MAX_ATTEMPTS:
+                        user.pin_locked_until = datetime.now() + timedelta(minutes=PIN_LOCKOUT_MINUTES)
+                        user.pin_failed_attempts = 0
+                    db.session.commit()
+                    return jsonify({'message':'Invalid PIN'}),401
+
+                user.pin_failed_attempts = 0
+                user.pin_locked_until = None
+                db.session.commit()
+
+            login_user(user)
+            return jsonify({'message':'Your are logged in succesfully','role':user.type,'pin_setup_required':siblings_count > 1 and not bool(user.pin_hash)}),200
+        else:
             return jsonify({'message':'Invalid account'}),404
-    
+
     except Exception as error:
         return jsonify({'message':'Internal server error','error':str(error)}),500
 @reader.route('/create_account',methods=['POST'])
+@login_required
 def create_account():
-    
-    try:  
+
+    try:
         username=request.json['username']
         password = request.json['password']
+        pin = request.json.get('pin')
         accounts =User.query.filter_by(email=current_user.email).all()
-        
-        
+
+
         if len(accounts) >= 3 :
             return jsonify({'message':'You reached the maximum number of accounts (3)'}) ,400
+
+        if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
+            return jsonify({'message':'A 4-digit PIN is required for this profile'}),400
+
+        if not current_user.pin_hash:
+            return jsonify({'message':'Set a PIN for your account before adding another profile'}),400
 
         user=User.query.filter_by(email=current_user.email,username=username).first()
         if not bcrypt.check_password_hash(current_user.password_hashed,password):
             return jsonify({'message':'Invalid password'}) ,400
-        if user:       
+        if user:
             return jsonify({'message':'Username already  exists '}),400
         else:
             #Create a new user in quiz api
             quiz_user ={
                 'app':f'{ConfigClass.QUIZ_API_KEY}'
             }
-            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
+            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)
             if response.status_code == 201:
                 quiz_id = response.json()['_id']
-                new_account = Reader(username=username, email=current_user.email, password_hashed=current_user.password_hashed, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id)
+                new_account = Reader(username=username, email=current_user.email, password_hashed=current_user.password_hashed, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id,is_primary=False,pin_hash=bcrypt.generate_password_hash(str(pin)))
                 db.session.add(new_account)
                 db.session.commit()
                 userData ={
@@ -1431,19 +1476,24 @@ def create_account():
         return jsonify({'message':'Internal server error','error':str(error)}),500
 # get user account with email 
 @reader.route('/get_accounts')
+@login_required
 def get_accounts():
-    
-    try:  
+
+    try:
         accounts =User.query.filter_by(email=current_user.email).all()
+        pin_required = len(accounts) > 1
         accountsData=[]
         for account in accounts:
 
             accountsData.append({
-                "username":account.username,  
+                "username":account.username,
                 "email":account.email,
-                "img":account.img
-                        })          
-        return jsonify({'accounts':accountsData}),200
+                "img":account.img,
+                "is_primary":account.is_primary,
+                "pin_required":pin_required,
+                "has_pin":bool(account.pin_hash)
+                        })
+        return jsonify({'accounts':accountsData,'pin_required':pin_required}),200
        
 
     
@@ -1504,8 +1554,10 @@ def user_authenticated():
                     'quiz_id': quiz_id,
                     'id': current_user.id,
                     'client_id_invoicing_api': client_id_invoicing_api,
-                    'schools': get_user_schools(current_user.id)
-                })     
+                    'schools': get_user_schools(current_user.id),
+                    'is_primary': current_user.is_primary,
+                    'has_pin': bool(current_user.pin_hash)
+                })
     except Exception as e:     
         return jsonify({'error': str(e), 'message': 'Internal server error'})
 
@@ -2086,6 +2138,31 @@ def set_password():
     except Exception as error:
         print(error)
         return jsonify({'message':'something wrong please try  later'}), 500
+
+# Sets or changes the PIN used to unlock this specific profile when switching
+# between the linked accounts under the same email (Netflix-profile style gate).
+@reader.route('/set_pin',methods=['POST'])
+@login_required
+def set_pin():
+    try:
+        password=request.json['password']
+        pin=request.json['pin']
+
+        if not bcrypt.check_password_hash(current_user.password_hashed,password):
+            return jsonify({'message':'Invalid password'}),400
+
+        if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
+            return jsonify({'message':'PIN must be exactly 4 digits'}),400
+
+        user=User.query.filter_by(email=current_user.email,username=current_user.username).first()
+        user.pin_hash=bcrypt.generate_password_hash(str(pin))
+        user.pin_failed_attempts=0
+        user.pin_locked_until=None
+        db.session.commit()
+        return jsonify({'message':f'{user.username} you have set your PIN'}),200
+    except Exception as error:
+        print(error)
+        return jsonify({'message':'something wrong please try later'}),500
 
 @reader.route('/set_image',methods=['POST'])
 @login_required
@@ -2971,23 +3048,28 @@ def import_quiz_json():
         jsonFile = request.files['json_file']
 
         try:
-            url = f'{ConfigClass.QUIZ_API}quiz/import-quiz'
-            files = {'json_file': (jsonFile.filename, jsonFile.stream, 'application/json')}
-            
-            response = requests.post(url, files=files)
+            url = f'{ConfigClass.QUIZ_API}quiz/json/{ConfigClass.QUIZ_API_KEY}'
+            files = {'file': (jsonFile.filename, jsonFile.stream, 'application/json')}
+
+            response = requests.post(url, files=files, timeout=30)
 
             if response.status_code == 201:
-                response_data = response.json()
-                quiz = response_data
-                return jsonify(quiz)
+                try:
+                    quiz = response.json()
+                except ValueError:
+                    print(f"Quiz created but response body was not JSON: {response.text!r}")
+                    quiz = {}
+                return jsonify(quiz), 201
             else:
-                print(f"API Error: {response.status_code} - {response.reason}")
-                return jsonify({'error': 'An error occurred during the API request'})
-        except requests.exceptions.HTTPError as e:
-            response_data = e.response.json()
-            error_message = response_data.get('message', 'Bad Request')
-            print(error_message)
-            return jsonify({'message': error_message}), 400
+                print(f"API Error: {response.status_code} - {response.reason} - {response.text}")
+                try:
+                    error_body = response.json()
+                except ValueError:
+                    error_body = {'error': response.text or 'An error occurred during the API request'}
+                return jsonify(error_body), response.status_code
+        except requests.exceptions.RequestException as e:
+            print(f"Quiz API request failed: {str(e)}")
+            return jsonify({'error': f'Could not reach the quiz service: {str(e)}'}), 502
 
     except Exception as e:
         print(f"Error: {str(e)}")

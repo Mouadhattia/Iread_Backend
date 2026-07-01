@@ -17,7 +17,7 @@ class ConfigClass:
     MAIL_DEBUG = False   
     FRONT_URL = 'https://iread.education'
     API_URL = 'https://api.iread.education'
-    QUIZ_API = 'https://quiz.iread.education/user'
+    QUIZ_API = 'https://quiz.iread.education/'
     QUIZ_API_KEY = '65800f77a2ce2e2c88ebd8bd'
     INVOICING_API = 'https://invoicing.iread.education'
     INVOICING_API_KEY = '65ba69fb713e132120743444'   

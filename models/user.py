@@ -24,6 +24,10 @@ class User(db.Model, UserMixin):
     created_at=db.Column(db.Date,nullable=False,default=datetime.now())
     type = db.Column(db.String(20))
     quiz_id=db.Column(db.String(100))
+    is_primary = db.Column(db.Boolean, nullable=False, default=True)
+    pin_hash = db.Column(db.String(100), nullable=True)
+    pin_failed_attempts = db.Column(db.Integer, nullable=False, default=0)
+    pin_locked_until = db.Column(db.DateTime, nullable=True)
 
     __mapper_args__ = {
         'polymorphic_on': type,
