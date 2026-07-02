@@ -43,6 +43,45 @@ def reader_confirm_token(token):
     else:
         return False
 
+## @brief Function that generates a token for confirming a pending email change.
+#
+# The token embeds the user's id and the requested new email so that the change can only be
+# applied once the new address is verified, and only to the account that requested it.
+#
+# @param user_id: The id of the user requesting the email change.
+# @param new_email: The new email address to confirm.
+# @return: The generated token.
+def generate_email_change_token(user_id, new_email):
+    token=s.dumps({'change_email_user_id':user_id,'new_email':new_email})
+    return token
+
+
+## @brief Function that verifies an email-change token and, if valid, applies the new email.
+#
+# This function checks that the token is valid and not expired, then updates the user's email
+# to the new address embedded in the token.
+#
+# @param token: The token to be verified.
+# @param max_age: How long (in seconds) the token stays valid for.
+# @return: A dict with the user, old_email and new_email if the token was valid, otherwise False.
+def confirm_email_change_token(token,max_age=1200):
+    try:
+        data=s.loads(token.encode('utf-8'),max_age=max_age)
+    except Exception:
+        return False
+    user_id=data.get('change_email_user_id')
+    new_email=data.get('new_email')
+    if not user_id or not new_email:
+        return False
+    user=User.query.get(user_id)
+    if not user:
+        return False
+    old_email=user.email
+    user.email=new_email
+    db.session.commit()
+    return {'user':user,'old_email':old_email,'new_email':new_email}
+
+
 def admin_confirm_token(token):
     try:
         data=s.loads(token.encode('utf-8'),max_age=1200)

@@ -33,7 +33,7 @@ from models.session import Session
 from models.book_text import Book_text
 from models.follow_session import Follow_session
 from models.audio_book import AudioBook, AudioBookPage
-from apps.main.email import generate_confirmed_token,reader_confirm_token
+from apps.main.email import generate_confirmed_token,reader_confirm_token,generate_email_change_token,confirm_email_change_token
 from apps.jitsi import is_online_session, serialize_jitsi_call
 from apps.notifications import serialize_reader_notification
 from apps.game_calendar import (
@@ -2068,17 +2068,19 @@ def set_username():
         return jsonify({'message':'Internal serveur error'}),500
 
 
-## @brief Route for changing the email of readers.
+## @brief Route for requesting an email change for readers.
 #
-# This route is used for changing the email of readers. The function accepts a POST request with JSON data containing the user's old email, password, and the new email.
-# The function checks if the provided old email and password match a user in the database using the 'User.query.filter_by' function and the 'bcrypt.check_password_hash' function.
-# If the old email and password are valid, the function updates the email for the user in the database and sets the 'confirmed' attribute to False to indicate that the email needs to be confirmed again.
-# A new confirmation token is generated for the new email, and a confirmation email is sent to the new email address using the 'generate_confirmed_token' function and the 'mail.send' function.
-# A success message is returned to the user indicating that the email has been successfully changed, and a confirmation email has been sent to the new email address.
-# If the old email and password are invalid or do not match a user in the database, an error message is returned.
+# This route starts an email change instead of applying it immediately. The function accepts a POST
+# request with JSON data containing the user's current password and the requested new email.
+# The function checks if the provided password matches the current user using 'bcrypt.check_password_hash'.
+# If valid, a time-limited token embedding the user's id and the new email is generated, and a
+# confirmation link built from that token is emailed to the new address. A separate notice is sent
+# to the current email so the account owner is aware a change was requested even if they didn't
+# initiate it. The email in the database is only updated once the new address is verified via
+# the '/confirm_email_change/<token>' route.
 #
 # @param password: The password of the current user to confirm their identity.
-# @param new_email: The new email to be set for the current user.
+# @param new_email: The new email to be set for the current user, pending verification.
 #
 @reader.route('/set_email',methods=['POST'])
 @login_required
@@ -2086,24 +2088,79 @@ def set_email():
     try:
         old_email=current_user.email
         password=request.json['password']
-        new_email=request.json['new_email']
+        new_email=request.json.get('new_email','').strip().lower()
 
         user=User.query.filter_by(email=old_email,username=current_user.username).first()
 
-        if user and bcrypt.check_password_hash(user.password_hashed,password):
-            user.email=new_email
-            db.session.commit()
-            user_info ={
-                'username':user.username,
-                 'email' :user.email,
-                 'img' : user.img,
-                 'is_authenticated':user.is_authenticated
+        if not (user and bcrypt.check_password_hash(user.password_hashed,password)):
+            return jsonify({'message':'Invalid email or passsword'}),404
 
-            }
-           
-            return jsonify({'message':'You have changed sucessfully your email','user':user_info}),200
-        else:
-            return jsonify({'message':f'Invalid email or passsword'}),404
+        if not new_email:
+            return jsonify({'message':'A new email is required'}),400
+
+        if new_email==old_email.lower():
+            return jsonify({'message':'This is already your current email'}),400
+
+        change_token=generate_email_change_token(user.id,new_email)
+        confirm_link=f"{ConfigClass.API_URL}/reader/confirm_email_change/{change_token}"
+
+        verify_msg=Message('Confirm your new email address',recipients=[new_email],sender=ConfigClass.MAIL_USERNAME)
+        verify_msg.body=(
+            f"Hi {user.username},\n\n"
+            f"Please confirm your new email address by clicking the link below:\n{confirm_link}\n\n"
+            "This link expires in 20 minutes. If you did not request this change, you can ignore this email."
+        )
+        mail.send(verify_msg)
+
+        notice_msg=Message('Email change requested on your account',recipients=[old_email],sender=ConfigClass.MAIL_USERNAME)
+        notice_msg.body=(
+            f"Hi {user.username},\n\n"
+            f"A request was made to change the email on your account from {old_email} to {new_email}.\n"
+            "If this was not you, please change your password immediately."
+        )
+        mail.send(notice_msg)
+
+        return jsonify({'message':f'A confirmation link has been sent to {new_email}. Your current email has also been notified of this request.'}),200
+    except Exception as error:
+        return jsonify({'message':'Internal serveur error'}),500
+
+
+## @brief Route for confirming a pending email change for readers.
+#
+# This route is used to confirm and apply an email change requested through '/set_email'. The function
+# uses the 'confirm_email_change_token' function to verify the token is valid, not expired, and matches
+# an existing user, applying the new email only at that point. Once applied, a confirmation email is sent
+# to both the new address (so the user knows the change succeeded) and the old address (so the previous
+# owner is informed the change went through, in case the request wasn't theirs).
+#
+# @param token: The token contained in the confirmation link sent to the requested new email.
+#
+# @return: A redirect to the front-end confirmation page, or a JSON error if the link is invalid or expired.
+@reader.route('/confirm_email_change/<token>')
+def confirm_email_change(token):
+    try:
+        result=confirm_email_change_token(token)
+        if not result:
+            return jsonify({'message':'Invalid or expired link'}),404
+
+        user=result['user']
+        old_email=result['old_email']
+        new_email=result['new_email']
+
+        confirmed_new_msg=Message('Your email address has been changed',recipients=[new_email],sender=ConfigClass.MAIL_USERNAME)
+        confirmed_new_msg.body=f"Hi {user.username},\n\nThis confirms that your account email has been changed to {new_email}."
+        mail.send(confirmed_new_msg)
+
+        if old_email and old_email!=new_email:
+            confirmed_old_msg=Message('Your account email has been changed',recipients=[old_email],sender=ConfigClass.MAIL_USERNAME)
+            confirmed_old_msg.body=(
+                f"Hi {user.username},\n\n"
+                f"This confirms that your account email was changed from {old_email} to {new_email}.\n"
+                "If you did not request this, please contact support immediately."
+            )
+            mail.send(confirmed_old_msg)
+
+        return redirect(f"{ConfigClass.FRONT_URL}/authentication/email-change-confirmed",code=302)
     except Exception as error:
         return jsonify({'message':'Internal serveur error'}),500
 
