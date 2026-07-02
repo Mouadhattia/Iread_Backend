@@ -28,6 +28,7 @@ class User(db.Model, UserMixin):
     pin_hash = db.Column(db.String(100), nullable=True)
     pin_failed_attempts = db.Column(db.Integer, nullable=False, default=0)
     pin_locked_until = db.Column(db.DateTime, nullable=True)
+    must_change_password = db.Column(db.Boolean, nullable=False, default=False)
 
     __mapper_args__ = {
         'polymorphic_on': type,

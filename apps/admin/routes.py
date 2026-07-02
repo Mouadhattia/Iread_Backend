@@ -400,11 +400,36 @@ def send_school_admin_approved_email(user):
         logging.error('Unable to send school admin approval email: %s', error, exc_info=True)
         return False, str(error)
 
+def get_school_welcome_email_body(user, school, password):
+    return (
+        f'Hello,\n\n'
+        f'A dashboard account for {school.name} has been created on IRead.\n\n'
+        f'Login email: {user.email}\n'
+        f'Temporary password: {password}\n\n'
+        f'Please sign in at {ConfigClass.FRONT_URL} — you will be asked to choose '
+        f'a new password on your first login.\n'
+    )
+
+def send_school_welcome_email(user, school, password):
+    try:
+        msg = Message(
+            'Your IRead school account has been created',
+            recipients=[user.email],
+            sender=ConfigClass.MAIL_USERNAME
+        )
+        msg.body = get_school_welcome_email_body(user, school, password)
+        mail.send(msg)
+        return True, None
+    except Exception as error:
+        logging.error('Unable to send school welcome email: %s', error, exc_info=True)
+        return False, str(error)
+
 def delete_super_user_dependencies(user_id):
     Follow_book.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     Follow_session.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     Follow_pack.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     Notification_user.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    ReaderNotification.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     Game_result.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     Profile.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     Teacher_postulate.query.filter_by(id=user_id).delete(synchronize_session=False)
@@ -8021,17 +8046,57 @@ def create_shcool():
         name = str(name).strip()
         if school_name_exists(name):
             return jsonify({'message': 'This school name is already used. Please choose another'}), 409
+
+        email = data.get('email')
+        password = data.get('password')
+        if (email and not password) or (password and not email):
+            return jsonify({'message': 'email and password must be provided together'}), 400
+        email = str(email).strip().lower() if email else None
+        if email and User.query.filter_by(email=email).first():
+            return jsonify({'message': 'A user with this email already exists'}), 409
+
         new_shcool = Shcool(name=name)
         db.session.add(new_shcool)
         db.session.flush()
         get_or_create_school_public_page(new_shcool)
+
+        school_admin = None
+        if email and password:
+            school_admin = Admin(
+                username=name,
+                email=email,
+                password_hashed=bcrypt.generate_password_hash(password).decode('utf-8'),
+                created_at=datetime.now(),
+                confirmed=True,
+                approved=True,
+                must_change_password=True
+            )
+            db.session.add(school_admin)
+            db.session.flush()
+            db.session.add(User_shcool(user_id=school_admin.id, shcool_id=new_shcool.id))
+
         db.session.commit()
+
         result = {
             'id':new_shcool.id,
             'name':new_shcool.name
         }
-        return jsonify({'message': 'Shcool created successfully','shcool':result }), 201
+        response = {'message': 'Shcool created successfully','shcool':result}
+
+        if school_admin:
+            email_sent, email_error = send_school_welcome_email(school_admin, new_shcool, password)
+            response['admin'] = {
+                'id': school_admin.id,
+                'email': school_admin.email,
+                'username': school_admin.username
+            }
+            response['welcome_email_sent'] = email_sent
+            if email_error:
+                response['welcome_email_error'] = email_error
+
+        return jsonify(response), 201
     except Exception as e:
+        db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
 # Read

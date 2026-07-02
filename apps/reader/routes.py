@@ -1353,18 +1353,41 @@ def login():
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
-                    login_user(user) 
-                        
-                    return jsonify({'message':'Your are logged in succesfully','role':user.type}),200
+                    login_user(user)
+
+                    return jsonify({'message':'Your are logged in succesfully','role':user.type,'must_change_password':bool(user.must_change_password)}),200
                 else:
                     return jsonify({'message':'Your are not been approved for the moment'}),403
             else:
                 return jsonify({'message':'You don\'t confirm your account'}),403 # Acces interdit
-        else:  
+        else:
             return jsonify({'message':'Invalid email or password'}),404
-    
+
     except Exception as error:
-        return jsonify({'message':'Internal server error','error':str(error)}),500        
+        return jsonify({'message':'Internal server error','error':str(error)}),500
+
+## @brief Route for a logged-in user to change their own password.
+#
+# Verifies the current password, sets the new password hash, and clears
+# must_change_password so the forced first-login reset flow stops firing.
+@reader.route('/change_password',methods=['POST'])
+@login_required
+def change_password():
+    try:
+        current_password = request.json.get('current_password')
+        new_password = request.json.get('new_password')
+        if not current_password or not new_password:
+            return jsonify({'message':'current_password and new_password are required'}),400
+        if not bcrypt.check_password_hash(current_user.password_hashed,current_password):
+            return jsonify({'message':'Current password is incorrect'}),403
+        current_user.password_hashed = bcrypt.generate_password_hash(new_password).decode('utf-8')
+        current_user.must_change_password = False
+        db.session.commit()
+        return jsonify({'message':'Password updated successfully'}),200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message':'Internal server error','error':str(error)}),500
+
 PIN_MAX_ATTEMPTS = 5
 PIN_LOCKOUT_MINUTES = 15
 
@@ -1522,15 +1545,16 @@ def user_authenticated():
                     'quiz_id': quiz_id,
                     'id': current_user.id,
                     'is_super_admin': True,
+                    'must_change_password': bool(current_user.must_change_password),
                     'schools': [{'id': school.id, 'name': school.name} for school in schools]
                 })
 
             if current_user.type == "admin":
-                
+
                 school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
 
                 school = Shcool.query.get(school_id)
-                
+
                 return jsonify({
                     'is_authenticated': current_user.is_authenticated,
                     'username': current_user.username,
@@ -1541,7 +1565,8 @@ def user_authenticated():
                     'id': current_user.id,
                     'client_id_invoicing_api': client_id_invoicing_api,
                     'school_id': school.id,
-                    'school': school.name
+                    'school': school.name,
+                    'must_change_password': bool(current_user.must_change_password)
                 })
 
             else:
@@ -1556,7 +1581,8 @@ def user_authenticated():
                     'client_id_invoicing_api': client_id_invoicing_api,
                     'schools': get_user_schools(current_user.id),
                     'is_primary': current_user.is_primary,
-                    'has_pin': bool(current_user.pin_hash)
+                    'has_pin': bool(current_user.pin_hash),
+                    'must_change_password': bool(current_user.must_change_password)
                 })
     except Exception as e:     
         return jsonify({'error': str(e), 'message': 'Internal server error'})
