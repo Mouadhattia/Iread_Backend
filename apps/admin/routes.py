@@ -6539,10 +6539,9 @@ def add_quiz_to_session():
         data = request.get_json()
         session_id = data['session_id']
         quiz_token = data['quiz_token']
-        release_date = data.get('release_date')  
         if not get_school_session(session_id):
             return jsonify({'message': 'Session not found'}), 404
-       
+
         # Check if  the quiz already exists in the session
         if Session_quiz.query.filter_by(session_id=session_id, quiz_token=quiz_token).first():
             return jsonify({'message': 'This quiz is already exists in the session.'}), 409  # Conflict
@@ -6551,7 +6550,6 @@ def add_quiz_to_session():
             new_session_quiz = Session_quiz(
                 session_id=session_id,
                 quiz_token=quiz_token,
-                release_date=release_date if release_date else None  
             )
 
             # Add the user to the database
@@ -6564,7 +6562,6 @@ def add_quiz_to_session():
                 'quiz_session': {
                     'session_id': session_id,
                     'quiz_token': quiz_token,
-                    'release_date': new_session_quiz.release_date,
                     'id': new_session_quiz.id,
                 }
             }
@@ -6616,7 +6613,6 @@ def get_quiz_in_session():
             quiz_data.append({
                 'session_id': quiz.session_id,
                 'quiz_token': quiz.quiz_token,
-                'release_date': quiz.release_date,
                 'id': quiz.id,
             })
         return jsonify({
