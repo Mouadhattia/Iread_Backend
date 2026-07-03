@@ -3372,6 +3372,34 @@ def parse_non_negative_seconds(value):
     return max(0, seconds)
 
 
+def parse_result_completed(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def apply_game_result_payload(game_result, data):
+    if 'score' in data:
+        game_result.score = data['score']
+
+    if 'words_learned' in data:
+        game_result.words_learned = data.get('words_learned') or []
+
+    if 'completed' in data:
+        game_result.completed = parse_result_completed(data.get('completed'), default=False)
+
+    if 'time_spent_seconds' in data:
+        game_result.time_spent_seconds = parse_non_negative_seconds(data.get('time_spent_seconds'))
+
+
+def is_played_game_result(result):
+    return result is not None
+
+
 def serialize_game_result(result, rank=None, current_user_id=None):
     user = User.query.get(result.user_id) if result.user_id else None
     return {
@@ -3389,6 +3417,48 @@ def serialize_game_result(result, rank=None, current_user_id=None):
         'time_spent_seconds': result.time_spent_seconds or 0,
         'is_current_user': bool(current_user_id and result.user_id == current_user_id),
     }
+
+
+@reader.route('/game-result/status', methods=['GET'])
+def get_game_result_status():
+    try:
+        game = request.args.get('game')
+        book_id = request.args.get('book_id') or request.args.get('id')
+        if not game:
+            return jsonify({'error': 'game query parameter is required'}), 400
+        if not book_id:
+            return jsonify({'error': 'book_id query parameter is required'}), 400
+
+        try:
+            game_status = normalize_game_result_enum(game)
+        except ValueError:
+            return jsonify({'error': 'Invalid game type'}), 400
+
+        raw_user_id = request.args.get('user_id') or (current_user.id if current_user.is_authenticated else None)
+        if not raw_user_id:
+            return jsonify({'result': None, 'completed': False}), 200
+        try:
+            user_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            return jsonify({'result': None, 'completed': False}), 200
+
+        result_day = parse_result_day(request.args.get('day') or request.args.get('date'))
+        existing_result = Game_result.query.filter_by(
+            user_id=user_id,
+            day=result_day,
+            game=game_status,
+            book_id=book_id
+        ).first()
+
+        result_data = serialize_game_result(existing_result, current_user_id=user_id) if existing_result else None
+        played = is_played_game_result(existing_result)
+        return jsonify({
+            'result': result_data,
+            'completed': played,
+            'played': played
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @reader.route('/game-result', methods=['POST'])
@@ -3424,6 +3494,12 @@ def create_game_result():
         existing_result = Game_result.query.filter_by(user_id=user_id, day=result_day,game=game_status,book_id=data['book_id']).first()
 
         if existing_result:
+            if parse_result_completed(data.get('completed'), default=False) and not existing_result.completed:
+                apply_game_result_payload(existing_result, data)
+                db.session.commit()
+                result_data = serialize_game_result(existing_result, current_user_id=user_id)
+                return jsonify({'message': 'Game result updated successfully', 'result': result_data}), 200
+
             result_data = serialize_game_result(existing_result, current_user_id=user_id)
          
             if existing_result.completed:
@@ -3438,6 +3514,8 @@ def create_game_result():
             game=game_status,
             user_id=user_id,
             day=result_day,
+            completed=parse_result_completed(data.get('completed'), default=False),
+            words_learned=data.get('words_learned') or [],
             time_spent_seconds=parse_non_negative_seconds(data.get('time_spent_seconds')),
         )
 
@@ -3466,17 +3544,7 @@ def update_game_result(result_id):
             return jsonify({'error': 'Game result not found'}), 404
         
         # Validate and update fields
-        if 'score' in data:
-            game_result.score = data['score']
-        
-        if  'words_learned' in data :
-            game_result.words_learned = data['words_learned']
-        
-        if 'completed' in data:
-            game_result.completed = data['completed']
-
-        if 'time_spent_seconds' in data:
-            game_result.time_spent_seconds = parse_non_negative_seconds(data.get('time_spent_seconds'))
+        apply_game_result_payload(game_result, data)
         
         
 
@@ -3582,10 +3650,24 @@ def get_daily_game_leaderboard():
         except ValueError:
             return jsonify({'error': 'Invalid game type'}), 400
 
-        current_user_id = current_user.id if current_user.is_authenticated else None
+        current_user_id = request.args.get('user_id') or (current_user.id if current_user.is_authenticated else None)
+        if current_user_id:
+            try:
+                current_user_id = int(current_user_id)
+            except (TypeError, ValueError):
+                current_user_id = None
         query = (
             Game_result.query
-            .filter_by(book_id=book_id, game=game_enum, day=day, completed=True)
+            .filter(
+                Game_result.book_id == book_id,
+                Game_result.game == game_enum,
+                Game_result.day == day,
+                or_(
+                    Game_result.completed.is_(True),
+                    Game_result.score > 0,
+                    Game_result.time_spent_seconds > 0,
+                )
+            )
             .order_by(Game_result.id.asc())
         )
         all_results = sorted(
