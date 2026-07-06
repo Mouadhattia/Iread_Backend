@@ -24,6 +24,9 @@ TYPE_ICONS = {
     'pack_book_added': 'fe fe-book-open',
     'school_pack_created': 'fe fe-layers',
     'global_pack_created': 'fe fe-globe',
+    'word_suggestion_submitted': 'fe fe-edit-3',
+    'word_suggestion_approved': 'fe fe-check-circle',
+    'word_suggestion_rejected': 'fe fe-x-circle',
 }
 
 
@@ -191,6 +194,13 @@ def get_all_school_staff_ids():
         .filter(User.type.in_(['admin', 'teacher']))
         .distinct()
         .all()
+    ]
+
+
+def get_super_admin_ids():
+    return [
+        user_id for (user_id,) in
+        db.session.query(User.id).filter(User.type == 'super_admin').all()
     ]
 
 
@@ -378,6 +388,49 @@ def clear_old_daily_game_notifications(school_id, book_id, game_type, play_date)
         ReaderNotification.game_type == game_type,
         ReaderNotification.play_date != play_date
     ).delete(synchronize_session=False)
+
+
+def notify_word_suggestion_submitted(suggestion, sense):
+    school_name = suggestion.school.name if suggestion.school else 'A school'
+    create_notifications_for_users(
+        get_super_admin_ids(),
+        'word_suggestion_submitted',
+        'New word suggestion',
+        f'{school_name} suggested a change for "{sense.lemma}" — review it in Word Suggestions.',
+        link='/dashboard/word-suggestions',
+        school_id=suggestion.school_id,
+        payload={
+            'suggestion_id': suggestion.id,
+            'word_sense_id': sense.id,
+            'lemma': sense.lemma,
+            'suggestion_type': suggestion.suggestion_type,
+        },
+    )
+
+
+def notify_word_suggestion_reviewed(suggestion, sense, approved):
+    if approved:
+        title = 'Suggestion approved'
+        message = f'Your suggestion for "{sense.lemma}" was approved and is now live.'
+    else:
+        title = 'Suggestion rejected'
+        message = f'Your suggestion for "{sense.lemma}" was rejected.'
+        if suggestion.review_note:
+            message += f' Note: {suggestion.review_note}'
+    create_notifications_for_users(
+        [suggestion.suggested_by],
+        'word_suggestion_approved' if approved else 'word_suggestion_rejected',
+        title,
+        message,
+        link='/dashboard/word-review',
+        school_id=suggestion.school_id,
+        payload={
+            'suggestion_id': suggestion.id,
+            'word_sense_id': sense.id,
+            'lemma': sense.lemma,
+            'suggestion_type': suggestion.suggestion_type,
+        },
+    )
 
 
 def notify_daily_game_created(school_id, book, game_type, play_date):

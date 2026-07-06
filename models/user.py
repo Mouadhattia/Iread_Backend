@@ -29,6 +29,10 @@ class User(db.Model, UserMixin):
     pin_failed_attempts = db.Column(db.Integer, nullable=False, default=0)
     pin_locked_until = db.Column(db.DateTime, nullable=True)
     must_change_password = db.Column(db.Boolean, nullable=False, default=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    suspended_at = db.Column(db.DateTime, nullable=True)
+    suspended_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    suspended_reason = db.Column(db.String(500), nullable=True)
 
     __mapper_args__ = {
         'polymorphic_on': type,

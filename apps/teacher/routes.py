@@ -4,7 +4,9 @@ from uuid import uuid4
 from flask import Blueprint,abort,jsonify,request
 from flask_login import login_required,current_user
 
-from models.user import Teacher
+from models.user import Teacher, Reader
+from sqlalchemy import or_
+from apps.progress_engine import serialize_reader_progress
 from models.book import Book
 from models.book_pack import Book_pack
 from models.book_story import BookStory
@@ -168,6 +170,52 @@ def paginate_query(query, serializer, collection_name):
             'max_per_page': 100
         }
     }
+
+@teacher.route('/reader-progress', methods=['GET'])
+@login_required
+def list_reader_progress():
+    """Read-only — teachers and assistants can see how their students are
+    progressing (words mastered, streaks, achievements), but can't edit
+    CEFR levels or dictionary data; that stays admin-only in /admin/word-senses."""
+    if current_user.type not in ('teacher', 'assistant', 'admin', 'super_admin'):
+        return abort(401)
+
+    try:
+        page = get_positive_int_arg('page', 1)
+        per_page = min(get_positive_int_arg('per_page', 20), 100)
+        search = (request.args.get('search') or '').strip().lower()
+
+        school_ids = get_teacher_school_ids()
+        reader_ids = [
+            m.user_id for m in User_shcool.query.filter(User_shcool.shcool_id.in_(school_ids)).all()
+        ] if school_ids else []
+
+        query = Reader.query.filter(Reader.id.in_(reader_ids))
+        if search:
+            query = query.filter(or_(
+                Reader.username.like('%' + search + '%'),
+                Reader.email.like('%' + search + '%'),
+            ))
+
+        total = query.count()
+        readers = (
+            query.order_by(Reader.username)
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        return jsonify({
+            'items': [serialize_reader_progress(reader) for reader in readers],
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+        }), 200
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
 
 @teacher.route('/dashboard')
 @login_required

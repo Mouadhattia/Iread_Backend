@@ -33,15 +33,28 @@ from models.session import Session
 from models.book_text import Book_text
 from models.follow_session import Follow_session
 from models.audio_book import AudioBook, AudioBookPage
+from apps.account_status import get_account_block_message
 from apps.main.email import generate_confirmed_token,reader_confirm_token,generate_email_change_token,confirm_email_change_token
 from apps.jitsi import is_online_session, serialize_jitsi_call
 from apps.notifications import serialize_reader_notification
 from apps.game_calendar import (
     GameCalendarError,
+    SUPPORTED_GAME_TYPES,
     game_error_response,
     get_player_game_payload,
+    normalize_game_type,
     parse_optional_play_date,
     split_legacy_words_from_text,
+)
+from apps.progress_engine import (
+    AttemptError,
+    attempt_error_response,
+    get_achievement_status,
+    get_progress_summary,
+    get_self_reported_shelf,
+    get_word_collection,
+    record_self_reported_word,
+    submit_attempt,
 )
 from extensions import mail,login_manager,db
 from flask_mail import Message
@@ -978,6 +991,10 @@ def login_from_school_public_page(slug):
             return jsonify({'message': "You don't confirm your account"}), 403
         if not user.approved:
             return jsonify({'message': 'Your are not been approved for the moment'}), 403
+        if not user.is_active:
+            return jsonify({'message': 'Your account has been suspended. Contact your school administrator.', 'code': 'ACCOUNT_INACTIVE'}), 403
+        if not school.is_active:
+            return jsonify({'message': 'This school has been suspended. Contact IRead support.', 'code': 'ACCOUNT_INACTIVE'}), 403
         if not user_belongs_to_school(user.id, school.id):
             return jsonify({'message': 'You are not joined to this school'}), 403
 
@@ -1116,6 +1133,9 @@ def google_register():
         if user_email_exist(email):
            google_user=User.query.filter_by(email=email).first()
            accounts = User.query.filter_by(email=email).all()
+           block = get_account_block_message(google_user)
+           if block:
+               return jsonify({'message': block[0], 'code': 'ACCOUNT_INACTIVE'}), block[1]
            login_user(google_user)
            if invitation_code:
                redeem_school_invitation_for_user(invitation_code, google_user.id)
@@ -1320,6 +1340,9 @@ def login_client():
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
+                    block = get_account_block_message(user)
+                    if block:
+                        return jsonify({'message': block[0], 'code': 'ACCOUNT_INACTIVE'}), block[1]
                     login_user(user)
                     pin_required = len(accounts) > 1
                     accountsData=[]
@@ -1353,6 +1376,9 @@ def login():
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
+                    block = get_account_block_message(user)
+                    if block:
+                        return jsonify({'message': block[0], 'code': 'ACCOUNT_INACTIVE'}), block[1]
                     login_user(user)
 
                     return jsonify({'message':'Your are logged in succesfully','role':user.type,'must_change_password':bool(user.must_change_password)}),200
@@ -1409,6 +1435,9 @@ def select_account():
                 return jsonify({'message':'You don\'t confirm your account'}),403
             if not user.approved:
                 return jsonify({'message':'Your are not been approved for the moment'}),403
+            block = get_account_block_message(user)
+            if block:
+                return jsonify({'message': block[0], 'code': 'ACCOUNT_INACTIVE'}), block[1]
 
             siblings_count = User.query.filter_by(email=email).count()
             # Profiles created before the PIN feature existed (or the split
@@ -3461,6 +3490,124 @@ def get_game_result_status():
         return jsonify({'error': str(e)}), 500
 
 
+MAX_SUGGESTED_SIBLING_BOOKS = 4
+
+
+@reader.route('/daily-run-suggestions', methods=['GET'])
+@login_required
+def get_daily_run_suggestions():
+    try:
+        book_id = get_request_value('book_id', 'id')
+        current_game = get_request_value('game')
+        pack_id = get_request_value('pack_id')
+
+        if not book_id:
+            return jsonify({'error': 'book_id query parameter is required'}), 400
+        if not current_game:
+            return jsonify({'error': 'game query parameter is required'}), 400
+
+        try:
+            book_id = int(book_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'book_id must be a number'}), 400
+
+        try:
+            current_game_type = normalize_game_type(current_game)
+            current_game_enum = normalize_game_result_enum(current_game)
+        except (ValueError, GameCalendarError):
+            return jsonify({'error': 'Invalid game type'}), 400
+
+        school_id, school_error, school_status = resolve_game_school_id_from_session()
+        if school_error:
+            return jsonify({'message': school_error, 'code': 'SCHOOL_CONTEXT_REQUIRED'}), school_status
+
+        book = Book.query.get(book_id)
+        if not reader_can_access_book_in_school(book, school_id):
+            return jsonify({'message': 'Book not found', 'code': 'BOOK_NOT_FOUND'}), 404
+
+        school = Shcool.query.get(school_id)
+        user_id = current_user.id
+        result_day = parse_result_day(request.args.get('date'))
+
+        # "Not yet played" alone isn't enough — a candidate also needs a real
+        # GameCalendarEntry/SchoolGameSetting for today, or clicking it would
+        # just 404. get_player_game_payload is the same availability check
+        # /get_book_games/<id>/<type> already relies on, reused here rather
+        # than re-deriving calendar/settings logic.
+        other_games_same_book = []
+        for game_type in SUPPORTED_GAME_TYPES:
+            if game_type == current_game_type:
+                continue
+            game_enum = normalize_game_result_enum(game_type)
+            already_played = Game_result.query.filter_by(
+                user_id=user_id, book_id=book_id, day=result_day, game=game_enum
+            ).first() is not None
+            if already_played:
+                continue
+            try:
+                get_player_game_payload(school_id, book_id, game_type, play_date=result_day, school=school)
+            except GameCalendarError:
+                continue
+            other_games_same_book.append(game_type)
+
+        other_books_same_game = []
+        pack_id_int = None
+        if pack_id is not None:
+            try:
+                pack_id_int = int(pack_id)
+            except (TypeError, ValueError):
+                pack_id_int = None
+
+        if pack_id_int is not None:
+            pack = get_pack_in_school(pack_id_int, school_id)
+            # A stale/invalid/inaccessible pack_id shouldn't break the whole
+            # response — just fall back to no sibling-book suggestions, same
+            # as when pack_id is absent entirely.
+            if pack and user_can_view_pack_in_school(pack, school_id):
+                siblings = sorted(
+                    (b for b in get_books_in_pack(pack.id) if b.id != book_id),
+                    key=lambda b: b.id
+                )
+                sibling_ids = [b.id for b in siblings]
+                played_book_ids = {
+                    row.book_id for row in db.session.query(Game_result.book_id).filter(
+                        Game_result.user_id == user_id,
+                        Game_result.day == result_day,
+                        Game_result.game == current_game_enum,
+                        Game_result.book_id.in_(sibling_ids)
+                    ).all()
+                } if sibling_ids else set()
+
+                audio_map = get_published_audio_book_ids_by_book(sibling_ids, school_id)
+                for sibling in siblings:
+                    if len(other_books_same_game) >= MAX_SUGGESTED_SIBLING_BOOKS:
+                        break
+                    if sibling.id in played_book_ids:
+                        continue
+                    try:
+                        get_player_game_payload(
+                            school_id, sibling.id, current_game_type, play_date=result_day, school=school
+                        )
+                    except GameCalendarError:
+                        continue
+                    other_books_same_game.append(serialize_book_for_pack(sibling, audio_map))
+            else:
+                pack_id_int = None
+
+        return jsonify({
+            'book_id': book_id,
+            'pack_id': pack_id_int,
+            'game': current_game_type,
+            'date': result_day.isoformat(),
+            'other_games_same_book': other_games_same_book,
+            'other_books_same_game': other_books_same_game,
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        logging.error('Get daily run suggestions failed: %s', e, exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @reader.route('/game-result', methods=['POST'])
 @reader.route('/game-result/', methods=['POST'])
 def create_game_result():
@@ -3558,7 +3705,152 @@ def update_game_result(result_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
-    
+
+
+@reader.route('/word-attempt', methods=['POST'])
+def create_word_attempt():
+    """Both daily-run and practice call this after every game — mode never
+    affects stage, pips, or mastery (Achievement & Word-Progress brief,
+    section 2)."""
+    try:
+        data = request.get_json() or {}
+
+        required_fields = ['book_id', 'word', 'game', 'mode', 'correct']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return jsonify({
+                'message': 'Missing required fields: %s' % ', '.join(missing_fields),
+                'code': 'MISSING_FIELDS',
+            }), 400
+
+        user_id = data.get('user_id') or (current_user.id if current_user.is_authenticated else None)
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+
+        result = submit_attempt(
+            user_id=user_id,
+            book_id=data['book_id'],
+            surface_form=data['word'],
+            game=data['game'],
+            mode=data['mode'],
+            correct=bool(data['correct']),
+            hints_used=int(data.get('hints_used') or 0),
+            heaviest_hint_tier=data.get('heaviest_hint_tier'),
+            from_memory=bool(data.get('from_memory', False)),
+        )
+        return jsonify(result), 200
+    except AttemptError as error:
+        db.session.rollback()
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Word attempt submission failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@reader.route('/self-reported-word', methods=['POST'])
+def create_self_reported_word():
+    """The 'words I already know' shelf — a typed word that isn't a tracked
+    book word (section 8, second branch)."""
+    try:
+        data = request.get_json() or {}
+
+        user_id = data.get('user_id') or (current_user.id if current_user.is_authenticated else None)
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+
+        result = record_self_reported_word(user_id, data.get('word'))
+        return jsonify(result), 200
+    except AttemptError as error:
+        db.session.rollback()
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Self-reported word submission failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+def _resolve_progress_user_id():
+    """Raises AttemptError (400) on a non-numeric user_id instead of letting
+    int() crash into a raw 500 — e.g. a client accidentally sending the
+    quiz_id (an external Mongo-style id) instead of the real integer id."""
+    raw_user_id = request.args.get('user_id')
+    if raw_user_id:
+        try:
+            return int(raw_user_id)
+        except (TypeError, ValueError):
+            raise AttemptError(
+                'user_id must be a valid integer, not %r' % (raw_user_id,),
+                'INVALID_USER_ID',
+            )
+    return current_user.id if current_user.is_authenticated else None
+
+
+@reader.route('/word-progress/summary', methods=['GET'])
+def get_word_progress_summary_route():
+    try:
+        user_id = _resolve_progress_user_id()
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+
+        return jsonify(get_progress_summary(user_id)), 200
+    except AttemptError as error:
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        logging.error('Word progress summary failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@reader.route('/achievements', methods=['GET'])
+def get_achievements_route():
+    try:
+        user_id = _resolve_progress_user_id()
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+
+        return jsonify({'achievements': get_achievement_status(user_id)}), 200
+    except AttemptError as error:
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        logging.error('Achievement status failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@reader.route('/word-collection', methods=['GET'])
+def get_word_collection_route():
+    try:
+        user_id = _resolve_progress_user_id()
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+
+        return jsonify({'words': get_word_collection(user_id)}), 200
+    except AttemptError as error:
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        logging.error('Word collection failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@reader.route('/words-i-know', methods=['GET'])
+def get_words_i_know_route():
+    try:
+        user_id = _resolve_progress_user_id()
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+
+        return jsonify({'words': get_self_reported_shelf(user_id)}), 200
+    except AttemptError as error:
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        logging.error('Words I know failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
 
 @reader.route('/game-results', methods=['GET'])
 def get_game_results():

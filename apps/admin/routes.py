@@ -36,6 +36,7 @@ from models.user_shcool import User_shcool
 from models.Follow_book import Follow_book
 from models.game_result import Game_result
 from models.user_log import UserLog
+from models.word_progress import WordProgress, UserAchievement
 from models.session import Session,Location
 from models.pack_template import Pack_template
 from models.pack import Pack, StatusEnum as PackAgeEnum
@@ -46,6 +47,24 @@ from models.follow_pack import Follow_pack
 from models.session_quiz import Session_quiz
 from models.about_book import About_Book
 from models.book_text import Book_text
+from models.word_sense import WordSense
+from models.word_occurrence import WordOccurrence
+from models.chapter import Chapter
+from models.word_sense_suggestion import (
+    SUGGESTION_TYPE_CEFR,
+    SUGGESTION_TYPE_DICTIONARY,
+    STATUS_APPROVED,
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    STATUS_SUPERSEDED,
+    WordSenseSuggestion,
+)
+from models.platform_settings import PlatformSettings
+from apps.progress_engine import (
+    get_achievement_status,
+    get_progress_summary,
+    serialize_reader_progress,
+)
 from models.notification_user import Notification_user
 from models.reader_notification import ReaderNotification
 from models.profile import Profile
@@ -92,6 +111,8 @@ from apps.notifications import (
     notify_session_created,
     notify_session_deleted,
     notify_session_updated,
+    notify_word_suggestion_reviewed,
+    notify_word_suggestion_submitted,
 )
 import secrets
 import string
@@ -1353,6 +1374,7 @@ def get_user_schools_for_super(user_id):
     return [{'id': school.id, 'name': school.name} for membership, school in memberships]
 
 def serialize_super_user(user):
+    suspender = User.query.get(user.suspended_by) if user.suspended_by else None
     return {
         'id': user.id,
         'username': user.username,
@@ -1361,10 +1383,15 @@ def serialize_super_user(user):
         'role': user.type,
         'confirmed': user.confirmed,
         'approved': user.approved,
-        'status': 'approved' if user.approved else 'pending_approval',
+        'status': 'suspended' if not user.is_active else ('approved' if user.approved else 'pending_approval'),
         'created_at': user.created_at.isoformat() if user.created_at else None,
         'quiz_id': getattr(user, 'quiz_id', None),
-        'schools': get_user_schools_for_super(user.id)
+        'schools': get_user_schools_for_super(user.id),
+        'is_active': user.is_active,
+        'suspended_at': user.suspended_at.isoformat() if user.suspended_at else None,
+        'suspended_by': user.suspended_by,
+        'suspended_by_name': suspender.username if suspender else None,
+        'suspended_reason': user.suspended_reason
     }
 
 def serialize_super_user_detail(user):
@@ -1500,12 +1527,18 @@ def serialize_super_school(school):
         .distinct()
         .count()
     )
+    suspender = User.query.get(school.suspended_by) if school.suspended_by else None
     return {
         'id': school.id,
         'name': school.name,
         'user_count': user_count,
         'pack_count': pack_count,
-        'book_count': book_count
+        'book_count': book_count,
+        'is_active': school.is_active,
+        'suspended_at': school.suspended_at.isoformat() if school.suspended_at else None,
+        'suspended_by': school.suspended_by,
+        'suspended_by_name': suspender.username if suspender else None,
+        'suspended_reason': school.suspended_reason
     }
 
 def get_school_invitation_code(invitation_code_id):
@@ -1610,6 +1643,171 @@ def super_dashboard():
             'packs': Pack.query.count(),
             'books': Book.query.count(),
             'sessions': Session.query.count()
+        }), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+## @brief Strategic platform-wide analytics for the super admin: KPI pulse,
+# a "needs attention" action queue, growth/engagement trends over a
+# selectable range, content-health signals, and a top-schools-by-activity
+# leaderboard. Reuses the same range/bucket helpers as the school-admin
+# reading-analytics endpoint (resolve_dashboard_range/bucket_dates/count_in_buckets).
+@admin.route('/super/analytics', methods=['GET'])
+def super_analytics():
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        start, now, granularity, range_key = resolve_dashboard_range(request.args.get('range'))
+        buckets = bucket_dates(start, now, granularity)
+        bucket_labels = [label for (_start, _end, label) in buckets]
+        range_start_date = start.date()
+        today = now.date()
+
+        # --- Platform pulse ---
+        schools_suspended = Shcool.query.filter_by(is_active=False).count()
+        schools_total = Shcool.query.count()
+        users_suspended = User.query.filter_by(is_active=False).count()
+
+        dau = db.session.query(func.count(func.distinct(UserLog.user_id))).filter(
+            UserLog.created_at == today
+        ).scalar() or 0
+        wau = db.session.query(func.count(func.distinct(UserLog.user_id))).filter(
+            UserLog.created_at >= today - timedelta(days=7)
+        ).scalar() or 0
+        mau = db.session.query(func.count(func.distinct(UserLog.user_id))).filter(
+            UserLog.created_at >= today - timedelta(days=30)
+        ).scalar() or 0
+
+        pulse = {
+            'schools_total': schools_total,
+            'schools_active': schools_total - schools_suspended,
+            'schools_suspended': schools_suspended,
+            'users_total': User.query.count(),
+            'users_suspended': users_suspended,
+            'readers_total': User.query.filter_by(type='reader').count(),
+            'admins_total': User.query.filter_by(type='admin').count(),
+            'teachers_total': User.query.filter_by(type='teacher').count(),
+            'assistants_total': User.query.filter_by(type='assistant').count(),
+            'super_admins_total': User.query.filter_by(type='super_admin').count(),
+            'dau': dau,
+            'wau': wau,
+            'mau': mau,
+        }
+
+        # --- Needs attention / action queue ---
+        suspended_schools = (
+            Shcool.query.filter_by(is_active=False)
+            .order_by(Shcool.suspended_at.desc())
+            .limit(10)
+            .all()
+        )
+        needs_attention = {
+            'pending_school_admins': User.query.filter_by(type='admin', approved=False).count(),
+            'pending_teachers': User.query.filter_by(type='teacher', approved=False).count(),
+            'pending_word_suggestions': WordSenseSuggestion.query.filter_by(status=STATUS_PENDING).count(),
+            'suspended_schools_count': schools_suspended,
+            'suspended_schools': [
+                {'id': school.id, 'name': school.name, 'suspended_reason': school.suspended_reason}
+                for school in suspended_schools
+            ],
+            'suspended_users_count': users_suspended,
+        }
+
+        # --- Growth / engagement trends over the selected range ---
+        signup_rows = (
+            User.query.filter(User.created_at >= range_start_date)
+            .with_entities(User.created_at)
+            .all()
+        )
+        signups_over_time = count_in_buckets(signup_rows, lambda row: row[0], buckets)
+
+        visit_rows = (
+            db.session.query(UserLog.created_at, UserLog.user_id)
+            .filter(UserLog.created_at >= range_start_date, UserLog.user_id.isnot(None))
+            .all()
+        )
+        active_readers_over_time = []
+        for bucket_start, bucket_end, _label in buckets:
+            distinct_ids = {
+                user_id for visit_date, user_id in visit_rows
+                if bucket_start.date() <= visit_date < bucket_end.date()
+            }
+            active_readers_over_time.append(len(distinct_ids))
+
+        game_day_rows = (
+            Game_result.query.filter(Game_result.day >= range_start_date)
+            .with_entities(Game_result.day)
+            .all()
+        )
+        games_played_over_time = count_in_buckets(game_day_rows, lambda row: row[0], buckets)
+
+        trends = {
+            'signups_over_time': signups_over_time,
+            'active_readers_over_time': active_readers_over_time,
+            'games_played_over_time': games_played_over_time,
+        }
+
+        # --- Content health ---
+        word_sense_total = WordSense.query.count()
+        word_sense_resolved = WordSense.query.filter(or_(
+            WordSense.cefr_level.isnot(None),
+            WordSense.cefr_override_level.isnot(None),
+        )).count()
+        word_sense_excluded = WordSense.query.filter(WordSense.proper_noun_excluded.is_(True)).count()
+        word_sense_unresolved = word_sense_total - word_sense_resolved - word_sense_excluded
+
+        books_total = Book.query.count()
+        platform_books = Book.query.filter_by(is_platform_book=True).count()
+        packs_total = Pack.query.count()
+        global_packs = Pack.query.filter_by(is_global_pack=True).count()
+
+        content_health = {
+            'word_sense_total': word_sense_total,
+            'word_sense_resolved': word_sense_resolved,
+            'word_sense_unresolved': word_sense_unresolved,
+            'word_sense_excluded': word_sense_excluded,
+            'word_sense_unresolved_rate': round(word_sense_unresolved / word_sense_total, 4) if word_sense_total else 0,
+            'books_total': books_total,
+            'platform_books': platform_books,
+            'school_books': books_total - platform_books,
+            'packs_total': packs_total,
+            'global_packs': global_packs,
+            'school_packs': packs_total - global_packs,
+        }
+
+        # --- Engagement / achievements, and a top-schools-by-activity leaderboard ---
+        mastered_this_period = WordProgress.query.filter(WordProgress.mastered_at >= start).count()
+        achievements_this_period = UserAchievement.query.filter(UserAchievement.earned_at >= start).count()
+
+        top_schools_rows = (
+            db.session.query(Shcool.id, Shcool.name, func.count(Game_result.id))
+            .join(User_shcool, User_shcool.shcool_id == Shcool.id)
+            .join(Game_result, Game_result.user_id == User_shcool.user_id)
+            .filter(Game_result.day >= range_start_date)
+            .group_by(Shcool.id, Shcool.name)
+            .order_by(func.count(Game_result.id).desc())
+            .limit(10)
+            .all()
+        )
+
+        engagement = {
+            'mastered_words_this_period': mastered_this_period,
+            'achievements_this_period': achievements_this_period,
+            'top_schools_by_activity': [
+                {'id': school_id, 'name': name, 'play_count': play_count}
+                for school_id, name, play_count in top_schools_rows
+            ],
+        }
+
+        return jsonify({
+            'range': range_key,
+            'granularity': granularity,
+            'labels': bucket_labels,
+            'pulse': pulse,
+            'needs_attention': needs_attention,
+            'trends': trends,
+            'content_health': content_health,
+            'engagement': engagement,
         }), 200
     except Exception as error:
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
@@ -1933,6 +2131,59 @@ def super_approve_user(user_id=None):
         return jsonify(response), 200
     except ValueError as error:
         return jsonify({'message': str(error)}), 400
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/super/users/<int:user_id>/suspend', methods=['POST'])
+def super_suspend_user(user_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        if user_id == current_user.id:
+            return jsonify({'message': 'You cannot suspend your own account'}), 400
+
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'message': 'User not found'}), 404
+
+        if user.type == 'super_admin' and User.query.filter_by(type='super_admin', is_active=True).count() <= 1:
+            return jsonify({'message': 'Cannot suspend the last active super admin'}), 400
+
+        data = request.get_json(silent=True) or {}
+        user.is_active = False
+        user.suspended_at = datetime.now()
+        user.suspended_by = current_user.id
+        user.suspended_reason = data.get('reason')
+        db.session.commit()
+
+        return jsonify({
+            'message': 'User suspended successfully',
+            'user': serialize_super_user_detail(user)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/super/users/<int:user_id>/activate', methods=['POST'])
+def super_activate_user(user_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'message': 'User not found'}), 404
+
+        user.is_active = True
+        user.suspended_at = None
+        user.suspended_by = None
+        user.suspended_reason = None
+        db.session.commit()
+
+        return jsonify({
+            'message': 'User reactivated successfully',
+            'user': serialize_super_user_detail(user)
+        }), 200
     except Exception as error:
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
@@ -2741,6 +2992,53 @@ def super_get_schools():
     except ValueError as error:
         return jsonify({'message': str(error)}), 400
     except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/super/schools/<int:school_id>/suspend', methods=['POST'])
+def super_suspend_school(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        school.is_active = False
+        school.suspended_at = datetime.now()
+        school.suspended_by = current_user.id
+        school.suspended_reason = data.get('reason')
+        db.session.commit()
+
+        return jsonify({
+            'message': 'School suspended successfully',
+            'school': serialize_super_school(school)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/super/schools/<int:school_id>/activate', methods=['POST'])
+def super_activate_school(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        school.is_active = True
+        school.suspended_at = None
+        school.suspended_by = None
+        school.suspended_reason = None
+        db.session.commit()
+
+        return jsonify({
+            'message': 'School reactivated successfully',
+            'school': serialize_super_school(school)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/platform-books', methods=['GET'])
@@ -8410,9 +8708,552 @@ def define_word():
             "definition_en": definition_en,
             "definition_ar": definition_ar
         })
-    
+
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
+
+##---------word sense / CEFR review queue (Word-Data brief T14-T16)----------
+
+def get_scoped_book_ids(book_id_filter=None):
+    """None means 'no restriction' (super admin, no book filter). Otherwise a
+    concrete, already-authorized list of book ids to scope word senses to."""
+    if is_super_admin():
+        return [book_id_filter] if book_id_filter else None
+
+    allowed = [book.id for book in school_book_query().all()]
+    if book_id_filter:
+        return [book_id_filter] if book_id_filter in allowed else []
+    return allowed
+
+
+def scope_word_sense_query(query, book_id_filter=None):
+    book_ids = get_scoped_book_ids(book_id_filter)
+    if book_ids is None:
+        return query
+
+    sense_ids = [
+        row[0] for row in db.session.query(WordOccurrence.word_sense_id)
+        .join(Chapter, WordOccurrence.chapter_id == Chapter.id)
+        .filter(Chapter.book_id.in_(book_ids))
+        .distinct()
+        .all()
+    ]
+    return query.filter(WordSense.id.in_(sense_ids))
+
+
+def serialize_suggestion(suggestion):
+    return {
+        'id': suggestion.id,
+        'word_sense_id': suggestion.word_sense_id,
+        'school_id': suggestion.school_id,
+        'school_name': suggestion.school.name if suggestion.school else None,
+        'suggestion_type': suggestion.suggestion_type,
+        'suggested_cefr_level': suggestion.suggested_cefr_level,
+        'suggested_proper_noun_excluded': suggestion.suggested_proper_noun_excluded,
+        'suggested_definition': suggestion.suggested_definition,
+        'suggested_synonyms': suggestion.suggested_synonyms,
+        'suggested_example_sentence': suggestion.suggested_example_sentence,
+        'note': suggestion.note,
+        'status': suggestion.status,
+        'suggested_by': suggestion.suggested_by,
+        'suggested_by_name': suggestion.suggester.username if suggestion.suggester else None,
+        'suggested_at': suggestion.suggested_at.isoformat(),
+        'reviewed_by': suggestion.reviewed_by,
+        'reviewed_at': suggestion.reviewed_at.isoformat() if suggestion.reviewed_at else None,
+        'review_note': suggestion.review_note,
+    }
+
+
+def serialize_word_sense(sense, viewer_school_id=None):
+    occurrences = list(sense.occurrences)
+    book_ids = sorted({
+        occurrence.chapter.book_id for occurrence in occurrences if occurrence.chapter
+    })
+
+    pending_suggestion = None
+    if viewer_school_id:
+        suggestion = (
+            WordSenseSuggestion.query
+            .filter_by(word_sense_id=sense.id, school_id=viewer_school_id, status=STATUS_PENDING)
+            .order_by(WordSenseSuggestion.suggested_at.desc())
+            .first()
+        )
+        if suggestion:
+            pending_suggestion = serialize_suggestion(suggestion)
+
+    return {
+        'id': sense.id,
+        'lemma': sense.lemma,
+        'pos': sense.pos,
+        'definition': sense.definition,
+        'synonyms': sense.synonyms,
+        'example_sentence': sense.example_sentence,
+        'cefr_level': sense.cefr_level,
+        'cefr_source': sense.cefr_source,
+        'cefr_override_level': sense.cefr_override_level,
+        'cefr_override_note': sense.cefr_override_note,
+        'effective_cefr_level': sense.effective_cefr_level,
+        'proper_noun_excluded': sense.proper_noun_excluded,
+        'is_unresolved': sense.is_unresolved,
+        'occurrence_count': len(occurrences),
+        'sample_surface_forms': sorted({o.surface_form for o in occurrences})[:5],
+        'book_ids': book_ids,
+        'pending_suggestion': pending_suggestion,
+    }
+
+
+@admin.route('/word-senses', methods=['GET'])
+def list_word_senses():
+    try:
+        page, per_page = get_super_admin_pagination_params()
+        status = request.args.get('status', 'unresolved')
+        search = (request.args.get('search') or '').strip().lower()
+        book_id = request.args.get('book_id', type=int)
+
+        query = WordSense.query
+
+        if status == 'unresolved':
+            query = query.filter(
+                WordSense.cefr_level.is_(None),
+                WordSense.cefr_override_level.is_(None),
+                WordSense.proper_noun_excluded.is_(False),
+            )
+        elif status == 'excluded':
+            query = query.filter(WordSense.proper_noun_excluded.is_(True))
+        elif status == 'resolved':
+            query = query.filter(or_(
+                WordSense.cefr_level.isnot(None),
+                WordSense.cefr_override_level.isnot(None),
+            ))
+        # status == 'all' -> no extra filter
+
+        if search:
+            query = query.filter(WordSense.lemma.like(f'%{search}%'))
+
+        query = scope_word_sense_query(query, book_id)
+
+        total = query.count()
+        senses = (
+            query.order_by(WordSense.lemma)
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        # Only school admins have a single "own school" whose pending
+        # suggestions are worth flagging inline — super admins use the
+        # dedicated /word-suggestions review queue for the full picture.
+        viewer_school_id = None if is_super_admin() else get_current_school_id()
+
+        return jsonify({
+            'items': [serialize_word_sense(sense, viewer_school_id) for sense in senses],
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+        }), 200
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/word-senses/quality', methods=['GET'])
+def word_sense_quality():
+    """T15 — the unresolved-rate signal: a spike should be visible against
+    the normal trickle of proper nouns."""
+    try:
+        book_id = request.args.get('book_id', type=int)
+        query = scope_word_sense_query(WordSense.query, book_id)
+
+        total = query.count()
+        resolved = query.filter(or_(
+            WordSense.cefr_level.isnot(None),
+            WordSense.cefr_override_level.isnot(None),
+        )).count()
+        excluded = query.filter(WordSense.proper_noun_excluded.is_(True)).count()
+        unresolved = total - resolved - excluded
+
+        return jsonify({
+            'total': total,
+            'resolved': resolved,
+            'proper_noun_excluded': excluded,
+            'unresolved': unresolved,
+            'unresolved_rate': round(unresolved / total, 4) if total else 0,
+        }), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+VALID_CEFR_LEVELS = ('A1', 'A2', 'B1', 'B2', 'C1', 'C2')
+
+
+def upsert_pending_suggestion(word_sense_id, school_id, suggestion_type, **fields):
+    """Updates the caller's own still-pending suggestion for this word in
+    place rather than piling up duplicates when they revise it before review."""
+    suggestion = WordSenseSuggestion.query.filter_by(
+        word_sense_id=word_sense_id,
+        school_id=school_id,
+        suggestion_type=suggestion_type,
+        status=STATUS_PENDING,
+    ).first()
+
+    if suggestion is None:
+        suggestion = WordSenseSuggestion(
+            word_sense_id=word_sense_id,
+            school_id=school_id,
+            suggestion_type=suggestion_type,
+            suggested_by=current_user.id,
+        )
+        db.session.add(suggestion)
+
+    for key, value in fields.items():
+        setattr(suggestion, key, value)
+    suggestion.suggested_by = current_user.id
+    suggestion.suggested_at = datetime.now()
+    suggestion.status = STATUS_PENDING
+
+    db.session.commit()
+    return suggestion
+
+
+@admin.route('/word-senses/<int:sense_id>', methods=['PUT'])
+def update_word_sense(sense_id):
+    """Super admins edit directly, always. School admins can only suggest a
+    CEFR level or proper-noun exclusion (see /word-senses/<id>/suggest) —
+    dictionary content is direct or suggested depending on the platform's
+    require_dictionary_approval setting."""
+    try:
+        sense = WordSense.query.get(sense_id)
+        if not sense:
+            return jsonify({'message': 'Word sense not found'}), 404
+
+        super_admin = is_super_admin()
+
+        if not super_admin:
+            allowed_book_ids = set(get_scoped_book_ids())
+            sense_book_ids = {
+                occurrence.chapter.book_id for occurrence in sense.occurrences if occurrence.chapter
+            }
+            if not sense_book_ids & allowed_book_ids:
+                return jsonify({'message': 'Not authorized to edit this word'}), 403
+
+        data = request.get_json() or {}
+
+        if not super_admin and ('cefr_override_level' in data or 'proper_noun_excluded' in data):
+            return jsonify({
+                'message': 'School admins can\'t set a CEFR level or proper-noun exclusion directly — '
+                           'use POST /admin/word-senses/<id>/suggest to propose one for review.',
+                'code': 'MUST_SUGGEST',
+            }), 403
+
+        dictionary_fields = {
+            key: data[key] for key in ('definition', 'synonyms', 'example_sentence') if key in data
+        }
+
+        if dictionary_fields and not super_admin and PlatformSettings.get().require_dictionary_approval:
+            school_id = get_current_school_id()
+            suggestion = upsert_pending_suggestion(
+                sense.id, school_id, SUGGESTION_TYPE_DICTIONARY,
+                suggested_definition=dictionary_fields.get('definition', sense.definition),
+                suggested_synonyms=dictionary_fields.get('synonyms', sense.synonyms),
+                suggested_example_sentence=dictionary_fields.get('example_sentence', sense.example_sentence),
+                note=data.get('note'),
+            )
+            commit_notification_event(notify_word_suggestion_submitted, suggestion, sense)
+            return jsonify({
+                'action': 'suggested',
+                'message': 'Submitted for super-admin review — not live yet.',
+                'suggestion': serialize_suggestion(suggestion),
+            }), 202
+
+        if 'definition' in data:
+            sense.definition = data['definition']
+        if 'synonyms' in data:
+            sense.synonyms = data['synonyms']
+        if 'example_sentence' in data:
+            sense.example_sentence = data['example_sentence']
+        if dictionary_fields:
+            sense.enrichment_updated_by = current_user.id
+            sense.enrichment_updated_at = datetime.now()
+
+        if super_admin and 'proper_noun_excluded' in data:
+            sense.proper_noun_excluded = bool(data['proper_noun_excluded'])
+        if super_admin and 'cefr_override_level' in data:
+            level = (data['cefr_override_level'] or '').strip().upper() or None
+            if level and level not in VALID_CEFR_LEVELS:
+                return jsonify({'message': 'Invalid CEFR level'}), 400
+            sense.cefr_override_level = level
+            sense.cefr_override_note = data.get('cefr_override_note')
+            sense.cefr_override_by = current_user.id
+            sense.cefr_override_at = datetime.now()
+
+        db.session.commit()
+        return jsonify({
+            'action': 'updated',
+            'message': 'Word sense updated successfully',
+            'word_sense': serialize_word_sense(sense),
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/word-senses/<int:sense_id>/suggest', methods=['POST'])
+def suggest_word_sense_change(sense_id):
+    """School admins propose a CEFR level or proper-noun exclusion for an
+    unresolved word — never applied live; a super admin must approve it via
+    POST /admin/word-suggestions/<id>/approve."""
+    try:
+        if is_super_admin():
+            return jsonify({
+                'message': 'Super admins set this directly via PUT /admin/word-senses/<id> — no suggestion needed.',
+            }), 400
+
+        sense = WordSense.query.get(sense_id)
+        if not sense:
+            return jsonify({'message': 'Word sense not found'}), 404
+
+        allowed_book_ids = set(get_scoped_book_ids())
+        sense_book_ids = {
+            occurrence.chapter.book_id for occurrence in sense.occurrences if occurrence.chapter
+        }
+        if not sense_book_ids & allowed_book_ids:
+            return jsonify({'message': 'Not authorized to suggest for this word'}), 403
+
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'No school context for this account'}), 400
+
+        data = request.get_json() or {}
+        cefr_level = (data.get('cefr_level') or '').strip().upper() or None
+        proper_noun_excluded = data.get('proper_noun_excluded')
+
+        if cefr_level and cefr_level not in VALID_CEFR_LEVELS:
+            return jsonify({'message': 'Invalid CEFR level'}), 400
+        if cefr_level is None and proper_noun_excluded is None:
+            return jsonify({'message': 'Provide cefr_level or proper_noun_excluded'}), 400
+
+        suggestion = upsert_pending_suggestion(
+            sense.id, school_id, SUGGESTION_TYPE_CEFR,
+            suggested_cefr_level=cefr_level,
+            suggested_proper_noun_excluded=bool(proper_noun_excluded) if proper_noun_excluded is not None else None,
+            note=data.get('note'),
+        )
+        commit_notification_event(notify_word_suggestion_submitted, suggestion, sense)
+
+        return jsonify({
+            'message': 'Suggestion submitted for super-admin review.',
+            'suggestion': serialize_suggestion(suggestion),
+        }), 202
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/word-suggestions', methods=['GET'])
+def list_word_suggestions():
+    """Super admin's review queue — every pending suggestion, across every
+    school, so conflicting suggestions for the same word are visible together."""
+    try:
+        if not is_super_admin():
+            return jsonify({'message': 'Super admin access required'}), 403
+
+        suggestions = (
+            WordSenseSuggestion.query
+            .filter_by(status=STATUS_PENDING)
+            .order_by(WordSenseSuggestion.word_sense_id, WordSenseSuggestion.suggested_at)
+            .all()
+        )
+
+        grouped = {}
+        for suggestion in suggestions:
+            sense = suggestion.word_sense
+            key = sense.id
+            if key not in grouped:
+                grouped[key] = {
+                    'word_sense_id': sense.id,
+                    'lemma': sense.lemma,
+                    'pos': sense.pos,
+                    'effective_cefr_level': sense.effective_cefr_level,
+                    'definition': sense.definition,
+                    'suggestions': [],
+                }
+            grouped[key]['suggestions'].append(serialize_suggestion(suggestion))
+
+        return jsonify({'words': list(grouped.values())}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/word-suggestions/<int:suggestion_id>/approve', methods=['POST'])
+def approve_word_suggestion(suggestion_id):
+    try:
+        if not is_super_admin():
+            return jsonify({'message': 'Super admin access required'}), 403
+
+        suggestion = WordSenseSuggestion.query.get(suggestion_id)
+        if not suggestion or suggestion.status != STATUS_PENDING:
+            return jsonify({'message': 'No pending suggestion with that id'}), 404
+
+        sense = suggestion.word_sense
+        now = datetime.now()
+
+        if suggestion.suggestion_type == SUGGESTION_TYPE_CEFR:
+            if suggestion.suggested_cefr_level:
+                sense.cefr_override_level = suggestion.suggested_cefr_level
+                sense.cefr_override_note = suggestion.note
+            if suggestion.suggested_proper_noun_excluded is not None:
+                sense.proper_noun_excluded = suggestion.suggested_proper_noun_excluded
+            sense.cefr_override_by = current_user.id
+            sense.cefr_override_at = now
+        else:
+            if suggestion.suggested_definition is not None:
+                sense.definition = suggestion.suggested_definition
+            if suggestion.suggested_synonyms is not None:
+                sense.synonyms = suggestion.suggested_synonyms
+            if suggestion.suggested_example_sentence is not None:
+                sense.example_sentence = suggestion.suggested_example_sentence
+            sense.enrichment_updated_by = current_user.id
+            sense.enrichment_updated_at = now
+
+        suggestion.status = STATUS_APPROVED
+        suggestion.reviewed_by = current_user.id
+        suggestion.reviewed_at = now
+        suggestion.review_note = (request.get_json(silent=True) or {}).get('note')
+
+        siblings = WordSenseSuggestion.query.filter(
+            WordSenseSuggestion.word_sense_id == sense.id,
+            WordSenseSuggestion.suggestion_type == suggestion.suggestion_type,
+            WordSenseSuggestion.status == STATUS_PENDING,
+            WordSenseSuggestion.id != suggestion.id,
+        ).all()
+        for sibling in siblings:
+            sibling.status = STATUS_SUPERSEDED
+            sibling.reviewed_by = current_user.id
+            sibling.reviewed_at = now
+
+        db.session.commit()
+        commit_notification_event(notify_word_suggestion_reviewed, suggestion, sense, True)
+        return jsonify({
+            'message': 'Suggestion approved and applied.',
+            'word_sense': serialize_word_sense(sense),
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/word-suggestions/<int:suggestion_id>/reject', methods=['POST'])
+def reject_word_suggestion(suggestion_id):
+    try:
+        if not is_super_admin():
+            return jsonify({'message': 'Super admin access required'}), 403
+
+        suggestion = WordSenseSuggestion.query.get(suggestion_id)
+        if not suggestion or suggestion.status != STATUS_PENDING:
+            return jsonify({'message': 'No pending suggestion with that id'}), 404
+
+        data = request.get_json(silent=True) or {}
+        suggestion.status = STATUS_REJECTED
+        suggestion.reviewed_by = current_user.id
+        suggestion.reviewed_at = datetime.now()
+        suggestion.review_note = data.get('note')
+
+        db.session.commit()
+        sense = suggestion.word_sense
+        commit_notification_event(notify_word_suggestion_reviewed, suggestion, sense, False)
+        return jsonify({'message': 'Suggestion rejected.'}), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/settings', methods=['GET'])
+def get_platform_settings():
+    try:
+        if not is_super_admin():
+            return jsonify({'message': 'Super admin access required'}), 403
+
+        settings = PlatformSettings.get()
+        return jsonify({'require_dictionary_approval': settings.require_dictionary_approval}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+@admin.route('/settings', methods=['PUT'])
+def update_platform_settings():
+    try:
+        if not is_super_admin():
+            return jsonify({'message': 'Super admin access required'}), 403
+
+        data = request.get_json() or {}
+        settings = PlatformSettings.get()
+        if 'require_dictionary_approval' in data:
+            settings.require_dictionary_approval = bool(data['require_dictionary_approval'])
+            settings.updated_by = current_user.id
+            settings.updated_at = datetime.now()
+
+        db.session.commit()
+        return jsonify({'require_dictionary_approval': settings.require_dictionary_approval}), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+
+##---------reader achievement/progress visibility (admin-facing)----------
+
+def get_scoped_school_ids(school_id_filter=None):
+    """Mirrors get_scoped_book_ids's shape for schools: None means 'no
+    restriction' (super admin, no filter)."""
+    if is_super_admin():
+        return [school_id_filter] if school_id_filter else None
+
+    allowed = [m.shcool_id for m in User_shcool.query.filter_by(user_id=current_user.id).all()]
+    if school_id_filter:
+        return [school_id_filter] if school_id_filter in allowed else []
+    return allowed
+
+
+@admin.route('/reader-progress', methods=['GET'])
+def list_reader_progress():
+    try:
+        page, per_page = get_super_admin_pagination_params()
+        search = (request.args.get('search') or '').strip().lower()
+        school_id = request.args.get('school_id', type=int)
+
+        school_ids = get_scoped_school_ids(school_id)
+
+        query = Reader.query
+        if school_ids is not None:
+            reader_ids = [
+                m.user_id for m in User_shcool.query.filter(User_shcool.shcool_id.in_(school_ids)).all()
+            ]
+            query = query.filter(Reader.id.in_(reader_ids))
+        if search:
+            query = query.filter(or_(
+                Reader.username.like('%' + search + '%'),
+                Reader.email.like('%' + search + '%'),
+            ))
+
+        total = query.count()
+        readers = (
+            query.order_by(Reader.username)
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        return jsonify({
+            'items': [serialize_reader_progress(reader) for reader in readers],
+            'total': total,
+            'page': page,
+            'per_page': per_page,
+        }), 200
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 '''
 

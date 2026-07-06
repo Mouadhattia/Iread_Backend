@@ -47,8 +47,9 @@
 # For any inquiries or support, please contact the development team at <intellectgabes@gmail.com>.
 
 ## @file
-from flask import Flask
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_login import current_user, logout_user
 from config import ConfigClass
 from extensions import mail,login_manager,db
 from flask_migrate import Migrate
@@ -84,10 +85,28 @@ from apps.teacher.routes import teacher
 from apps.admin.routes import admin
 from apps.main.routes import main
 from apps.audiobooks.routes import admin_audiobooks, teacher_audiobooks, reader_audiobooks
+from apps.account_status import get_account_block_message
 
 @app.route('/')
 def home():
     return "<h3>Server is running...</h3>"
+
+## @brief Force-logs-out any already-authenticated session whose account or
+# school gets suspended mid-session — the login routes themselves reject a
+# fresh login attempt, but this catches sessions that were already valid
+# when the suspension happened.
+@app.before_request
+def enforce_active_account():
+    if request.method == 'OPTIONS':
+        return None
+    if not current_user.is_authenticated:
+        return None
+    block = get_account_block_message(current_user)
+    if block:
+        message, status = block
+        logout_user()
+        return jsonify({'message': message, 'code': 'ACCOUNT_INACTIVE'}), status
+    return None
 
 ## @brief Merge the 'admin','main' and 'auth' blueprints into the app (the application).
 app.register_blueprint(reader)
