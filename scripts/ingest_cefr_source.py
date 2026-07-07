@@ -13,17 +13,33 @@ levels already assigned by the A1-B2 file.
 Usage (from the Iread_Backend project root, with the venv active):
     python scripts/ingest_cefr_source.py --source "C:\\path\\to\\cefrj-vocabulary-profile-1.5.csv" --tag cefrj-1.5
     python scripts/ingest_cefr_source.py --source "C:\\path\\to\\octanove-vocabulary-profile-c1c2-1.0.csv" --tag octanove-c1c2-1.0 --dry-run
+
+To load against a database other than the one in config.py (e.g. production),
+pass --db-url. Always --dry-run first and check the printed target host before
+dropping --dry-run:
+    python scripts/ingest_cefr_source.py --source cefrj-vocabulary-profile-1.5.csv --tag cefrj-1.5 \\
+        --db-url "mysql://USER:PASSWORD@PROD_HOST:3306/iread" --dry-run
 """
 import argparse
 import csv
 import os
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import app
 from extensions import db
 from models.word_sense import WordSense
+
+
+def _masked(db_url):
+    """Host/db-name only, never the credentials, for the confirmation printout."""
+    parts = urlsplit(db_url)
+    netloc = parts.hostname or ''
+    if parts.port:
+        netloc += ':%d' % parts.port
+    return urlunsplit((parts.scheme, netloc, parts.path, '', ''))
 
 # Normalizes this CSV family's free-text POS labels onto spaCy's universal POS
 # tag set, so later book-ingestion (spaCy-tagged) lemma+POS lookups line up
@@ -108,7 +124,13 @@ def main():
     parser.add_argument('--source', required=True, help='Path to the CEFR CSV file')
     parser.add_argument('--tag', required=True, help='Source label to store in word_sense.cefr_source, e.g. cefrj-1.5')
     parser.add_argument('--dry-run', action='store_true', help='Preview counts without committing')
+    parser.add_argument('--db-url', help='Override config.py\'s SQLALCHEMY_DATABASE_URI, e.g. to target production')
     args = parser.parse_args()
+
+    if args.db_url:
+        app.config['SQLALCHEMY_DATABASE_URI'] = args.db_url
+
+    print('Target database: %s' % _masked(app.config['SQLALCHEMY_DATABASE_URI']))
 
     with app.app_context():
         ingest(args.source, args.tag, dry_run=args.dry_run)

@@ -947,7 +947,8 @@ def register_from_school_public_page(slug):
         confirmation_email = render_template(
             'confirmation_email_template.html',
             username=username,
-            confirm_link=confirm_link
+            confirm_link=confirm_link,
+            current_year=datetime.now().year
         )
         msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
         msg.html = confirmation_email
@@ -1101,7 +1102,8 @@ def register():
                 confirmation_token = generate_confirmed_token(email)
                 confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
                 confirmation_email = render_template('confirmation_email_template.html', username=username,
-                                                      confirm_link=confirm_link)
+                                                      confirm_link=confirm_link,
+                                                      current_year=datetime.now().year)
                 msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
                 msg.html = confirmation_email
                 mail.send(msg)
@@ -1218,7 +1220,7 @@ def resend_email_confirmation_link():
             username=user.username
             confirmation_token=generate_confirmed_token(email)
             confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
-            confirmation_email = render_template('confirmation_email_template.html', username=username, confirm_link=confirm_link)
+            confirmation_email = render_template('confirmation_email_template.html', username=username, confirm_link=confirm_link, current_year=datetime.now().year)
             msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
             msg.html = confirmation_email
             mail.send(msg)

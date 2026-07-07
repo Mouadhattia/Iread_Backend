@@ -359,7 +359,7 @@ def send_email():
         )
 
         # Build the email message body for the customer
-        customer_html_body = render_template('customer_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message)
+        customer_html_body = render_template('customer_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message, current_year=datetime.now().year)
 
         # Send the email to the customer
         customer_msg.html = customer_html_body
@@ -373,7 +373,7 @@ def send_email():
         )
 
         # Build the email message body for the admin
-        admin_html_body = render_template('admin_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message)
+        admin_html_body = render_template('admin_email_template.html', subject=subject, first_name=first_name, last_name=last_name, email=email, phone=phone, message=message, current_year=datetime.now().year)
 
         # Send the email to yourself
         admin_msg.html = admin_html_body
