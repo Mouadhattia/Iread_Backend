@@ -3672,63 +3672,65 @@ def create_user():
         # Check if the email already exists
         if User.query.filter_by(email=email).first():
             return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
-        else:
-            # Hash the password
-            password_hash = bcrypt.generate_password_hash(password)
-             #Create a new user in quiz api
-            quiz_user ={
-                'app':f'{ConfigClass.QUIZ_API_KEY}'
-            }
-            invoicing_client ={
-                'appId':f'{ConfigClass.INVOICING_API_KEY}'
-            }
-            invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create', json=invoicing_client)  
-            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
 
-            if response.status_code == 201 and invoicing_response.status_code==201:
-                quiz_id = response.json()['_id']
-                client_id = invoicing_response.json()['_id']
-                
-                # Create a new user
-                new_user = Reader(
-                    img=img,
-                    username=username,
-                    email=email,
-                    password_hashed=password_hash,
-                    created_at=datetime.now(),
-                    confirmed=True,
-                    quiz_id=quiz_id,
-                    client_id_invoicing_api=client_id
-                    )
+        # Resolve the current admin's school before creating anything, so a missing
+        # school assignment never leaves behind a reader with no school link.
+        shcool = User_shcool.query.filter_by(user_id=current_user.id).first()
+        if not shcool:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
 
-                # Add the user to the database
-                db.session.add(new_user)
-                db.session.commit()
-                shcool=  User_shcool.query.filter_by(user_id=current_user.id).first()
-                if not shcool:
-                    return jsonify({'message': 'Current admin has no school assigned'}), 403
-                new_user_shcool = User_shcool(
-                  user_id = new_user.id,
-                  shcool_id = shcool.shcool_id
-                )
-                db.session.add(new_user_shcool)
-                db.session.commit()
+        # Hash the password
+        password_hash = bcrypt.generate_password_hash(password)
+         #Create a new user in quiz api
+        quiz_user ={
+            'app':f'{ConfigClass.QUIZ_API_KEY}'
+        }
+        invoicing_client ={
+            'appId':f'{ConfigClass.INVOICING_API_KEY}'
+        }
+        invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create', json=invoicing_client)
+        response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)
 
-            # Return a success response
-            response_data = {
-                'message': 'Your account has been successfully created.',
-                'user': {
-                    'username': username,
-                    'email': email,
-                    'confirmed': new_user.confirmed,
-                    'id': new_user.id,
-                    'img':new_user.img,
-                    'quiz_id':new_user.quiz_id
-                  
-                }
+        if response.status_code != 201 or invoicing_response.status_code != 201:
+            return jsonify({'message': 'Error creation Quiz account'}), 400
+
+        quiz_id = response.json()['_id']
+        client_id = invoicing_response.json()['_id']
+
+        # Create a new user
+        new_user = Reader(
+            img=img,
+            username=username,
+            email=email,
+            password_hashed=password_hash,
+            created_at=datetime.now(),
+            confirmed=True,
+            quiz_id=quiz_id,
+            client_id_invoicing_api=client_id
+            )
+        db.session.add(new_user)
+        db.session.flush()
+
+        # Same transaction as the reader itself, so the two can never diverge.
+        db.session.add(User_shcool(user_id=new_user.id, shcool_id=shcool.shcool_id))
+        db.session.commit()
+
+        # Return a success response
+        response_data = {
+            'message': 'Your account has been successfully created.',
+            'user': {
+                'username': username,
+                'email': email,
+                'confirmed': new_user.confirmed,
+                'id': new_user.id,
+                'img':new_user.img,
+                'quiz_id':new_user.quiz_id
+
             }
-            return jsonify(response_data), 201
+        }
+        return jsonify(response_data), 201
     except Exception as e:
+        db.session.rollback()
         print(e)
         # Handle exceptions and return an error response
         return jsonify({'message': 'Internal server error'}), 500
