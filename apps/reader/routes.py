@@ -896,13 +896,15 @@ def register_from_school_public_page(slug):
         username = data.get('username')
         email = data.get('email')
         password = data.get('password')
+        invitation_code_value = data.get('invitation_code')
 
         missing_fields = [
             field
             for field, value in {
                 'username': username,
                 'email': email,
-                'password': password
+                'password': password,
+                'invitation_code': invitation_code_value
             }.items()
             if not value or not str(value).strip()
         ]
@@ -911,6 +913,12 @@ def register_from_school_public_page(slug):
 
         username = str(username).strip()
         email = str(email).strip().lower()
+
+        invitation_code, invitation_error, invitation_status = get_valid_school_invitation(invitation_code_value)
+        if invitation_error:
+            return jsonify({'message': invitation_error}), invitation_status
+        if invitation_code.shcool_id != school.id:
+            return jsonify({'message': "This invitation code isn't valid for this school"}), 400
 
         if user_email_exist(email):
             return jsonify({'message': 'This email is already used. Please choose another'}), 409
@@ -939,7 +947,7 @@ def register_from_school_public_page(slug):
         iread_school = Shcool.query.filter_by(name='IRead').first()
         if iread_school:
             add_user_to_school(new_user.id, iread_school.id)
-        add_user_to_school(new_user.id, school.id)
+        redeem_school_invitation_for_user(invitation_code, new_user.id)
         db.session.commit()
 
         confirmation_token = generate_confirmed_token(email)
