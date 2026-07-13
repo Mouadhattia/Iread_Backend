@@ -3689,7 +3689,7 @@ def create_user():
             'appId':f'{ConfigClass.INVOICING_API_KEY}'
         }
         invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create', json=invoicing_client)
-        response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)
+        response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
 
         if response.status_code != 201 or invoicing_response.status_code != 201:
             return jsonify({'message': 'Error creation Quiz account'}), 400

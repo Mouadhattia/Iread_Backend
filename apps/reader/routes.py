@@ -926,7 +926,7 @@ def register_from_school_public_page(slug):
         quiz_user = {'app': f'{ConfigClass.QUIZ_API_KEY}'}
         invoicing_client = {'appId': f'{ConfigClass.INVOICING_API_KEY}'}
         invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create', json=invoicing_client)
-        response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)
+        response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
         if response.status_code != 201 or invoicing_response.status_code != 201:
             return jsonify({'message': 'Error creation Quiz account'}), 400
 
@@ -1090,8 +1090,8 @@ def register():
             invoicing_client ={
                 'appId':f'{ConfigClass.INVOICING_API_KEY}'
             }
-            invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create' , json=invoicing_client)  
-            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
+            invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create' , json=invoicing_client)
+            response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
             if response.status_code == 201 and invoicing_response.status_code==201:
                 quiz_id = response.json()['_id']
                 client_id = invoicing_response.json()['_id']
@@ -1163,7 +1163,7 @@ def google_register():
             quiz_user ={
                 'app':f'{ConfigClass.QUIZ_API_KEY}'
             }
-            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)  
+            response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
             if response.status_code == 201:
                 quiz_id = response.json()['_id']
                 # Create a new user in your Flask application
@@ -1510,7 +1510,7 @@ def create_account():
             quiz_user ={
                 'app':f'{ConfigClass.QUIZ_API_KEY}'
             }
-            response = requests.post(ConfigClass.QUIZ_API, json=quiz_user)
+            response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
             if response.status_code == 201:
                 quiz_id = response.json()['_id']
                 new_account = Reader(username=username, email=current_user.email, password_hashed=current_user.password_hashed, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id,is_primary=False,pin_hash=bcrypt.generate_password_hash(str(pin)))
