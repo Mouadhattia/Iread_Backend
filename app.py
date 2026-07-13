@@ -66,6 +66,12 @@ oauth = OAuth(app)
 ## @brief Configure the application using the configuration class from the config.py file.
 app.config.from_object(ConfigClass)
 
+## @brief Share the login session cookie across all *.iread.education
+# subdomains. Without this it defaults to host-only on api.iread.education,
+# so games.iread.education never receives it and every proxied call to
+# /reader/... (e.g. daily-challenge) 401s under @login_required.
+app.config['SESSION_COOKIE_DOMAIN'] = '.iread.education'
+
 ## @brief Initialize the email extension.
 mail.init_app(app)
 
