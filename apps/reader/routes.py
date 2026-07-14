@@ -2393,12 +2393,18 @@ def get_reader_session_video_call(session_id):
 @login_required
 def register_session():
     try:
-        token = request.json['id']    
+        school_id, school_error, school_status = resolve_current_user_school_id()
+        if school_error:
+            return jsonify({'message': school_error}), school_status
+
+        token = request.json['id']
         session_instance = db.session.query(Session).filter(Session.id == token).first()
         if session_instance:
-            print(current_user.id)
+            pack = get_pack_in_school(session_instance.pack_id, school_id)
+            if not pack:
+                return jsonify({'message': 'No session found'}), 404
             # Assuming session_instance.id is related to pack_id and book_id
-            follow_pack = Follow_pack.query.filter_by(pack_id=session_instance.pack_id, user_id=current_user.id).first()       
+            follow_pack = Follow_pack.query.filter_by(pack_id=session_instance.pack_id, user_id=current_user.id).first()
             if follow_pack and follow_pack.approved:
                 follows_count = Follow_session.query.filter_by(session_id=session_instance.id).count()
                 if session_instance.capacity> follows_count:
