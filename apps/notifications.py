@@ -20,6 +20,9 @@ TYPE_ICONS = {
     'session_created': 'fe fe-calendar',
     'session_updated': 'fe fe-calendar',
     'session_deleted': 'fe fe-calendar',
+    'session_follow_approved': 'fe fe-check-circle',
+    'online_session_follow_approved': 'fe fe-check-circle',
+    'pack_follow_approved': 'fe fe-check-circle',
     'daily_game': 'fe fe-play-circle',
     'pack_book_added': 'fe fe-book-open',
     'school_pack_created': 'fe fe-layers',
@@ -51,19 +54,52 @@ def _session_school_id(session):
     return _school_id_for_pack(pack)
 
 
-def _notification_link(pack_id=None, session_id=None, book_id=None, game_type=None):
-    if session_id:
-        return '/student/dashboard'
-    if game_type and book_id:
-        return f'/student/games?book_id={book_id}&game={game_type}'
+ONLINE_SESSION_TYPES = (
+    'online_session_created', 'online_session_updated', 'online_session_follow_approved'
+)
+SESSION_TYPES = ONLINE_SESSION_TYPES + ('session_created', 'session_updated', 'session_follow_approved')
+
+
+def _notification_link(notification_type, pack_id=None, session_id=None, book_id=None, game_type=None):
+    pack_query = f'?pack_id={pack_id}' if pack_id else ''
+
+    if notification_type in ONLINE_SESSION_TYPES and book_id and session_id:
+        return f'/student/online_session/{book_id}?session_id={session_id}'
+
+    if notification_type in SESSION_TYPES or notification_type == 'session_deleted':
+        if book_id:
+            return f'/student/book-details/{book_id}{pack_query}'
+        return '/student/student-sessions'
+
+    if notification_type == 'daily_game' and book_id:
+        return f'/games/{book_id}'
+
+    if notification_type == 'pack_book_added' and book_id:
+        return f'/student/book-details/{book_id}{pack_query}'
+
+    if notification_type == 'school_pack_created' and pack_id:
+        return f'/student/pack-books/{pack_id}'
+
     if pack_id:
-        return f'/student/pack-details/{pack_id}'
-    return '/student/dashboard'
+        return f'/student/pack-books/{pack_id}'
+
+    return None
 
 
 def serialize_reader_notification(notification):
     created_at = notification.created_at.isoformat() if notification.created_at else None
     read = notification.read_at is not None
+    # Recomputed from the stored type/pack_id/session_id/book_id/game_type rather than trusting
+    # notification.link as-is, so notifications created before a route mapping fix self-heal on
+    # read instead of staying dead links forever (falls back to the stored value for notification
+    # types _notification_link doesn't recognize, e.g. staff-facing word-suggestion links).
+    computed_link = _notification_link(
+        notification.type,
+        pack_id=notification.pack_id,
+        session_id=notification.session_id,
+        book_id=notification.book_id,
+        game_type=notification.game_type,
+    )
     return {
         'id': notification.id,
         '_id': notification.id,
@@ -74,7 +110,7 @@ def serialize_reader_notification(notification):
         'title': notification.title,
         'message': notification.message,
         'desc': notification.message,
-        'link': notification.link,
+        'link': computed_link or notification.link,
         'pack_id': notification.pack_id,
         'session_id': notification.session_id,
         'book_id': notification.book_id,
@@ -186,12 +222,12 @@ def get_school_staff_ids(school_id):
     ]
 
 
-def get_all_school_staff_ids():
+def get_all_school_staff_ids(roles=('admin', 'teacher')):
     return [
         user_id for (user_id,) in
         db.session.query(User.id)
         .join(User_shcool, User_shcool.user_id == User.id)
-        .filter(User.type.in_(['admin', 'teacher']))
+        .filter(User.type.in_(roles))
         .distinct()
         .all()
     ]
@@ -288,7 +324,7 @@ def notify_school_pack_created(pack):
         'school_pack_created',
         'New reading pack',
         f'{pack.title} is now available in your school.',
-        link=_notification_link(pack_id=pack.id),
+        link=_notification_link('school_pack_created', pack_id=pack.id),
         school_id=school_id,
         pack_id=pack.id,
         dedupe_key=f'school-pack-created:{pack.id}'
@@ -296,14 +332,29 @@ def notify_school_pack_created(pack):
 
 
 def notify_global_pack_created(pack):
+    # Admins and teachers land on different dashboards, so each role needs its own
+    # destination — /admin/global-packs only exists for admins, and there is no
+    # teacher-facing global-packs page today, so teachers fall back to their dashboard home.
+    title = 'New IRead global pack'
+    message = f'IRead published a global pack: {pack.title}.'
+    dedupe_key = f'global-pack-created:{pack.id}'
     create_notifications_for_users(
-        get_all_school_staff_ids(),
+        get_all_school_staff_ids(roles=('admin',)),
         'global_pack_created',
-        'New IRead global pack',
-        f'IRead published a global pack: {pack.title}.',
-        link='/global-packs',
+        title,
+        message,
+        link='/admin/global-packs',
         pack_id=pack.id,
-        dedupe_key=f'global-pack-created:{pack.id}'
+        dedupe_key=dedupe_key
+    )
+    create_notifications_for_users(
+        get_all_school_staff_ids(roles=('teacher',)),
+        'global_pack_created',
+        title,
+        message,
+        link='/teacher-dashboard/sessions',
+        pack_id=pack.id,
+        dedupe_key=dedupe_key
     )
 
 
@@ -317,7 +368,7 @@ def notify_book_added_to_pack(pack, book):
         'pack_book_added',
         'New book in your pack',
         f'{book.title} was added to {pack.title}.',
-        link=_notification_link(pack_id=pack.id, book_id=book.id),
+        link=_notification_link('pack_book_added', pack_id=pack.id, book_id=book.id),
         school_id=school_id,
         pack_id=pack.id,
         book_id=book.id,
@@ -332,12 +383,15 @@ def notify_session_created(session):
     message = f'{session.name} was added to your reading schedule.'
     if online:
         message = f'{session.name} is online and ready for video call access.'
+    notification_type = 'online_session_created' if online else 'session_created'
     create_notifications_for_users(
         get_session_audience_ids(session),
-        'online_session_created' if online else 'session_created',
+        notification_type,
         title,
         message,
-        link=_notification_link(pack_id=session.pack_id, session_id=session.id),
+        link=_notification_link(
+            notification_type, pack_id=session.pack_id, session_id=session.id, book_id=session.book_id
+        ),
         school_id=_session_school_id(session),
         pack_id=session.pack_id,
         session_id=session.id,
@@ -357,7 +411,9 @@ def notify_session_updated(session, became_online=False):
         notification_type,
         title,
         message,
-        link=_notification_link(pack_id=session.pack_id, session_id=session.id),
+        link=_notification_link(
+            notification_type, pack_id=session.pack_id, session_id=session.id, book_id=session.book_id
+        ),
         school_id=_session_school_id(session),
         pack_id=session.pack_id,
         session_id=session.id,
@@ -371,12 +427,51 @@ def notify_session_deleted(session_data, user_ids):
         'session_deleted',
         'Session removed',
         f"{session_data.get('name', 'A session')} was removed from your schedule.",
-        link=_notification_link(pack_id=session_data.get('pack_id')),
+        link=_notification_link(
+            'session_deleted', pack_id=session_data.get('pack_id'), book_id=session_data.get('book_id')
+        ),
         school_id=session_data.get('school_id'),
         pack_id=session_data.get('pack_id'),
         session_id=None,
         book_id=session_data.get('book_id'),
         payload={'deleted_session_id': session_data.get('id')}
+    )
+
+
+def notify_pack_follow_approved(pack, user_id):
+    create_notifications_for_users(
+        [user_id],
+        'pack_follow_approved',
+        'Pack request approved',
+        f'You now have access to {pack.title}.',
+        link=_notification_link('pack_follow_approved', pack_id=pack.id),
+        school_id=pack.shcool_id,
+        pack_id=pack.id,
+        dedupe_key=f'pack-follow-approved:{pack.id}:{user_id}'
+    )
+
+
+def notify_session_follow_approved(session, user_id):
+    location_value = getattr(session.location, 'value', session.location)
+    online = location_value == 'online'
+    notification_type = 'online_session_follow_approved' if online else 'session_follow_approved'
+    title = 'Online session approved' if online else 'Session approved'
+    message = f'You are approved for {session.name}.'
+    if online:
+        message = f'You are approved for {session.name} — the video call is ready to join.'
+    create_notifications_for_users(
+        [user_id],
+        notification_type,
+        title,
+        message,
+        link=_notification_link(
+            notification_type, pack_id=session.pack_id, session_id=session.id, book_id=session.book_id
+        ),
+        school_id=_session_school_id(session),
+        pack_id=session.pack_id,
+        session_id=session.id,
+        book_id=session.book_id,
+        dedupe_key=f'session-follow-approved:{session.id}:{user_id}'
     )
 
 
@@ -442,7 +537,7 @@ def notify_daily_game_created(school_id, book, game_type, play_date):
         'daily_game',
         'New daily game',
         f'{game_type.replace("-", " ").title()} is ready for {book.title}.',
-        link=_notification_link(book_id=book.id, game_type=game_type),
+        link=_notification_link('daily_game', book_id=book.id, game_type=game_type),
         school_id=school_id,
         book_id=book.id,
         game_type=game_type,

@@ -107,9 +107,11 @@ from apps.notifications import (
     notify_book_added_to_pack,
     notify_daily_game_created,
     notify_global_pack_created,
+    notify_pack_follow_approved,
     notify_school_pack_created,
     notify_session_created,
     notify_session_deleted,
+    notify_session_follow_approved,
     notify_session_updated,
     notify_word_suggestion_reviewed,
     notify_word_suggestion_submitted,
@@ -6406,6 +6408,10 @@ def approve_follow_request():
         follow_request.approved = True
         db.session.commit()  # Assuming you're using SQLAlchemy and have a database session.
 
+        pack = Pack.query.get(pack_id)
+        if pack:
+            commit_notification_event(notify_pack_follow_approved, pack, user_id)
+
         return jsonify({'message': 'Follow request approved'}), 200
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
@@ -6709,6 +6715,10 @@ def approve_session_follow_request():
         # Update the 'approved' attribute to True.
         follow_request.approved = True
         db.session.commit()  # Assuming you're using SQLAlchemy and have a database session.
+
+        session_instance = Session.query.get(session_id)
+        if session_instance:
+            commit_notification_event(notify_session_follow_approved, session_instance, user_id)
 
         return jsonify({'message': 'Follow request approved'}), 200
     except Exception as e:
