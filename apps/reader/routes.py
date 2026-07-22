@@ -1635,6 +1635,10 @@ def create_parent_account():
             return jsonify({'message': error_message}), error_status
 
         db.session.commit()
+        # The Parent row is a distinct login session from the Reader that
+        # spawned it -- without this, the browser stays authenticated as the
+        # Reader and every Parent-only route/endpoint bounces it away.
+        login_user(new_parent)
         return jsonify({'message': 'Parent account created', 'parent': {'username': new_parent.username}}), 201
     except Exception as error:
         db.session.rollback()
@@ -1665,6 +1669,10 @@ def complete_account_setup():
 
         current_user.account_setup_complete = True
         db.session.commit()
+        # Switch the active session to the newly-created Parent -- otherwise
+        # the browser stays logged in as the Reader that answered the prompt
+        # and can never reach /parent/dashboard or any parent-only route.
+        login_user(new_parent)
         return jsonify({'message': 'Parent account created', 'account_type': 'both'}), 200
     except Exception as error:
         db.session.rollback()
