@@ -33,6 +33,11 @@ class User(db.Model, UserMixin):
     suspended_at = db.Column(db.DateTime, nullable=True)
     suspended_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     suspended_reason = db.Column(db.String(500), nullable=True)
+    # Whether this reader has answered the "who is this account for?" prompt
+    # shown after their first login. Existing rows are backfilled True by the
+    # migration (nothing to ask them); only freshly self-registered readers
+    # default to False. Irrelevant for non-reader roles.
+    account_setup_complete = db.Column(db.Boolean, nullable=False, default=False)
 
     __mapper_args__ = {
         'polymorphic_on': type,

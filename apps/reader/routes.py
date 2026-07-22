@@ -334,6 +334,15 @@ def set_default_school_for_user(user_id, school_id):
     User_shcool.query.filter_by(user_id=user_id, shcool_id=school_id).update({'is_default': True})
     return True
 
+## @brief Derive a Parent's username from the reader it's created alongside/from.
+#
+# The Parent row would otherwise carry the exact same username as the first
+# Reader, which makes the two profiles indistinguishable in every UI that
+# lists accounts by username (switch-profile grid, dashboards, etc).
+def derive_parent_username(base_username):
+    suffix = ' (Parent)'
+    return f'{(base_username or "").strip()[:64 - len(suffix)]}{suffix}'
+
 ## @brief Create the Parent and/or Reader row(s) for a new household registration.
 #
 # account_type controls which rows get created: 'reader' (default, preserves the
@@ -365,7 +374,7 @@ def create_household_accounts(username, email, password, account_type='reader', 
         if invoicing_response.status_code != 201:
             return None, None, 'Error creating billing account', 400
         parent = Parent(
-            username=username, email=email, password_hashed=password_hash,
+            username=derive_parent_username(username), email=email, password_hashed=password_hash,
             created_at=datetime.now(), is_primary=False,
             pin_hash=bcrypt.generate_password_hash(str(parent_pin)),
             client_id_invoicing_api=invoicing_response.json()['_id']
@@ -391,12 +400,52 @@ def create_household_accounts(username, email, password, account_type='reader', 
             username=username, email=email, password_hashed=password_hash,
             created_at=datetime.now(), quiz_id=quiz_response.json()['_id'],
             is_primary=True, parent_id=parent.id if parent else None,
-            client_id_invoicing_api=reader_client_id
+            client_id_invoicing_api=reader_client_id,
+            # If a Parent was created alongside, the "who is this account for?"
+            # decision is already made -- no need to prompt after first login.
+            account_setup_complete=bool(parent)
         )
         db.session.add(reader)
         db.session.flush()
 
     return reader, parent, None, None
+
+## @brief Create a Parent row for an existing primary Reader's household and link them.
+#
+# Used both by the standalone "add a parent account" action (from an already
+# set-up household) and by the first-login "who is this account for?" prompt
+# answered later, once the Reader already exists. Does not commit -- the
+# caller commits so it can be combined with other writes (e.g. flipping
+# account_setup_complete) in one transaction.
+# Returns (parent_or_None, error_message_or_None, error_status_or_None).
+def upgrade_reader_to_parent(reader_user, parent_pin):
+    if reader_user.type != 'reader' or not reader_user.is_primary or reader_user.parent_id is not None:
+        return None, 'A parent account is not applicable for this profile', 400
+    if not parent_pin or not str(parent_pin).isdigit() or len(str(parent_pin)) != 4:
+        return None, 'A 4-digit PIN is required for the parent account', 400
+
+    invoicing_response = requests.post(
+        f'{ConfigClass.INVOICING_API}/client/create',
+        json={'appId': f'{ConfigClass.INVOICING_API_KEY}'}
+    )
+    if invoicing_response.status_code != 201:
+        return None, 'Error creating billing account', 400
+
+    new_parent = Parent(
+        username=derive_parent_username(reader_user.username), email=reader_user.email,
+        password_hashed=reader_user.password_hashed, created_at=datetime.now(),
+        confirmed=True, approved=True, is_primary=False,
+        pin_hash=bcrypt.generate_password_hash(str(parent_pin)),
+        client_id_invoicing_api=invoicing_response.json()['_id'],
+        account_setup_complete=True
+    )
+    db.session.add(new_parent)
+    db.session.flush()
+
+    reader_user.parent_id = new_parent.id
+    reader_user.account_setup_complete = True
+
+    return new_parent, None, None
 
 def get_valid_school_invitation(code):
     normalized_code = normalize_invitation_code(code)
@@ -1576,37 +1625,47 @@ def select_account():
 @login_required
 def create_parent_account():
     try:
-        if current_user.type != 'reader' or not current_user.is_primary or current_user.parent_id is not None:
-            return jsonify({'message': 'A parent account is not applicable for this profile'}), 400
-
         password = request.json.get('password')
         pin = request.json.get('pin')
         if not bcrypt.check_password_hash(current_user.password_hashed, password):
             return jsonify({'message': 'Invalid password'}), 400
-        if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
-            return jsonify({'message': 'A 4-digit PIN is required for the parent account'}), 400
 
-        invoicing_response = requests.post(
-            f'{ConfigClass.INVOICING_API}/client/create',
-            json={'appId': f'{ConfigClass.INVOICING_API_KEY}'}
-        )
-        if invoicing_response.status_code != 201:
-            return jsonify({'message': 'Error creating billing account'}), 400
+        new_parent, error_message, error_status = upgrade_reader_to_parent(current_user, pin)
+        if error_message:
+            return jsonify({'message': error_message}), error_status
 
-        new_parent = Parent(
-            username=current_user.username, email=current_user.email,
-            password_hashed=current_user.password_hashed, created_at=datetime.now(),
-            confirmed=True, approved=True, is_primary=False,
-            pin_hash=bcrypt.generate_password_hash(str(pin)),
-            client_id_invoicing_api=invoicing_response.json()['_id']
-        )
-        db.session.add(new_parent)
-        db.session.flush()
-
-        current_user.parent_id = new_parent.id
         db.session.commit()
-
         return jsonify({'message': 'Parent account created', 'parent': {'username': new_parent.username}}), 201
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+## @brief Answer the "who is this account for?" prompt shown after a reader's first login.
+#
+# This is the primary way a household ends up with a Parent account now --
+# account_type/parent_pin are no longer collected at signup, only here, once
+# the Reader created by /register already exists. wants_parent=false just
+# clears the prompt; wants_parent=true creates the Parent via the same
+# upgrade_reader_to_parent path used by the standalone /create_parent_account.
+@reader.route('/complete_account_setup', methods=['POST'])
+@login_required
+def complete_account_setup():
+    try:
+        wants_parent = bool(request.json.get('wants_parent'))
+
+        if not wants_parent:
+            current_user.account_setup_complete = True
+            db.session.commit()
+            return jsonify({'message': 'Account setup completed', 'account_type': 'reader'}), 200
+
+        parent_pin = request.json.get('parent_pin')
+        new_parent, error_message, error_status = upgrade_reader_to_parent(current_user, parent_pin)
+        if error_message:
+            return jsonify({'message': error_message}), error_status
+
+        current_user.account_setup_complete = True
+        db.session.commit()
+        return jsonify({'message': 'Parent account created', 'account_type': 'both'}), 200
     except Exception as error:
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
@@ -1621,25 +1680,15 @@ def create_account():
         pin = request.json.get('pin')
         requested_school_id = request.json.get('school_id')
 
-        is_parent = current_user.type == 'parent'
-        # Back-compat: a household that hasn't upgraded to a Parent account
-        # yet can still add siblings the original way, as its primary Reader.
-        is_legacy_primary = current_user.type == 'reader' and current_user.is_primary and current_user.parent_id is None
+        # Only a Parent account can create a child Reader profile -- a
+        # household with no Parent yet must create one first (see
+        # /create_parent_account, /complete_account_setup).
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can add a child profile. Set up a parent account first.'}), 403
 
-        if not is_parent and not is_legacy_primary:
-            return jsonify({'message': 'Only a parent account can add a child profile'}), 403
-
-        accounts = User.query.filter_by(email=current_user.email).all()
-        existing_children = [account for account in accounts if account.type == 'reader']
-
-        if is_parent:
-            if len(existing_children) >= 3:
-                return jsonify({'message':'You reached the maximum number of children (3)'}) ,400
-        else:
-            if len(accounts) >= 3 :
-                return jsonify({'message':'You reached the maximum number of accounts (3)'}) ,400
-            if not current_user.pin_hash:
-                return jsonify({'message':'Set a PIN for your account before adding another profile'}),400
+        existing_children = Reader.query.filter_by(parent_id=current_user.id).all()
+        if len(existing_children) >= 3:
+            return jsonify({'message':'You reached the maximum number of children (3)'}) ,400
 
         if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
             return jsonify({'message':'A 4-digit PIN is required for this profile'}),400
@@ -1663,7 +1712,9 @@ def create_account():
             username=username, email=current_user.email, password_hashed=current_user.password_hashed,
             created_at=datetime.now(), confirmed=True, approved=True, quiz_id=quiz_id,
             is_primary=False, pin_hash=bcrypt.generate_password_hash(str(pin)),
-            parent_id=current_user.id if is_parent else None
+            parent_id=current_user.id,
+            # Not the first login of a self-registered household -- no prompt needed.
+            account_setup_complete=True
         )
         db.session.add(new_account)
         db.session.flush()
@@ -1714,6 +1765,45 @@ def get_children():
         } for child in children]
         return jsonify({'children': childrenData}), 200
     except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+## @brief Let a Parent enroll one of their children in a new school.
+#
+# Unlike /set_default_school (which only picks a default among schools the
+# child already belongs to), this actually joins the child to a school they
+# aren't a member of yet -- the reader-side /join_school equivalent, but
+# performed by the Parent on the child's behalf. The newly joined school
+# becomes that child's default automatically, per add_user_to_school.
+@reader.route('/assign_child_school', methods=['POST'])
+@login_required
+def assign_child_school():
+    try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can assign a school'}), 403
+
+        data = request.get_json(silent=True) or {}
+        child_user_id = data.get('child_user_id')
+        school_id = data.get('school_id')
+        if not child_user_id or not school_id:
+            return jsonify({'message': 'child_user_id and school_id are required'}), 400
+
+        child = Reader.query.filter_by(id=child_user_id, parent_id=current_user.id).first()
+        if not child:
+            return jsonify({'message': 'Child not found for this parent'}), 404
+
+        school = Shcool.query.get(int(school_id))
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        added = add_user_to_school(child.id, school.id)
+        db.session.commit()
+        return jsonify({
+            'message': 'School assigned' if added else 'Child was already a member of that school',
+            'schools': get_user_schools(child.id),
+            'default_school_id': get_default_school(child.id)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 ## @brief Let a Parent change which school is the default for one of their children.
@@ -1834,7 +1924,8 @@ def user_authenticated():
                     'default_school_id': get_default_school(current_user.id),
                     'is_primary': current_user.is_primary,
                     'has_pin': bool(current_user.pin_hash),
-                    'must_change_password': bool(current_user.must_change_password)
+                    'must_change_password': bool(current_user.must_change_password),
+                    'needs_account_setup': current_user.type == 'reader' and not bool(current_user.account_setup_complete)
                 })
     except Exception as e:     
         return jsonify({'error': str(e), 'message': 'Internal server error'})
@@ -2274,7 +2365,7 @@ def forget_password():
             return jsonify({'message':' There is no account with this email'}),404
         else:
             confirmation_token=generate_confirmed_token(email)
-            confirm_link = f"{ConfigClass.API_URL}/reader/password_reset/{confirmation_token}"
+            confirm_link = f"{ConfigClass.FRONT_URL}/authentication/reset-password/{confirmation_token}"
             #confirmation_email = render_template('proof_your_identity.html',confirm_link=confirm_link)
             msg = Message('Proof your identity', recipients=[email],sender=ConfigClass.MAIL_USERNAME)
             msg.body=confirm_link
@@ -2474,12 +2565,17 @@ def set_password():
         print(error)
         return jsonify({'message':'something wrong please try  later'}), 500
 
-# Sets or changes the PIN used to unlock this specific profile when switching
-# between the linked accounts under the same email (Netflix-profile style gate).
+# Sets or changes the current Parent's own PIN, used to unlock the Parent
+# profile when switching between the linked accounts under the same email
+# (Netflix-profile style gate). PIN management for a *child* Reader is done
+# by the Parent instead, via /set_child_pin -- readers no longer self-serve.
 @reader.route('/set_pin',methods=['POST'])
 @login_required
 def set_pin():
     try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can change its own PIN'}), 403
+
         password=request.json['password']
         pin=request.json['pin']
 
@@ -2489,15 +2585,51 @@ def set_pin():
         if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
             return jsonify({'message':'PIN must be exactly 4 digits'}),400
 
-        user=User.query.filter_by(email=current_user.email,username=current_user.username).first()
-        user.pin_hash=bcrypt.generate_password_hash(str(pin))
-        user.pin_failed_attempts=0
-        user.pin_locked_until=None
+        current_user.pin_hash=bcrypt.generate_password_hash(str(pin))
+        current_user.pin_failed_attempts=0
+        current_user.pin_locked_until=None
         db.session.commit()
-        return jsonify({'message':f'{user.username} you have set your PIN'}),200
+        return jsonify({'message':f'{current_user.username} you have set your PIN'}),200
     except Exception as error:
         print(error)
         return jsonify({'message':'something wrong please try later'}),500
+
+## @brief Let a Parent set or change a specific child's PIN.
+#
+# Requires the Parent's own household password (same confirmation pattern as
+# /create_account and /create_parent_account) rather than the child's PIN,
+# since the whole point is recovering/managing a PIN the child may have
+# forgotten or that the parent wants to rotate.
+@reader.route('/set_child_pin', methods=['POST'])
+@login_required
+def set_child_pin():
+    try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can manage a child PIN'}), 403
+
+        password = request.json.get('password')
+        pin = request.json.get('pin')
+        child_user_id = request.json.get('child_user_id')
+
+        if not bcrypt.check_password_hash(current_user.password_hashed, password):
+            return jsonify({'message': 'Invalid password'}), 400
+        if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
+            return jsonify({'message': 'PIN must be exactly 4 digits'}), 400
+
+        child = Reader.query.filter_by(id=child_user_id, parent_id=current_user.id).first()
+        if not child:
+            return jsonify({'message': 'Child not found for this parent'}), 404
+        if child.is_primary:
+            return jsonify({'message': 'The first reader profile does not use a PIN'}), 400
+
+        child.pin_hash = bcrypt.generate_password_hash(str(pin))
+        child.pin_failed_attempts = 0
+        child.pin_locked_until = None
+        db.session.commit()
+        return jsonify({'message': f'PIN updated for {child.username}'}), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @reader.route('/set_image',methods=['POST'])
 @login_required
