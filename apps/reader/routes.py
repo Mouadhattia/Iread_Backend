@@ -1933,7 +1933,15 @@ def user_authenticated():
                     'is_primary': current_user.is_primary,
                     'has_pin': bool(current_user.pin_hash),
                     'must_change_password': bool(current_user.must_change_password),
-                    'needs_account_setup': current_user.type == 'reader' and not bool(current_user.account_setup_complete)
+                    'needs_account_setup': current_user.type == 'reader' and not bool(current_user.account_setup_complete),
+                    # Whether this profile can still spin up a Parent account
+                    # later (e.g. after declining at first login) -- same
+                    # eligibility check as upgrade_reader_to_parent.
+                    'can_create_parent': (
+                        current_user.type == 'reader'
+                        and current_user.is_primary
+                        and current_user.parent_id is None
+                    )
                 })
     except Exception as e:     
         return jsonify({'error': str(e), 'message': 'Internal server error'})
