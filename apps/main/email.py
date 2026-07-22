@@ -34,12 +34,17 @@ def reader_confirm_token(token):
         data=s.loads(token.encode('utf-8'),max_age=1200)
     except Exception:
         return False
-    reader=Reader.query.filter_by(email=data.get('confirm')).first()
-    if reader:
-        reader.confirmed = True
-        reader.approved = True
+    email = data.get('confirm')
+    # A household's Parent + first Reader are created together at signup and
+    # share one email; confirming the link must confirm every row for that
+    # email, not just the first Reader, or the Parent profile stays locked out.
+    users = User.query.filter_by(email=email).all()
+    if users:
+        for user in users:
+            user.confirmed = True
+            user.approved = True
         db.session.commit()
-        return data.get('confirm')
+        return email
     else:
         return False
 

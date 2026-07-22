@@ -63,10 +63,30 @@ class Reader(User):
     id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
     level=db.Column(db.String(10),nullable=True)
     client_id_invoicing_api =db.Column(db.String(100), nullable=True)
-    __mapper_args__ = {'polymorphic_identity': 'reader'}
-    
+    # Points at the owning Parent's User.id -- a second FK to 'user.id' besides
+    # the inheritance PK above, so the STI join condition must be disambiguated
+    # explicitly or SQLAlchemy can't tell which FK links reader -> user.
+    parent_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    __mapper_args__ = {
+        'polymorphic_identity': 'reader',
+        'inherit_condition': (id == User.id)
+    }
+
     def __repr__(self):
         return '<Reader %s>' % self.username
+
+
+##
+# @brief Class representing a parent user who manages one or more Reader (child) accounts.
+#
+class Parent(User):
+    __tablename__ = "parent"
+    id = db.Column(db.Integer, db.ForeignKey('user.id'), primary_key=True)
+    client_id_invoicing_api = db.Column(db.String(100), nullable=True)
+    __mapper_args__ = {'polymorphic_identity': 'parent'}
+
+    def __repr__(self):
+        return '<Parent %s>' % self.username
 
 
 ##

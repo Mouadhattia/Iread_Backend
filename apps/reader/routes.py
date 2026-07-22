@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import os
 from flask import Blueprint,request,jsonify,render_template, redirect,make_response,session,send_file
 from flask_bcrypt import Bcrypt
-from models.user import User,Reader,Teacher,Admin,SuperAdmin
+from models.user import User,Reader,Teacher,Admin,SuperAdmin,Parent
 from models.game_result import Game_result, GameEnum
 from models.teacher_postulate import Teacher_postulate
 from models.pack import Pack
@@ -303,7 +303,8 @@ def normalize_invitation_code(code):
 def add_user_to_school(user_id, school_id):
     if User_shcool.query.filter_by(user_id=user_id, shcool_id=school_id).first():
         return False
-    db.session.add(User_shcool(user_id=user_id, shcool_id=school_id))
+    User_shcool.query.filter_by(user_id=user_id).update({'is_default': False})
+    db.session.add(User_shcool(user_id=user_id, shcool_id=school_id, joined_at=datetime.now(), is_default=True))
     return True
 
 def get_user_schools(user_id):
@@ -314,6 +315,88 @@ def get_user_schools(user_id):
         if school:
             schools.append({'id': school.id, 'name': school.name})
     return schools
+
+## @brief Resolve the school a reader/child should land on by default.
+#
+# Prefers an explicit is_default membership, otherwise falls back to the
+# most recently joined school.
+def get_default_school(user_id):
+    default_membership = User_shcool.query.filter_by(user_id=user_id, is_default=True).first()
+    if not default_membership:
+        default_membership = User_shcool.query.filter_by(user_id=user_id).order_by(User_shcool.joined_at.desc()).first()
+    return default_membership.shcool_id if default_membership else None
+
+## @brief Set which school is the default for a given child, on behalf of their parent.
+def set_default_school_for_user(user_id, school_id):
+    if not user_belongs_to_school(user_id, school_id):
+        return False
+    User_shcool.query.filter_by(user_id=user_id).update({'is_default': False})
+    User_shcool.query.filter_by(user_id=user_id, shcool_id=school_id).update({'is_default': True})
+    return True
+
+## @brief Create the Parent and/or Reader row(s) for a new household registration.
+#
+# account_type controls which rows get created: 'reader' (default, preserves the
+# original single-reader signup exactly), 'parent' (parent only, children added
+# later from the Parent Dashboard), or 'both' (parent + first child together).
+# The Parent, when created, owns the household's invoicing client id; a lone
+# Reader (no parent) keeps it on itself, exactly like today.
+# Returns (reader_or_None, parent_or_None, error_message_or_None, error_status_or_None).
+def create_household_accounts(username, email, password, account_type='reader', parent_pin=None):
+    account_type = (account_type or 'reader').strip().lower()
+    if account_type not in ('reader', 'parent', 'both'):
+        return None, None, 'account_type must be one of reader, parent, both', 400
+
+    wants_parent = account_type in ('parent', 'both')
+    wants_reader = account_type in ('reader', 'both')
+
+    if wants_parent:
+        if not parent_pin or not str(parent_pin).isdigit() or len(str(parent_pin)) != 4:
+            return None, None, 'A 4-digit PIN is required for the parent account', 400
+
+    password_hash = bcrypt.generate_password_hash(password)
+
+    parent = None
+    if wants_parent:
+        invoicing_response = requests.post(
+            f'{ConfigClass.INVOICING_API}/client/create',
+            json={'appId': f'{ConfigClass.INVOICING_API_KEY}'}
+        )
+        if invoicing_response.status_code != 201:
+            return None, None, 'Error creating billing account', 400
+        parent = Parent(
+            username=username, email=email, password_hashed=password_hash,
+            created_at=datetime.now(), is_primary=False,
+            pin_hash=bcrypt.generate_password_hash(str(parent_pin)),
+            client_id_invoicing_api=invoicing_response.json()['_id']
+        )
+        db.session.add(parent)
+        db.session.flush()
+
+    reader = None
+    if wants_reader:
+        quiz_response = requests.post(f'{ConfigClass.QUIZ_API}user', json={'app': f'{ConfigClass.QUIZ_API_KEY}'})
+        if quiz_response.status_code != 201:
+            return None, None, 'Error creation Quiz account', 400
+        reader_client_id = None
+        if not parent:
+            invoicing_response = requests.post(
+                f'{ConfigClass.INVOICING_API}/client/create',
+                json={'appId': f'{ConfigClass.INVOICING_API_KEY}'}
+            )
+            if invoicing_response.status_code != 201:
+                return None, None, 'Error creation Quiz account', 400
+            reader_client_id = invoicing_response.json()['_id']
+        reader = Reader(
+            username=username, email=email, password_hashed=password_hash,
+            created_at=datetime.now(), quiz_id=quiz_response.json()['_id'],
+            is_primary=True, parent_id=parent.id if parent else None,
+            client_id_invoicing_api=reader_client_id
+        )
+        db.session.add(reader)
+        db.session.flush()
+
+    return reader, parent, None, None
 
 def get_valid_school_invitation(code):
     normalized_code = normalize_invitation_code(code)
@@ -993,7 +1076,10 @@ def login_from_school_public_page(slug):
             return jsonify({'message': 'Email and password are required'}), 400
 
         email = str(email).strip().lower()
-        user = User.query.filter(func.lower(User.email) == email).first()
+        user = (
+            User.query.filter(func.lower(User.email) == email, User.is_primary.is_(True)).first()
+            or User.query.filter(func.lower(User.email) == email).first()
+        )
         if not user or not bcrypt.check_password_hash(user.password_hashed, password):
             return jsonify({'message': 'Invalid email or password'}), 404
         if not user.confirmed:
@@ -1071,6 +1157,8 @@ def register():
         email = request.json['email']
         password = request.json['password']
         invitation_code_value = request.json.get('invitation_code')
+        account_type = request.json.get('account_type', 'reader')
+        parent_pin = request.json.get('parent_pin')
         invitation_code = None
 
         if invitation_code_value:
@@ -1079,50 +1167,41 @@ def register():
                 return jsonify({'message': invitation_error}), invitation_status
 
         if user_email_exist(email):
-
             return jsonify({'message': 'This email is already used. Please choose another'}), 409  # Conflict
-        else:
 
-            #Create a new user in quiz api
-            quiz_user ={
-                'app':f'{ConfigClass.QUIZ_API_KEY}'
-            }
-            invoicing_client ={
-                'appId':f'{ConfigClass.INVOICING_API_KEY}'
-            }
-            invoicing_response = requests.post(f'{ConfigClass.INVOICING_API}/client/create' , json=invoicing_client)
-            response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
-            if response.status_code == 201 and invoicing_response.status_code==201:
-                quiz_id = response.json()['_id']
-                client_id = invoicing_response.json()['_id']
-                # Create a new user in your Flask application
-                password_hash = bcrypt.generate_password_hash(password)
-                new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),quiz_id=quiz_id,client_id_invoicing_api=client_id)
-                db.session.add(new_user)
-                db.session.commit()
-                shcool=  Shcool.query.filter_by(name="IRead").first()
-                if shcool:
-                    add_user_to_school(new_user.id, shcool.id)
-                if invitation_code:
-                    redeem_school_invitation_for_user(invitation_code, new_user.id)
-                db.session.commit()
-                # Send a confirmation email as before
-                confirmation_token = generate_confirmed_token(email)
-                confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
-                confirmation_email = render_template('confirmation_email_template.html', username=username,
-                                                      confirm_link=confirm_link,
-                                                      current_year=datetime.now().year)
-                msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
-                msg.html = confirmation_email
-                mail.send(msg)
+        reader_account, parent_account, error_message, error_status = create_household_accounts(
+            username, email, password, account_type=account_type, parent_pin=parent_pin
+        )
+        if error_message:
+            db.session.rollback()
+            return jsonify({'message': error_message}), error_status
 
-                return jsonify({'message': 'Your account has been successfully created. Please verify your emailbox to confirm your account',
-                                'user': {'username': username, 'email': email}}), 201
-            else:
+        db.session.commit()
 
-                return jsonify({'message':'Error creation Quiz account'}),400
+        if reader_account:
+            shcool = Shcool.query.filter_by(name="IRead").first()
+            if shcool:
+                add_user_to_school(reader_account.id, shcool.id)
+            if invitation_code:
+                redeem_school_invitation_for_user(invitation_code, reader_account.id)
+            db.session.commit()
+
+        # Send a confirmation email as before
+        confirmation_token = generate_confirmed_token(email)
+        confirm_link = f"{ConfigClass.API_URL}/reader/confirm/{confirmation_token}"
+        confirmation_email = render_template('confirmation_email_template.html', username=username,
+                                              confirm_link=confirm_link,
+                                              current_year=datetime.now().year)
+        msg = Message('Confirm your account', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
+        msg.html = confirmation_email
+        mail.send(msg)
+
+        return jsonify({'message': 'Your account has been successfully created. Please verify your emailbox to confirm your account',
+                        'user': {'username': username, 'email': email},
+                        'account_type': account_type}), 201
 
     except Exception as error:
+        db.session.rollback()
         print(str(error))  # Print the error message for debugging
         return jsonify({'message': 'Internal server error'}), 500
 
@@ -1344,9 +1423,11 @@ def login_client():
     try:
         email=request.json['email']
         password=request.json['password']
-        user=User.query.filter_by(email=email).first()
         accounts =User.query.filter_by(email=email).all()
-        print(accounts)
+        # A household's default landing profile is the primary Reader (never
+        # the Parent, which always requires a PIN) -- fall back to whichever
+        # row matches if none is flagged primary yet (pre-migration data).
+        user = next((account for account in accounts if account.is_primary), accounts[0] if accounts else None)
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
@@ -1361,6 +1442,7 @@ def login_client():
                             "username":account.username,
                             "email":account.email,
                             "img":account.img,
+                            "role":account.type,
                             "is_primary":account.is_primary,
                             "pin_required":pin_required,
                             "has_pin":bool(account.pin_hash)
@@ -1378,11 +1460,11 @@ def login_client():
         return jsonify({'message':'Internal server error','error':str(error)}),500
 
 @reader.route('/login',methods=['POST'])
-def login():   
-    try:    
+def login():
+    try:
         email=request.json['email']
         password=request.json['password']
-        user=User.query.filter_by(email=email).first()
+        user = User.query.filter_by(email=email, is_primary=True).first() or User.query.filter_by(email=email).first()
         if user and bcrypt.check_password_hash(user.password_hashed,password):
             if user.confirmed:
                 if user.approved:
@@ -1474,12 +1556,61 @@ def select_account():
                 db.session.commit()
 
             login_user(user)
-            return jsonify({'message':'Your are logged in succesfully','role':user.type,'pin_setup_required':siblings_count > 1 and not bool(user.pin_hash)}),200
+            # The first (is_primary) Reader is deliberately never nudged to set a
+            # PIN -- it's the one profile that should always stay PIN-free.
+            pin_setup_required = siblings_count > 1 and not bool(user.pin_hash) and not user.is_primary
+            return jsonify({'message':'Your are logged in succesfully','role':user.type,'pin_setup_required':pin_setup_required}),200
         else:
             return jsonify({'message':'Invalid account'}),404
 
     except Exception as error:
         return jsonify({'message':'Internal server error','error':str(error)}),500
+## @brief Upgrade a legacy single-reader household to a Parent-managed one.
+#
+# A household that registered before Parent accounts existed (or chose
+# "reader only" at signup) is stuck adding siblings under a plain Reader.
+# This lets that primary Reader spin up a real Parent row (same email and
+# password, a fresh mandatory PIN) and re-parents itself under it, since a
+# row's polymorphic type can't change in place once created.
+@reader.route('/create_parent_account', methods=['POST'])
+@login_required
+def create_parent_account():
+    try:
+        if current_user.type != 'reader' or not current_user.is_primary or current_user.parent_id is not None:
+            return jsonify({'message': 'A parent account is not applicable for this profile'}), 400
+
+        password = request.json.get('password')
+        pin = request.json.get('pin')
+        if not bcrypt.check_password_hash(current_user.password_hashed, password):
+            return jsonify({'message': 'Invalid password'}), 400
+        if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
+            return jsonify({'message': 'A 4-digit PIN is required for the parent account'}), 400
+
+        invoicing_response = requests.post(
+            f'{ConfigClass.INVOICING_API}/client/create',
+            json={'appId': f'{ConfigClass.INVOICING_API_KEY}'}
+        )
+        if invoicing_response.status_code != 201:
+            return jsonify({'message': 'Error creating billing account'}), 400
+
+        new_parent = Parent(
+            username=current_user.username, email=current_user.email,
+            password_hashed=current_user.password_hashed, created_at=datetime.now(),
+            confirmed=True, approved=True, is_primary=False,
+            pin_hash=bcrypt.generate_password_hash(str(pin)),
+            client_id_invoicing_api=invoicing_response.json()['_id']
+        )
+        db.session.add(new_parent)
+        db.session.flush()
+
+        current_user.parent_id = new_parent.id
+        db.session.commit()
+
+        return jsonify({'message': 'Parent account created', 'parent': {'username': new_parent.username}}), 201
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
 @reader.route('/create_account',methods=['POST'])
 @login_required
 def create_account():
@@ -1488,55 +1619,135 @@ def create_account():
         username=request.json['username']
         password = request.json['password']
         pin = request.json.get('pin')
-        accounts =User.query.filter_by(email=current_user.email).all()
+        requested_school_id = request.json.get('school_id')
 
+        is_parent = current_user.type == 'parent'
+        # Back-compat: a household that hasn't upgraded to a Parent account
+        # yet can still add siblings the original way, as its primary Reader.
+        is_legacy_primary = current_user.type == 'reader' and current_user.is_primary and current_user.parent_id is None
 
-        if len(accounts) >= 3 :
-            return jsonify({'message':'You reached the maximum number of accounts (3)'}) ,400
+        if not is_parent and not is_legacy_primary:
+            return jsonify({'message': 'Only a parent account can add a child profile'}), 403
+
+        accounts = User.query.filter_by(email=current_user.email).all()
+        existing_children = [account for account in accounts if account.type == 'reader']
+
+        if is_parent:
+            if len(existing_children) >= 3:
+                return jsonify({'message':'You reached the maximum number of children (3)'}) ,400
+        else:
+            if len(accounts) >= 3 :
+                return jsonify({'message':'You reached the maximum number of accounts (3)'}) ,400
+            if not current_user.pin_hash:
+                return jsonify({'message':'Set a PIN for your account before adding another profile'}),400
 
         if not pin or not str(pin).isdigit() or len(str(pin)) != 4:
             return jsonify({'message':'A 4-digit PIN is required for this profile'}),400
-
-        if not current_user.pin_hash:
-            return jsonify({'message':'Set a PIN for your account before adding another profile'}),400
 
         user=User.query.filter_by(email=current_user.email,username=username).first()
         if not bcrypt.check_password_hash(current_user.password_hashed,password):
             return jsonify({'message':'Invalid password'}) ,400
         if user:
             return jsonify({'message':'Username already  exists '}),400
-        else:
-            #Create a new user in quiz api
-            quiz_user ={
-                'app':f'{ConfigClass.QUIZ_API_KEY}'
+
+        #Create a new user in quiz api
+        quiz_user ={
+            'app':f'{ConfigClass.QUIZ_API_KEY}'
+        }
+        response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
+        if response.status_code != 201:
+            return jsonify({'message':'Error creation Quiz account'}),400
+
+        quiz_id = response.json()['_id']
+        new_account = Reader(
+            username=username, email=current_user.email, password_hashed=current_user.password_hashed,
+            created_at=datetime.now(), confirmed=True, approved=True, quiz_id=quiz_id,
+            is_primary=False, pin_hash=bcrypt.generate_password_hash(str(pin)),
+            parent_id=current_user.id if is_parent else None
+        )
+        db.session.add(new_account)
+        db.session.flush()
+
+        school = None
+        if requested_school_id:
+            school = Shcool.query.get(requested_school_id)
+        if not school:
+            selected_school_id = session.get('selected_school_id')
+            if selected_school_id:
+                school = Shcool.query.get(selected_school_id)
+        if not school:
+            school = Shcool.query.filter_by(name="IRead").first()
+        if school:
+            add_user_to_school(new_account.id, school.id)
+
+        db.session.commit()
+        userData ={
+            "username":new_account.username,
+            "email":new_account.email,
+            "img":new_account.img
             }
-            response = requests.post(f'{ConfigClass.QUIZ_API}user', json=quiz_user)
-            if response.status_code == 201:
-                quiz_id = response.json()['_id']
-                new_account = Reader(username=username, email=current_user.email, password_hashed=current_user.password_hashed, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id,is_primary=False,pin_hash=bcrypt.generate_password_hash(str(pin)))
-                db.session.add(new_account)
-                db.session.commit()
-                userData ={
-                    "username":new_account.username,
-                    "email":new_account.email,
-                    "img":new_account.img
-                    
-                    }
-                school  = Shcool.query.filter_by(name="IRead").first()
-                new_user_shcool = User_shcool(
-                  user_id = new_account.id,
-                  shcool_id = school.id
-                )
-                db.session.add(new_user_shcool)
-                db.session.commit()    
-                return jsonify({'message':'Your account has been created','user':userData}),201
-            else:
-                return jsonify({'message':'Error creation Quiz account'}),400    
-    
+        return jsonify({'message':'Your account has been created','user':userData}),201
+
     except Exception as error:
+        db.session.rollback()
         print(error)
         return jsonify({'message':'Internal server error','error':str(error)}),500
-# get user account with email 
+
+## @brief List the Reader children linked to the current Parent account.
+@reader.route('/get_children', methods=['GET'])
+@login_required
+def get_children():
+    try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can view children'}), 403
+
+        children = Reader.query.filter_by(parent_id=current_user.id).all()
+        childrenData = [{
+            'id': child.id,
+            'username': child.username,
+            'img': child.img,
+            'level': child.level,
+            'is_primary': child.is_primary,
+            'has_pin': bool(child.pin_hash),
+            'schools': get_user_schools(child.id),
+            'default_school_id': get_default_school(child.id)
+        } for child in children]
+        return jsonify({'children': childrenData}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+## @brief Let a Parent change which school is the default for one of their children.
+@reader.route('/set_default_school', methods=['POST'])
+@login_required
+def set_default_school():
+    try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can change a default school'}), 403
+
+        data = request.get_json(silent=True) or {}
+        child_user_id = data.get('child_user_id')
+        school_id = data.get('school_id')
+        if not child_user_id or not school_id:
+            return jsonify({'message': 'child_user_id and school_id are required'}), 400
+
+        child = Reader.query.filter_by(id=child_user_id, parent_id=current_user.id).first()
+        if not child:
+            return jsonify({'message': 'Child not found for this parent'}), 404
+
+        school = Shcool.query.get(int(school_id))
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        if not set_default_school_for_user(child.id, school.id):
+            return jsonify({'message': 'Child is not a member of that school'}), 400
+
+        db.session.commit()
+        return jsonify({'message': 'Default school updated', 'default_school_id': school.id}), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+# get user account with email
 @reader.route('/get_accounts')
 @login_required
 def get_accounts():
@@ -1551,6 +1762,7 @@ def get_accounts():
                 "username":account.username,
                 "email":account.email,
                 "img":account.img,
+                "role":account.type,
                 "is_primary":account.is_primary,
                 "pin_required":pin_required,
                 "has_pin":bool(account.pin_hash)
@@ -1619,6 +1831,7 @@ def user_authenticated():
                     'id': current_user.id,
                     'client_id_invoicing_api': client_id_invoicing_api,
                     'schools': get_user_schools(current_user.id),
+                    'default_school_id': get_default_school(current_user.id),
                     'is_primary': current_user.is_primary,
                     'has_pin': bool(current_user.pin_hash),
                     'must_change_password': bool(current_user.must_change_password)
