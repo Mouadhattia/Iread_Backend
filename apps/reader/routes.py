@@ -1,7 +1,7 @@
 ## @file
 # Blueprint for user readers' authentication.
 # Contains routes and functions related to user authentication.
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import os
 from flask import Blueprint,request,jsonify,render_template, redirect,make_response,session,send_file
 from flask_bcrypt import Bcrypt
@@ -53,6 +53,7 @@ from apps.progress_engine import (
     get_progress_summary,
     get_self_reported_shelf,
     get_word_collection,
+    get_word_progress_daily_trend,
     record_self_reported_word,
     submit_attempt,
 )
@@ -1773,6 +1774,84 @@ def get_children():
         } for child in children]
         return jsonify({'children': childrenData}), 200
     except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+## @brief Word/quiz/game activity for one child, for the Parent Dashboard's
+# per-child analytics charts. Merges three sources: local word-progress
+# evidence (MySQL), local game results (MySQL), and quiz attempts (proxied
+# from the quiz_api microservice via the child's quiz_id).
+@reader.route('/parent/child_analytics/<int:child_id>', methods=['GET'])
+@login_required
+def get_child_analytics(child_id):
+    try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can view child analytics'}), 403
+
+        child = Reader.query.filter_by(id=child_id, parent_id=current_user.id).first()
+        if not child:
+            return jsonify({'message': 'Child not found for this parent'}), 404
+
+        try:
+            days = int(request.args.get('days', 28))
+        except (TypeError, ValueError):
+            days = 28
+        days = max(7, min(days, 90))
+
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days - 1)
+
+        word_progress = {
+            'totals': get_progress_summary(child.id),
+            'daily': get_word_progress_daily_trend(child.id, start_date, end_date),
+        }
+
+        game_rows = (
+            db.session.query(
+                Game_result.day,
+                func.count(Game_result.id),
+                func.avg(Game_result.score),
+                func.sum(Game_result.time_spent_seconds),
+            )
+            .filter(
+                Game_result.user_id == child.id,
+                Game_result.day >= start_date,
+                Game_result.day <= end_date,
+            )
+            .group_by(Game_result.day)
+            .all()
+        )
+        game_daily = [
+            {
+                'date': day.isoformat(),
+                'games_played': played,
+                'avg_score': round(float(avg_score or 0), 1),
+                'time_spent_seconds': int(total_time or 0),
+            }
+            for day, played, avg_score, total_time in game_rows
+        ]
+
+        quiz_daily = []
+        if child.quiz_id:
+            try:
+                quiz_response = requests.get(
+                    f'{ConfigClass.QUIZ_API}userAnswer/{child.quiz_id}/analytics',
+                    params={'start': start_date.isoformat(), 'end': end_date.isoformat()},
+                    timeout=10,
+                )
+                if quiz_response.status_code == 200:
+                    quiz_daily = quiz_response.json().get('daily', [])
+            except requests.RequestException as error:
+                logging.error('Quiz analytics fetch failed for child %s: %s', child.id, error)
+
+        return jsonify({
+            'child': {'id': child.id, 'username': child.username},
+            'range': {'start': start_date.isoformat(), 'end': end_date.isoformat()},
+            'word_progress': word_progress,
+            'game_activity': {'daily': game_daily},
+            'quiz_activity': {'daily': quiz_daily},
+        }), 200
+    except Exception as error:
+        logging.error('Child analytics failed: %s', error, exc_info=True)
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 ## @brief Let a Parent enroll one of their children in a new school.

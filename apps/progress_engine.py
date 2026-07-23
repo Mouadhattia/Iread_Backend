@@ -5,6 +5,8 @@
 # ranking that lives entirely outside this module.
 from datetime import date, datetime
 
+from sqlalchemy import func
+
 from extensions import db
 from models.chapter import Chapter
 from models.word_occurrence import WordOccurrence
@@ -634,6 +636,50 @@ def _streak_summary(user_id):
         'best_streak': streak.best_streak,
         'grace_available': streak.grace_available,
     }
+
+
+def get_word_progress_daily_trend(user_id, start_date, end_date):
+    """Per-day evidence count and per-day newly-mastered count for a date
+    range, for parent/child analytics charts. `start_date`/`end_date` are
+    `date` objects, inclusive."""
+    evidence_rows = (
+        db.session.query(WordProgressEvidence.occurred_on, func.count(WordProgressEvidence.id))
+        .join(WordProgress, WordProgress.id == WordProgressEvidence.word_progress_id)
+        .filter(
+            WordProgress.user_id == user_id,
+            WordProgressEvidence.occurred_on >= start_date,
+            WordProgressEvidence.occurred_on <= end_date,
+        )
+        .group_by(WordProgressEvidence.occurred_on)
+        .all()
+    )
+    evidence_by_day = {day: count for day, count in evidence_rows}
+
+    mastered_rows = (
+        db.session.query(func.date(WordProgress.mastered_at), func.count(WordProgress.id))
+        .filter(
+            WordProgress.user_id == user_id,
+            WordProgress.mastered_at.isnot(None),
+            func.date(WordProgress.mastered_at) >= start_date,
+            func.date(WordProgress.mastered_at) <= end_date,
+        )
+        .group_by(func.date(WordProgress.mastered_at))
+        .all()
+    )
+    mastered_by_day = {}
+    for day, count in mastered_rows:
+        day = day if isinstance(day, date) else datetime.strptime(str(day), '%Y-%m-%d').date()
+        mastered_by_day[day] = count
+
+    all_days = sorted(set(evidence_by_day) | set(mastered_by_day))
+    return [
+        {
+            'date': day.isoformat(),
+            'words_practiced': evidence_by_day.get(day, 0),
+            'words_mastered': mastered_by_day.get(day, 0),
+        }
+        for day in all_days
+    ]
 
 
 def get_progress_summary(user_id):
