@@ -16,6 +16,10 @@ class User(db.Model, UserMixin):
     __tablename__ = "user"
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), nullable=False)
+    # Optional human-friendly label a parent can set for their own account or
+    # for any Reader they manage, shown instead of username/email wherever
+    # accounts are listed (switch-profile grid, children panel, etc.).
+    display_name = db.Column(db.String(64), nullable=True)
     email = db.Column(db.String(100), unique=False, nullable=False)
     password_hashed = db.Column(db.String(100), nullable=False)
     img = db.Column(db.String(300),default="https://upload.wikimedia.org/wikipedia/commons/thumb/5/59/User-avatar.svg/2048px-User-avatar.svg.png")

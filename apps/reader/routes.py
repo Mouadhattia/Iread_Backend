@@ -7,6 +7,7 @@ from flask import Blueprint,request,jsonify,render_template, redirect,make_respo
 from flask_bcrypt import Bcrypt
 from models.user import User,Reader,Teacher,Admin,SuperAdmin,Parent
 from models.game_result import Game_result, GameEnum
+from models.practice_play import PracticePlay
 from models.teacher_postulate import Teacher_postulate
 from models.pack import Pack, StatusEnum as PackAgeEnum
 from models.follow_pack import Follow_pack
@@ -1771,6 +1772,7 @@ def get_children():
         childrenData = [{
             'id': child.id,
             'username': child.username,
+            'display_name': child.display_name,
             'img': child.img,
             'level': child.level,
             'is_primary': child.is_primary,
@@ -1826,14 +1828,38 @@ def get_child_analytics(child_id):
             .group_by(Game_result.day)
             .all()
         )
+        practice_rows = (
+            db.session.query(
+                PracticePlay.day,
+                func.count(PracticePlay.id),
+                func.avg(PracticePlay.score),
+                func.sum(PracticePlay.time_spent_seconds),
+            )
+            .filter(
+                PracticePlay.user_id == child.id,
+                PracticePlay.day >= start_date,
+                PracticePlay.day <= end_date,
+            )
+            .group_by(PracticePlay.day)
+            .all()
+        )
+        # Daily Run (Game_result, one row/day/book) and practice-mode plays
+        # (PracticePlay, unlimited rows/day) are two different tables -- merge
+        # them by day so "games played" reflects all play, not just Daily Run.
+        game_activity_by_day = {}
+        for day, played, avg_score, total_time in game_rows + practice_rows:
+            entry = game_activity_by_day.setdefault(day, {'played': 0, 'score_sum': 0.0, 'time': 0})
+            entry['played'] += played
+            entry['score_sum'] += float(avg_score or 0) * played
+            entry['time'] += int(total_time or 0)
         game_daily = [
             {
                 'date': day.isoformat(),
-                'games_played': played,
-                'avg_score': round(float(avg_score or 0), 1),
-                'time_spent_seconds': int(total_time or 0),
+                'games_played': entry['played'],
+                'avg_score': round(entry['score_sum'] / entry['played'], 1) if entry['played'] else 0,
+                'time_spent_seconds': entry['time'],
             }
-            for day, played, avg_score, total_time in game_rows
+            for day, entry in sorted(game_activity_by_day.items())
         ]
 
         quiz_daily = []
@@ -1943,6 +1969,7 @@ def get_accounts():
 
             accountsData.append({
                 "username":account.username,
+                "display_name":account.display_name,
                 "email":account.email,
                 "img":account.img,
                 "role":account.type,
@@ -2007,6 +2034,7 @@ def user_authenticated():
                 return jsonify({
                     'is_authenticated': current_user.is_authenticated,
                     'username': current_user.username,
+                    'display_name': current_user.display_name,
                     'email': current_user.email,
                     'img': current_user.img,
                     'role': current_user.type,
@@ -2720,14 +2748,43 @@ def set_child_pin():
         child = Reader.query.filter_by(id=child_user_id, parent_id=current_user.id).first()
         if not child:
             return jsonify({'message': 'Child not found for this parent'}), 404
-        if child.is_primary:
-            return jsonify({'message': 'The first reader profile does not use a PIN'}), 400
 
         child.pin_hash = bcrypt.generate_password_hash(str(pin))
         child.pin_failed_attempts = 0
         child.pin_locked_until = None
         db.session.commit()
         return jsonify({'message': f'PIN updated for {child.username}'}), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+## @brief Let a Parent set/change the display name shown for their own
+# account or for any Reader they manage (including the first/primary
+# reader), so account-listing UIs (switch-profile grid, children panel)
+# don't have to fall back to a raw username/email.
+@reader.route('/set_display_name', methods=['POST'])
+@login_required
+def set_display_name():
+    try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can set a display name'}), 403
+
+        data = request.get_json(silent=True) or {}
+        display_name = (data.get('display_name') or '').strip()
+        if len(display_name) > 64:
+            return jsonify({'message': 'Display name must be 64 characters or fewer'}), 400
+
+        user_id = data.get('user_id')
+        if not user_id or int(user_id) == current_user.id:
+            target = current_user
+        else:
+            target = Reader.query.filter_by(id=user_id, parent_id=current_user.id).first()
+            if not target:
+                return jsonify({'message': 'Child not found for this parent'}), 404
+
+        target.display_name = display_name or None
+        db.session.commit()
+        return jsonify({'message': 'Display name updated', 'display_name': target.display_name}), 200
     except Exception as error:
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
@@ -4196,6 +4253,53 @@ def create_game_result():
         return jsonify({'error': str(e)}), 500
 
 
+## @brief Log one finished practice-mode round (Word Search, Strands,
+# Spelling Bee, the classic word-guess game). Unlike /game-result, this
+# always inserts a new row rather than upserting by day -- practice is
+# unlimited (Achievement & Word-Progress brief), so a child can finish many
+# rounds in one day and each should count toward the parent's "games played"
+# analytics. Kept as its own table/route instead of relaxing Game_result's
+# one-row-per-day uniqueness, since that uniqueness is exactly what the
+# Daily Run leaderboard/scoreboard routes rely on.
+@reader.route('/practice-play', methods=['POST'])
+@reader.route('/practice-play/', methods=['POST'])
+def create_practice_play():
+    try:
+        data = request.get_json()
+        if not data or 'game' not in data:
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        try:
+            game_status = normalize_game_result_enum(data['game'])
+        except ValueError:
+            return jsonify({'error': 'Invalid game status'}), 400
+
+        user_id = data.get('user_id') or (current_user.id if current_user.is_authenticated else None)
+        if not user_id:
+            return jsonify({'error': 'User not found'}), 404
+
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        play = PracticePlay(
+            score=data.get('score') or 0,
+            book_id=data.get('book_id'),
+            game=game_status,
+            user_id=user_id,
+            day=parse_result_day(data.get('day')),
+            words_learned=data.get('words_learned') or [],
+            time_spent_seconds=parse_non_negative_seconds(data.get('time_spent_seconds')),
+        )
+        db.session.add(play)
+        db.session.commit()
+
+        return jsonify({'message': 'Practice play recorded', 'id': play.id}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        logging.error('Practice play submission failed: %s', e, exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @reader.route('/game-result/<int:result_id>', methods=['PUT'])
