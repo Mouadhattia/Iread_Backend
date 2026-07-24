@@ -8,7 +8,7 @@ from flask_bcrypt import Bcrypt
 from models.user import User,Reader,Teacher,Admin,SuperAdmin,Parent
 from models.game_result import Game_result, GameEnum
 from models.teacher_postulate import Teacher_postulate
-from models.pack import Pack
+from models.pack import Pack, StatusEnum as PackAgeEnum
 from models.follow_pack import Follow_pack
 from models.Follow_book import Follow_book
 from models.notification_user import Notification_user
@@ -3706,7 +3706,7 @@ def get_packs_by_shcoo():
         title_search = request.args.get('title') 
         school = int(request.args.get('school'))    
         all = int(request.args.get('all'))    
-        age_enum_values = [age.value for age in StatusEnum]
+        age_enum_values = [age.value for age in PackAgeEnum]
         packs_query = (
             Pack.query
             .outerjoin(
