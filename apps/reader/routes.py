@@ -3007,7 +3007,63 @@ def follow_pack():
     except:
         return jsonify({'message': 'Internal server error'}), 500
 
-        
+## @brief Redeem a pack code on behalf of a child, from the Parent Dashboard.
+# Mirrors /follow_pack but targets a specific child instead of current_user,
+# guarded by the same parent-ownership check used everywhere else in this
+# file (current_user.type == 'parent' and Reader.parent_id == current_user.id).
+@reader.route('/parent/follow_pack/<int:child_id>', methods=['POST'])
+@login_required
+def parent_follow_pack(child_id):
+    try:
+        if current_user.type != 'parent':
+            return jsonify({'message': 'Only a parent account can redeem a pack for a child'}), 403
+
+        child = Reader.query.filter_by(id=child_id, parent_id=current_user.id).first()
+        if not child:
+            return jsonify({'message': 'Child not found for this parent'}), 404
+
+        token = request.json['id']
+        code = request.json['code']
+        code_to_use = Code.query.filter_by(code=code).first()
+
+        if not code_to_use:
+            return jsonify({'message': 'Code not found'}), 404
+
+        if code_to_use.pack_id != int(token):
+            return jsonify({'message': 'Code does not correspond to the specified pack'}), 400
+        if code_to_use.status == StatusEnum.USED:
+            return jsonify({'message': 'Code has already been used'}), 400
+
+        pack = Pack.query.filter_by(id=token).first()
+        if not pack:
+            return jsonify({'message': 'Pack not found'}), 404
+
+        existing_pack = Follow_pack.query.filter_by(user_id=child.id, pack_id=pack.id).first()
+        if existing_pack:
+            return jsonify({'message': f'{child.username} already follows this pack'}), 200
+
+        code_to_use.user_id = child.id
+        code_to_use.status = StatusEnum.USED
+        follow_pack = Follow_pack(user_id=child.id, pack_id=pack.id, approved=True)
+        db.session.add(follow_pack)
+        db.session.commit()
+
+        followed_pack = {
+            'approved': follow_pack.approved,
+            'id': pack.id,
+            'level': pack.level,
+            'book_number': pack.book_number,
+            'price': pack.price,
+            'title': pack.title
+        }
+        return jsonify({
+            'message': f'Pack added to {child.username}\'s pack list',
+            'followed_pack': followed_pack
+        }), 200
+    except Exception:
+        return jsonify({'message': 'Internal server error'}), 500
+
+
 @reader.route('/link_code', methods=['POST'])
 
 def link_code():
