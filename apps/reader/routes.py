@@ -745,7 +745,13 @@ def user_can_view_pack(pack):
 def user_can_view_pack_in_school(pack, school_id):
     if not pack or not getattr(pack, 'active', True):
         return False
-    if pack.public and not getattr(pack, 'is_global_pack', False):
+    # A public pack is exactly as visible here as it already is on the
+    # school's public pack listing (/get_packs_by_school with all=0, which
+    # does not distinguish global from school-owned packs) -- a parent
+    # browsing on behalf of a child, or any anonymous visitor, has no
+    # school membership row of their own and must still be able to view a
+    # pack that's already shown to them in that listing.
+    if pack.public:
         return True
     if not current_user.is_authenticated:
         return False
