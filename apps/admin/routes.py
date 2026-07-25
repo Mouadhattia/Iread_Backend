@@ -13,6 +13,7 @@ from werkzeug.utils import secure_filename
 from models.user import User,Reader,Teacher,Admin,Assistant,SuperAdmin
 from models.book_pack import Book_pack
 from models.book_story import BookStory
+from models.audio_book import AudioBook
 from models.game_calendar_entry import GameCalendarEntry
 from models.reader_story_progress import ReaderStoryProgress
 from models.school_book_instance import SchoolBookInstance
@@ -1091,10 +1092,10 @@ def serialize_platform_book(book, school_id=None, include_details=False):
     data['source'] = 'platform'
     data['read_only'] = not is_super_admin()
     data['school_id'] = school_id
-    data['has_story_pdf'] = BookStory.query.filter(
-        BookStory.book_id == book.id,
-        BookStory.shcool_id.is_(None),
-        BookStory.active.is_(True)
+    data['has_audio_story'] = AudioBook.query.filter_by(
+        book_id=book.id,
+        shcool_id=None,
+        active=True
     ).first() is not None
     data['has_headwords'] = get_book_text_entry(book.id) is not None
     data['instances_count'] = SchoolBookInstance.query.filter_by(book_id=book.id, active=True).count()
@@ -1104,10 +1105,6 @@ def serialize_platform_book(book, school_id=None, include_details=False):
     if include_details:
         text_entry = get_book_text_entry(book.id)
         data['headwords'] = text_entry.text if text_entry else None
-        data['stories'] = [
-            serialize_book_story(story)
-            for story in BookStory.query.filter_by(book_id=book.id, shcool_id=None).order_by(BookStory.id.desc()).all()
-        ]
         data['school_instances'] = [
             serialize_school_book_instance(instance)
             for instance in SchoolBookInstance.query.filter_by(book_id=book.id, active=True).order_by(SchoolBookInstance.id.desc()).all()
@@ -1118,49 +1115,6 @@ def get_book_request_data():
     if request.content_type and request.content_type.startswith('multipart/form-data'):
         return request.form
     return request.get_json(silent=True) or {}
-
-def save_book_story_pdf(book, school_id, title=None, description=None):
-    if 'file' not in request.files:
-        return None, 'PDF file is required', 400, None
-
-    pdf_file = request.files['file']
-    if not is_allowed_story_pdf(pdf_file):
-        return None, 'Only PDF files are allowed', 400, None
-
-    file_size = get_file_size(pdf_file)
-    max_file_size = ConfigClass.MAX_STORY_UPLOAD_MB * 1024 * 1024
-    if file_size > max_file_size:
-        return None, f'PDF file is too large. Max size is {ConfigClass.MAX_STORY_UPLOAD_MB} MB', 413, None
-
-    title = (title or '').strip()
-    if not title:
-        title = os.path.splitext(secure_filename(pdf_file.filename))[0] or 'Story'
-
-    original_filename = secure_filename(pdf_file.filename)
-    stored_filename = f'{uuid4().hex}.pdf'
-    upload_dir = get_story_upload_dir(school_id, book.id)
-    saved_file_path = os.path.join(upload_dir, stored_filename)
-    pdf_file.save(saved_file_path)
-
-    story = BookStory(
-        book_id=book.id,
-        shcool_id=school_id,
-        uploaded_by=current_user.id,
-        title=title,
-        description=description,
-        original_filename=original_filename,
-        stored_filename=stored_filename,
-        file_path=saved_file_path,
-        file_url='',
-        mime_type=pdf_file.mimetype or 'application/pdf',
-        file_size=file_size,
-        page_count=None,
-        active=True
-    )
-    db.session.add(story)
-    db.session.flush()
-    story.file_url = f'/reader/stories/{story.id}/pdf'
-    return story, None, None, saved_file_path
 
 def apply_book_metadata(book, data, require_title_author=False):
     if require_title_author:
@@ -2251,12 +2205,8 @@ def super_get_platform_books():
 def super_create_platform_book():
     if not is_super_admin():
         return jsonify({'message': 'Super admin access required'}), 403
-    saved_file_path = None
     try:
         data = get_book_request_data()
-        text = get_text_payload(data)
-        if not text:
-            return jsonify({'message': 'headwords or text is required'}), 400
 
         title = str(data.get('title') or '').strip()
         author = str(data.get('author') or '').strip()
@@ -2277,33 +2227,20 @@ def super_create_platform_book():
         db.session.add(book)
         db.session.flush()
 
-        upsert_book_text(book.id, text)
-
-        story, error_message, error_status, saved_file_path = save_book_story_pdf(
-            book,
-            None,
-            title=data.get('story_title') or data.get('title'),
-            description=data.get('story_description') or data.get('description')
-        )
-        if error_message:
-            db.session.rollback()
-            return jsonify({'message': error_message}), error_status
+        text = get_text_payload(data)
+        if text:
+            upsert_book_text(book.id, text)
 
         db.session.commit()
         return jsonify({
             'message': 'Platform book created successfully',
-            'book': serialize_platform_book(book, include_details=True),
-            'story': serialize_book_story(story)
+            'book': serialize_platform_book(book, include_details=True)
         }), 201
     except ValueError as error:
         db.session.rollback()
-        if saved_file_path and os.path.exists(saved_file_path):
-            os.remove(saved_file_path)
         return jsonify({'message': str(error)}), 400
     except Exception as error:
         db.session.rollback()
-        if saved_file_path and os.path.exists(saved_file_path):
-            os.remove(saved_file_path)
         logging.error('Create platform book failed: %s', error, exc_info=True)
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
@@ -2370,37 +2307,6 @@ def super_update_platform_book_headwords(book_id):
         }), 200
     except Exception as error:
         db.session.rollback()
-        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
-
-@admin.route('/super/platform-books/<int:book_id>/stories', methods=['POST'])
-def super_upload_platform_book_story(book_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
-    saved_file_path = None
-    try:
-        book = Book.query.filter_by(id=book_id, is_platform_book=True).first()
-        if not book:
-            return jsonify({'message': 'Platform book not found'}), 404
-
-        story, error_message, error_status, saved_file_path = save_book_story_pdf(
-            book,
-            None,
-            title=request.form.get('title') or request.form.get('story_title'),
-            description=request.form.get('description') or request.form.get('story_description')
-        )
-        if error_message:
-            return jsonify({'message': error_message}), error_status
-
-        db.session.commit()
-        return jsonify({
-            'message': 'Platform story uploaded successfully',
-            'story': serialize_book_story(story)
-        }), 201
-    except Exception as error:
-        db.session.rollback()
-        if saved_file_path and os.path.exists(saved_file_path):
-            os.remove(saved_file_path)
-        logging.error('Platform story upload failed: %s', error, exc_info=True)
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/platform-books/<int:book_id>', methods=['DELETE'])
