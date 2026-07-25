@@ -15,6 +15,10 @@ INTERPOLATED_TIMING_WARNING = (
     'Word-level alignment failed, so timings were estimated from segment timestamps. '
     'Review and save the timestamps before approval.'
 )
+SENTENCE_END_CHARS = ('.', '!', '?', '…')
+CLAUSE_END_CHARS = SENTENCE_END_CHARS + (',', ';', ':')
+DEFAULT_SENTENCE_PAUSE_MS = 700
+DEFAULT_LINE_BREAK_PAUSE_MS = 1200
 
 
 class AudioAlignmentUnavailable(RuntimeError):
@@ -131,21 +135,78 @@ def get_alignment_duration_ms(transcript_words, audio_duration_ms=None):
     return transcript_duration_ms
 
 
-def clean_transcribed_text(text):
-    text = re.sub(r'\s+', ' ', str(text or '')).strip()
-    text = re.sub(r'\s+([,.;:!?])', r'\1', text)
-    text = re.sub(r'([([{])\s+', r'\1', text)
+def get_sentence_pause_ms():
+    return int(getattr(ConfigClass, 'AUDIOBOOK_SENTENCE_PAUSE_MS', None) or DEFAULT_SENTENCE_PAUSE_MS)
+
+
+def get_line_break_pause_ms():
+    return int(getattr(ConfigClass, 'AUDIOBOOK_LINE_BREAK_PAUSE_MS', None) or DEFAULT_LINE_BREAK_PAUSE_MS)
+
+
+def restore_punctuation_and_breaks(words, sentence_pause_ms=None, line_break_pause_ms=None):
+    """Fill in missing sentence punctuation and paragraph breaks using inter-word silence.
+
+    Mutates each word dict in place, only ever appending to `text` and setting a
+    `lineBreakAfter` flag - the number and order of words never changes, so this
+    cannot desync the word-by-word audio highlighting.
+    """
+    sentence_pause_ms = sentence_pause_ms if sentence_pause_ms is not None else get_sentence_pause_ms()
+    line_break_pause_ms = (
+        line_break_pause_ms if line_break_pause_ms is not None else get_line_break_pause_ms()
+    )
+
+    word_count = len(words)
+    for index, word in enumerate(words):
+        is_last = index == word_count - 1
+        text = word.get('text') or ''
+
+        gap_ms = None
+        if not is_last:
+            next_word = words[index + 1]
+            if word.get('endMs') is not None and next_word.get('startMs') is not None:
+                gap_ms = next_word['startMs'] - word['endMs']
+
+        ends_with_sentence_punct = bool(text) and text[-1] in SENTENCE_END_CHARS
+        should_break = is_last or (gap_ms is not None and gap_ms >= line_break_pause_ms)
+        should_end_sentence = should_break or (gap_ms is not None and gap_ms >= sentence_pause_ms)
+
+        if should_end_sentence and text and not ends_with_sentence_punct:
+            word['text'] = text.rstrip(''.join(CLAUSE_END_CHARS)) + '.'
+            text = word['text']
+            ends_with_sentence_punct = True
+
+        word['lineBreakAfter'] = bool(should_break and not is_last)
+
+        if not is_last and ends_with_sentence_punct:
+            next_word = words[index + 1]
+            next_text = next_word.get('text') or ''
+            if next_text and next_text[0].isalpha() and next_text[0].islower():
+                next_word['text'] = next_text[0].upper() + next_text[1:]
+
+    if words:
+        first_text = words[0].get('text') or ''
+        if first_text and first_text[0].isalpha() and first_text[0].islower():
+            words[0]['text'] = first_text[0].upper() + first_text[1:]
+
+    return words
+
+
+def clean_rendered_text(text):
+    # Collapses runs of spaces/tabs, but preserves single '\n' line breaks.
+    text = re.sub(r'[^\S\n]+', ' ', str(text or ''))
+    text = re.sub(r' *\n+ *', '\n', text).strip()
+    text = re.sub(r' +([,.;:!?])', r'\1', text)
+    text = re.sub(r'([([{]) +', r'\1', text)
     return text
 
 
-def format_transcribed_text(transcript_result, transcript_words):
-    segment_text = ' '.join(
-        str(segment.get('text') or '').strip()
-        for segment in transcript_result.get('segments') or []
-        if str(segment.get('text') or '').strip()
-    )
-    word_text = ' '.join(word['text'] for word in transcript_words)
-    return clean_transcribed_text(segment_text or word_text)
+def render_words_to_text(words):
+    parts = []
+    for index, word in enumerate(words):
+        parts.append(word.get('text') or '')
+        if index < len(words) - 1:
+            parts.append('\n' if word.get('lineBreakAfter') else ' ')
+    return clean_rendered_text(''.join(parts))
 
 
 def build_matched_word(official_word, transcript_word, status='matched'):
@@ -289,9 +350,8 @@ def build_alignment_from_audio_transcript(
         raise AudioAlignmentError('The model did not find spoken words in this audio')
     has_interpolated_timings = any(word.get('status') == 'interpolated' for word in transcript_words)
 
-    official_text = format_transcribed_text(transcript_result, transcript_words)
-    if not official_text:
-        official_text = clean_transcribed_text(' '.join(word['text'] for word in transcript_words))
+    restore_punctuation_and_breaks(transcript_words)
+    official_text = render_words_to_text(transcript_words)
     if not official_text:
         raise AudioAlignmentError('The model could not generate text from this audio')
 
@@ -312,6 +372,7 @@ def build_alignment_from_audio_transcript(
                 'endMs': word['endMs'],
                 'status': word.get('status') or 'matched',
                 'confidence': word.get('confidence'),
+                'lineBreakAfter': bool(word.get('lineBreakAfter')),
             }
             for index, word in enumerate(transcript_words)
         ],

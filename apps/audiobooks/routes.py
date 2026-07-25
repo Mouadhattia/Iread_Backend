@@ -413,6 +413,10 @@ def validate_alignment_json(alignment, audio_duration_ms=None, official_text=Non
         if not isinstance(word.get('text'), str):
             raise ValueError('alignment word text is required')
 
+        line_break_after = word.get('lineBreakAfter')
+        if line_break_after is not None and not isinstance(line_break_after, bool):
+            raise ValueError('alignment word lineBreakAfter must be a boolean')
+
         status = word.get('status')
         if status not in ALIGNMENT_WORD_STATUSES:
             raise ValueError('alignment word status is invalid')
@@ -1000,10 +1004,22 @@ def update_page_for_book(book, page):
 def save_page_alignment(book, page):
     data = get_request_data()
     alignment = parse_alignment_json(data.get('alignment_json') or data.get('alignmentJson') or data)
-    validation_text = page.official_text if str(page.official_text or '').strip() else None
+    sync_official_text = parse_bool_value(
+        data.get('sync_official_text') if 'sync_official_text' in data else data.get('syncOfficialText'),
+        default=False
+    )
+    validation_text = None if sync_official_text else (
+        page.official_text if str(page.official_text or '').strip() else None
+    )
     validate_alignment_json(alignment, page.audio_duration_ms, validation_text)
-    if not str(page.official_text or '').strip():
-        page.official_text = str(alignment.get('officialText') or '').strip()
+    alignment_text = str(alignment.get('officialText') or '').strip()
+    if not str(page.official_text or '').strip() or sync_official_text:
+        # The word array is the source of truth the reader highlights against. Word-level
+        # corrections (punctuation fix, line break, typo fix) explicitly pass
+        # sync_official_text so the plain-text column stays mirrored to alignment.words;
+        # a raw pasted alignment JSON must still match the existing text unless it opts in.
+        if alignment_text:
+            page.official_text = alignment_text
     if parse_review_confirmed(data):
         alignment = mark_alignment_reviewed(alignment)
     page.alignment_json = alignment

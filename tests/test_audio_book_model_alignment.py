@@ -122,6 +122,50 @@ class AudioBookModelAlignmentTest(unittest.TestCase):
                 model_metadata={'provider': 'test'}
             )
 
+    def test_audio_transcript_restores_missing_sentence_punctuation_and_capitalization(self):
+        alignment = build_alignment_from_audio_transcript(
+            self.transcript([
+                {'text': 'hello', 'start': 0.0, 'end': 0.3, 'confidence': 0.9},
+                {'text': 'world', 'start': 0.35, 'end': 0.6, 'confidence': 0.9},
+                # A 1300ms silence gap here should be treated as a paragraph break.
+                {'text': 'the', 'start': 1.9, 'end': 2.1, 'confidence': 0.9},
+                {'text': 'end', 'start': 2.15, 'end': 2.4, 'confidence': 0.9},
+            ]),
+            audio_duration_ms=3000,
+            language='en',
+            model_metadata={'provider': 'test'}
+        )
+
+        # First word capitalized, sentence-ending period inserted at the pause, and the
+        # following word capitalized - all without changing the number of words.
+        self.assertEqual(len(alignment['words']), 4)
+        self.assertEqual(alignment['words'][0]['text'], 'Hello')
+        self.assertEqual(alignment['words'][1]['text'], 'world.')
+        self.assertTrue(alignment['words'][1]['lineBreakAfter'])
+        self.assertEqual(alignment['words'][2]['text'], 'The')
+        self.assertEqual(alignment['words'][3]['text'], 'end.')
+        self.assertEqual(alignment['officialText'], 'Hello world.\nThe end.')
+        # Timestamps for every word are untouched by the text/formatting changes.
+        self.assertEqual(alignment['words'][0]['startMs'], 0)
+        self.assertEqual(alignment['words'][1]['endMs'], 600)
+        self.assertEqual(alignment['words'][2]['startMs'], 1900)
+        self.assertEqual(alignment['words'][3]['endMs'], 2400)
+
+    def test_audio_transcript_keeps_existing_punctuation_untouched(self):
+        alignment = build_alignment_from_audio_transcript(
+            self.transcript([
+                {'text': 'Well,', 'start': 0.0, 'end': 0.3, 'confidence': 0.9},
+                {'text': 'hello!', 'start': 0.35, 'end': 0.6, 'confidence': 0.9},
+            ]),
+            audio_duration_ms=1000,
+            language='en',
+            model_metadata={'provider': 'test'}
+        )
+
+        self.assertEqual(alignment['words'][0]['text'], 'Well,')
+        self.assertEqual(alignment['words'][1]['text'], 'hello!')
+        self.assertEqual(alignment['officialText'], 'Well, hello!')
+
 
 if __name__ == '__main__':
     unittest.main()

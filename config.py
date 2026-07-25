@@ -29,6 +29,8 @@ class ConfigClass:
     AUDIOBOOK_ALIGNMENT_MODEL = os.environ.get('AUDIOBOOK_ALIGNMENT_MODEL') or 'base'
     AUDIOBOOK_ALIGNMENT_DEVICE = os.environ.get('AUDIOBOOK_ALIGNMENT_DEVICE') or 'cpu'
     AUDIOBOOK_FFMPEG_DIR = os.environ.get('AUDIOBOOK_FFMPEG_DIR') or ''
+    AUDIOBOOK_SENTENCE_PAUSE_MS = int(os.environ.get('AUDIOBOOK_SENTENCE_PAUSE_MS') or 700)
+    AUDIOBOOK_LINE_BREAK_PAUSE_MS = int(os.environ.get('AUDIOBOOK_LINE_BREAK_PAUSE_MS') or 1200)
     CALL_JWT_SECRET = os.environ.get('CALL_JWT_SECRET') or 'intellect'
     JITSI_APP_ID = os.environ.get('JITSI_APP_ID') or 'intellect'
     JITSI_DOMAIN = os.environ.get('JITSI_DOMAIN') or 'meeting.intellect.tn'
