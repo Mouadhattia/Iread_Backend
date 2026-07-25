@@ -1,20 +1,17 @@
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from functools import wraps
 from uuid import uuid4
 
-from flask import Blueprint, abort, jsonify, request, send_file
+from flask import Blueprint, abort, current_app, jsonify, request, send_file
 from flask_login import current_user, login_required
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from werkzeug.utils import secure_filename
 
-from apps.audiobooks.alignment import (
-    AudioAlignmentError,
-    AudioAlignmentUnavailable,
-    generate_model_alignment,
-)
+from apps.audiobooks.alignment import generate_model_alignment
 from config import ConfigClass
 from extensions import db
 from models.audio_book import AudioBook, AudioBookPage, AudioBookProgress
@@ -1056,15 +1053,16 @@ def should_generate_text_from_audio(page):
     return not bool(str(page.official_text or '').strip())
 
 
-def generate_page_alignment(book, page):
+def validate_alignment_prerequisites(page, source_text_from_audio):
     if not page.audio_path or not os.path.exists(page.audio_path):
         raise ValueError('Page audio is required before model alignment')
-
-    options = parse_model_alignment_options()
-    source_text_from_audio = should_generate_text_from_audio(page)
-    official_text = None if source_text_from_audio else page.official_text
-    if not source_text_from_audio and not str(official_text or '').strip():
+    if not source_text_from_audio and not str(page.official_text or '').strip():
         raise ValueError('Official text is required before model alignment')
+
+
+def generate_page_alignment(book, page, source_text_from_audio, options):
+    validate_alignment_prerequisites(page, source_text_from_audio)
+    official_text = None if source_text_from_audio else page.official_text
 
     alignment = generate_model_alignment(
         page.audio_path,
@@ -1458,6 +1456,26 @@ def handle_save_alignment(book_id, page_id, role):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 
+def run_generate_alignment_job(app_obj, book_id, page_id, source_text_from_audio, options):
+    # Runs on a background thread, so there is no request/login context here - fetch the
+    # rows directly instead of the permission-checked helpers (permission was already
+    # verified once, synchronously, before this thread was started).
+    with app_obj.app_context():
+        try:
+            page = AudioBookPage.query.get(page_id)
+            if not page:
+                return
+            book = AudioBook.query.get(book_id)
+            generate_page_alignment(book, page, source_text_from_audio, options)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            page = AudioBookPage.query.get(page_id)
+            if page:
+                page.alignment_status = 'failed'
+                db.session.commit()
+
+
 def handle_generate_alignment(book_id, page_id, role):
     page = None
     try:
@@ -1468,26 +1486,32 @@ def handle_generate_alignment(book_id, page_id, role):
         if not page:
             return jsonify({'message': 'Audiobook page not found'}), 404
 
+        if page.alignment_status in ('processing-local', 'queued-local'):
+            return jsonify({
+                'message': 'Text generation is already in progress for this page.',
+                'page': serialize_audio_book_page(page, role=role)
+            }), 409
+
+        options = parse_model_alignment_options()
+        source_text_from_audio = should_generate_text_from_audio(page)
+        validate_alignment_prerequisites(page, source_text_from_audio)
+
         page.alignment_status = 'processing-local'
         db.session.commit()
 
-        generate_page_alignment(book, page)
-        db.session.commit()
+        app_obj = current_app._get_current_object()
+        threading.Thread(
+            target=run_generate_alignment_job,
+            args=(app_obj, book_id, page_id, source_text_from_audio, options),
+            daemon=True
+        ).start()
+
         return jsonify({
-            'message': 'Model alignment generated successfully',
+            'message': 'Text generation started. This can take several minutes for longer pages.',
             'page': serialize_audio_book_page(page, role=role)
-        }), 200
-    except AudioAlignmentUnavailable as error:
+        }), 202
+    except ValueError as error:
         db.session.rollback()
-        if page:
-            page.alignment_status = 'failed'
-            db.session.commit()
-        return jsonify({'message': str(error)}), 503
-    except (AudioAlignmentError, ValueError) as error:
-        db.session.rollback()
-        if page:
-            page.alignment_status = 'failed'
-            db.session.commit()
         return jsonify({'message': str(error)}), 400
     except Exception as error:
         db.session.rollback()

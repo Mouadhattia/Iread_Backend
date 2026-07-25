@@ -37,6 +37,7 @@ from models.user_shcool import User_shcool
 from models.Follow_book import Follow_book
 from models.game_result import Game_result
 from models.user_log import UserLog
+from models.admin_audit_log import AdminAuditLog
 from models.word_progress import WordProgress, UserAchievement
 from models.session import Session,Location
 from models.pack_template import Pack_template
@@ -498,6 +499,57 @@ def admin_required(f):
             return abort(401)
         return f(*args, **kwargs)
     return decorated_function
+
+def is_admin_or_assistant_role():
+    return (
+        current_user.is_authenticated and
+        current_user.type in (ADMIN_ROLES | {'assistant'}) and
+        current_user.confirmed and
+        current_user.approved
+    )
+
+## @brief Decorator to enforce admin-or-assistant access for a view function.
+#
+# Assistants share the school-scoped user/book/pack/session management pages with
+# admins (see Dashboard-iread-last-version's DashboardAssistant nav), so these routes
+# need to allow both roles rather than admin_required's admin/super_admin-only check.
+#
+# @param f: The view function to be decorated.
+# @return: The decorated function that enforces admin-or-assistant access.
+def admin_or_assistant_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not is_admin_or_assistant_role():
+            return abort(401)
+        return f(*args, **kwargs)
+    return decorated_function
+
+## @brief Records an admin/assistant/super-admin action for accountability.
+#
+# Best-effort: a logging failure must never break the action it is recording,
+# so errors are swallowed after rolling back the (separate) failed insert.
+#
+# @param action: short verb describing what happened, e.g. 'delete', 'create', 'suspend'.
+# @param target_type: the kind of entity acted on, e.g. 'user', 'school', 'pack'.
+# @param target_id: the primary key of the affected entity, if any.
+# @param details: optional short human-readable context (already-serialized string).
+def log_admin_action(action, target_type, target_id=None, details=None):
+    try:
+        actor = current_user if current_user.is_authenticated else None
+        entry = AdminAuditLog(
+            actor_id=actor.id if actor else None,
+            actor_username=getattr(actor, 'username', None),
+            actor_role=getattr(actor, 'type', None),
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            details=details
+        )
+        db.session.add(entry)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logging.error(f"Failed to write admin audit log: {str(e)}")
 
 def get_current_school_id():
     membership = User_shcool.query.filter_by(user_id=current_user.id).first()
@@ -1889,6 +1941,8 @@ def super_create_user():
 
         db.session.commit()
 
+        log_admin_action('create', 'user', new_user.id, f'username={username}, role={role}')
+
         return jsonify({
             'message': 'User created successfully',
             'user': serialize_super_user_detail(new_user)
@@ -1988,6 +2042,8 @@ def super_update_user(user_id):
 
         db.session.commit()
 
+        log_admin_action('update', 'user', user_id, f'fields={list(data.keys())}')
+
         email_sent = None
         email_error = None
         if was_pending_school_admin and user.approved:
@@ -2037,9 +2093,16 @@ def super_delete_user(user_id):
         if user.type == 'super_admin' and SuperAdmin.query.count() <= 1:
             return jsonify({'message': 'Cannot delete the last super admin'}), 400
 
+        deleted_username = user.username
+        deleted_type = user.type
         delete_super_user_dependencies(user.id)
         db.session.delete(user)
         db.session.commit()
+
+        log_admin_action(
+            'delete', 'user', user_id,
+            f'username={deleted_username}, type={deleted_type}'
+        )
 
         return jsonify({'message': 'User deleted successfully'}), 200
     except Exception as error:
@@ -2068,6 +2131,8 @@ def super_approve_user(user_id=None):
         user.confirmed = True
         user.approved = True
         db.session.commit()
+
+        log_admin_action('approve', 'user', user_id, f'username={user.username}, type={user.type}')
 
         email_sent = None
         email_error = None
@@ -2113,6 +2178,8 @@ def super_suspend_user(user_id):
         user.suspended_reason = data.get('reason')
         db.session.commit()
 
+        log_admin_action('suspend', 'user', user_id, f'reason={user.suspended_reason}')
+
         return jsonify({
             'message': 'User suspended successfully',
             'user': serialize_super_user_detail(user)
@@ -2135,6 +2202,8 @@ def super_activate_user(user_id):
         user.suspended_by = None
         user.suspended_reason = None
         db.session.commit()
+
+        log_admin_action('activate', 'user', user_id)
 
         return jsonify({
             'message': 'User reactivated successfully',
@@ -2902,6 +2971,41 @@ def super_get_schools():
     except Exception as error:
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
+def serialize_admin_audit_log_entry(entry):
+    return {
+        'id': entry.id,
+        'actor_id': entry.actor_id,
+        'actor_username': entry.actor_username,
+        'actor_role': entry.actor_role,
+        'action': entry.action,
+        'target_type': entry.target_type,
+        'target_id': entry.target_id,
+        'details': entry.details,
+        'created_at': entry.created_at.isoformat() if entry.created_at else None
+    }
+
+## @brief Read-only feed of admin/assistant/super-admin actions (create, update,
+# delete, approve, suspend, activate) for accountability — see log_admin_action().
+@admin.route('/super/audit-log', methods=['GET'])
+def super_get_audit_log():
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        entries_query = AdminAuditLog.query
+        action = request.args.get('action')
+        if action:
+            entries_query = entries_query.filter(AdminAuditLog.action == action)
+        target_type = request.args.get('target_type')
+        if target_type:
+            entries_query = entries_query.filter(AdminAuditLog.target_type == target_type)
+
+        entries_query = entries_query.order_by(AdminAuditLog.created_at.desc())
+        return jsonify(paginate_super_admin_query(entries_query, serialize_admin_audit_log_entry, 'entries')), 200
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
 @admin.route('/super/schools/<int:school_id>/suspend', methods=['POST'])
 def super_suspend_school(school_id):
     if not is_super_admin():
@@ -2917,6 +3021,8 @@ def super_suspend_school(school_id):
         school.suspended_by = current_user.id
         school.suspended_reason = data.get('reason')
         db.session.commit()
+
+        log_admin_action('suspend', 'school', school_id, f'reason={school.suspended_reason}')
 
         return jsonify({
             'message': 'School suspended successfully',
@@ -2940,6 +3046,8 @@ def super_activate_school(school_id):
         school.suspended_by = None
         school.suspended_reason = None
         db.session.commit()
+
+        log_admin_action('activate', 'school', school_id)
 
         return jsonify({
             'message': 'School reactivated successfully',
@@ -3344,8 +3452,8 @@ def confirm(token):
 #
 # @return: A JSON object containing information about all users.
 @admin.route('/show_all_readers')
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def show_all_readers():
     try:
 
@@ -3415,8 +3523,8 @@ def get_users_following_pack(pack_id):
 
 # get all teachers
 @admin.route('/show_all_teachers')
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def show_all_teachers():
     try:
         # Retrieve the school associated with the current user
@@ -3448,8 +3556,8 @@ def show_all_teachers():
         return jsonify({'message': 'Internal server error'}), 500
 
 @admin.route('/show_all_assistants')
-# @login_required
-# @admin_required
+@login_required
+@admin_required
 def show_all_assistants():
     try:
         user_ids = get_current_school_user_ids()
@@ -3480,8 +3588,8 @@ def show_all_assistants():
 
 @admin.route('/get_user/<int:user_id>', methods=['GET'])
 
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def get_user(user_id):
     try:
         user = get_school_user(user_id)
@@ -3511,8 +3619,8 @@ def get_user(user_id):
 
 
 @admin.route('/update_user', methods=['PUT'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def update_user():
     try:
         data = request.json
@@ -3544,6 +3652,7 @@ def update_user():
 
             # Assuming you're using some sort of database session management, commit the changes
             db.session.commit()
+            log_admin_action('update', 'user', user.id, f'fields={list(data.keys())}')
             response_data = {
                 'message': 'Reader updated successfully',
                 'teacher': {
@@ -3565,8 +3674,8 @@ def update_user():
 
 
 @admin.route('/create_user',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def create_user():
     try:
         # Get data from the request
@@ -3623,6 +3732,8 @@ def create_user():
         db.session.add(User_shcool(user_id=new_user.id, shcool_id=shcool.shcool_id))
         db.session.commit()
 
+        log_admin_action('create', 'user', new_user.id, f'username={username}, role=reader')
+
         # Return a success response
         response_data = {
             'message': 'Your account has been successfully created.',
@@ -3646,8 +3757,8 @@ def create_user():
 
 
 @admin.route('/create_assistant', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_required
 def create_assistant():
     try:
         # Get data from the request
@@ -3695,6 +3806,8 @@ def create_assistant():
                 db.session.add(new_user_shcool)
                 db.session.commit()
 
+                log_admin_action('create', 'user', new_user.id, f'username={username}, role=assistant')
+
                 # Return a success response
                 response_data = {
                     'message': 'Your account has been successfully created.',
@@ -3705,7 +3818,7 @@ def create_assistant():
                         'id': new_user.id,
                         'img': new_user.img
                     }
-                }    
+                }
                 return jsonify(response_data), 201
             else:
                 password_hash = bcrypt.generate_password_hash(password)
@@ -3734,6 +3847,8 @@ def create_assistant():
                 db.session.add(new_user_shcool)
                 db.session.commit()
 
+                log_admin_action('create', 'user', new_user.id, f'username={username}, role=assistant')
+
                 # Return a success response
                 response_data = {
                     'message': 'Your account has been successfully created.',
@@ -3744,7 +3859,7 @@ def create_assistant():
                         'id': new_user.id,
                         'img': new_user.img
                     }
-                }    
+                }
                 return jsonify(response_data), 201
                  
                  
@@ -3758,8 +3873,8 @@ def create_assistant():
 
 
 @admin.route('/create_teacher',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def create_teacher():
     try:
         # Get data from the request
@@ -3803,6 +3918,7 @@ def create_teacher():
                 )
             db.session.add(new_user_shcool)
             db.session.commit()
+            log_admin_action('create', 'user', new_user.id, f'username={username}, role=teacher')
             # Return a success response
             response_data = {
                 'message': 'Your account has been successfully created.',
@@ -3826,8 +3942,8 @@ def create_teacher():
 
 
 @admin.route('/update_teacher', methods=['PUT'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 
 def update_teacher():
     data = request.json
@@ -3865,6 +3981,8 @@ def update_teacher():
         # Commit the changes to the database
         db.session.commit()
 
+        log_admin_action('update', 'user', teacher.id, f'fields={list(data.keys())}')
+
         # Return a success response
         response_data = {
             'message': 'Teacher updated successfully',
@@ -3888,8 +4006,8 @@ def update_teacher():
 
 
 @admin.route('/approved_user',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def approved_user():
     try:
         id=request.json['id']
@@ -3899,6 +4017,7 @@ def approved_user():
             user.approved=True
             user.confirmed =True
             db.session.commit()
+            log_admin_action('approve', 'user', user.id, f'username={user.username}, type={user.type}')
             return jsonify({'message':'Account approved sucessfully'}),200
 
         else :
@@ -3916,16 +4035,22 @@ def approved_user():
 # @param email: The email of the user whose account needs to be deleted.
 # @return: A JSON object indicating whether the account deletion was successful or not.
 @admin.route('/delete_user',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_user():
     try:
         id = request.json['id']
         user = get_school_user(id)
         
         if user:
+            deleted_username = user.username
+            deleted_type = user.type
             db.session.delete(user)
             db.session.commit()
+            log_admin_action(
+                'delete', 'user', id,
+                f'username={deleted_username}, type={deleted_type}'
+            )
             return jsonify({'message': 'Account deleted successfully'}), 200
         else:
             return jsonify({'message': 'Invalid ID'}), 404
@@ -4652,8 +4777,8 @@ def get_admin_session_video_call(session_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/update_session', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def update_session():
     try:
         data = request.json
@@ -4836,8 +4961,8 @@ def get_all_units(id):
         return jsonify({'message': 'Internal server error'}), 500
 #delete unit 
 @admin.route('/delete_unit', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_unit():
     try:
         token = request.json['id']
@@ -4853,8 +4978,8 @@ def delete_unit():
 
 #create unit 
 @admin.route('/create_unit',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def create_unit():
     try:
         data = request.get_json()
@@ -4969,8 +5094,8 @@ def update_unit():
 # @return: A JSON object indicating whether the book deletion was successful or not.
 
 @admin.route('/delete_book', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_book():
     try:
         token = request.json['id']
@@ -5110,8 +5235,8 @@ def unarchive_book(book_id):
 #
 # @return: A JSON object indicating whether the book creation was successful or not.
 @admin.route('/create_book',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def create_book():   
     try:
         data = request.get_json(silent=True) or {}
@@ -6022,8 +6147,8 @@ def create_pack():
         return jsonify({'message': 'Internal server error'}), 500
 
 @admin.route('/add_book_to_pack',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def add_book_to_pack():
     try:
         pack_token=request.json['pack_id']
@@ -6064,8 +6189,8 @@ def add_book_to_pack():
 
 
 @admin.route('/delete_book_from_pack', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_book_from_pack():
     try:
         book_token = request.json['book_id']
@@ -6095,8 +6220,8 @@ def delete_book_from_pack():
 
 
 @admin.route('/delete_pack', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_pack():
     try:
         token = (request.get_json(silent=True) or {}).get('id')
@@ -6146,8 +6271,8 @@ def delete_pack():
 
 
 @admin.route('/update_pack_details', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def update_pack_details():
     try:
         data = request.json
@@ -6300,8 +6425,8 @@ def revoke_teacher_role():
 
 
 @admin.route('/show_pack_follow_requests')
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def show_pack_follow_requests():
     try:
         school_id = get_current_school_id()
@@ -6349,8 +6474,8 @@ def show_pack_follow_requests():
         return jsonify({'message': 'Internal server error'}), 500
 # Define a new route to approve follow requests.
 @admin.route('/approve_pack_follow_request', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def approve_follow_request():
     try:
         # Get pack_id and user_id from the request JSON data.
@@ -6386,8 +6511,8 @@ def approve_follow_request():
 
  # Define a new route to approve follow requests.
 @admin.route('/reject_pack_follow_request', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def reject_follow_request():
     try:
         # Get pack_id and user_id from the request JSON data.
@@ -6419,8 +6544,8 @@ def reject_follow_request():
 
 # Define a route to delete a follow request.
 @admin.route('/delete_follow_request', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_follow_request():
     try:
         # Get pack_id and user_id from the request JSON data.
@@ -6452,7 +6577,8 @@ def delete_follow_request():
 
 #create follow pack 
 @admin.route('/create_follow_pack', methods=['POST'])
-# @login_required
+@login_required
+@admin_or_assistant_required
 def create_follow_pack():
     try:
         pack_id = request.json.get('pack_id')
@@ -6500,8 +6626,8 @@ def create_follow_pack():
 
 # Define a route to get follow requests by user and pack ID.
 @admin.route('/get_one_pack_follow_requests', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def get_one_pack_follow_requests():
     try:
 
@@ -6547,7 +6673,8 @@ def get_one_pack_follow_requests():
 
 #create follow session 
 @admin.route('/create_follow_session', methods=['POST'])
-# @login_required
+@login_required
+@admin_or_assistant_required
 def create_follow_session():
     try:
         session_id = request.json.get('session_id')
@@ -6603,8 +6730,8 @@ def create_follow_session():
 
 
 @admin.route('/show_session_follow_requests')
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def show_session_follow_requests():
     try:
         school_id = get_current_school_id()
@@ -6657,8 +6784,8 @@ def show_session_follow_requests():
         return jsonify({'message': 'Internal server error'}), 500
 
 @admin.route('/approve_session_follow_request', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def approve_session_follow_request():
     try:
         # Get session_id and user_id from the request JSON data.
@@ -6693,8 +6820,8 @@ def approve_session_follow_request():
         return jsonify({'message': 'Internal server error'}), 500
 
 @admin.route('/reject_session_follow_request', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def reject_session_follow_request():
     try:
         # Get session_id and user_id from the request JSON data.
@@ -6726,8 +6853,8 @@ def reject_session_follow_request():
         
 # Define a route to delete a follow request.
 @admin.route('/delete_session_follow_request', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_session_follow_request():
     try:
         # Get session_id and user_id from the request JSON data.
@@ -6764,8 +6891,8 @@ def delete_session_follow_request():
 
 # Define a route to get follow requests by user and session ID.
 @admin.route('/get_one_session_follow_requests', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def get_one_session_follow_requests():
     try:
         # Get session_id and user_id from the request JSON data.
@@ -6808,8 +6935,8 @@ def get_one_session_follow_requests():
         return jsonify({'message': 'Internal server error'}), 500
 
 @admin.route('/add_quiz_to_session', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def add_quiz_to_session():
     try:
         # Get data from the request
@@ -6850,8 +6977,8 @@ def add_quiz_to_session():
 
 
 @admin.route('/delete_quiz_from_session',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def delete_quiz_from_session():
     try:
         session_id = request.json['session_id']
@@ -6875,8 +7002,8 @@ def delete_quiz_from_session():
 
 
 @admin.route('/get_quiz_in_session',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def get_quiz_in_session():
     try:
         session_id = request.json['session_id']
@@ -8006,8 +8133,8 @@ def get_about_book_by_book_id(book_id):
 
 
 @admin.route('/create_notification', methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_required
 def create_notification():
     try:
         # Get data from the request
@@ -8045,8 +8172,8 @@ def create_notification():
 
 
 @admin.route('/delete_notification',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_required
 def delete_notification():
     try:
         id = request.json['id']
@@ -8067,8 +8194,8 @@ def delete_notification():
 
 
 @admin.route('/get_notification',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_required
 def get_notification():
     try:
         user_id = request.json['user_id']
@@ -8094,8 +8221,8 @@ def get_notification():
 
 
 @admin.route('/get_users_in_pack',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def get_users_in_pack():
     try:
         pack_id = request.json['pack_id']
@@ -8126,8 +8253,8 @@ def get_users_in_pack():
         return jsonify({'message': 'Internal server error'}), 500   
 
 @admin.route('/paser_story',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def paser_story():
     try:
         text = request.json['text']
@@ -8145,8 +8272,8 @@ def paser_story():
 
             
 @admin.route('/get_word',methods=['POST'])
-# @login_required
-# @admin_required
+@login_required
+@admin_or_assistant_required
 def get_word():
     try:
         word = request.json['word']
@@ -8420,6 +8547,8 @@ def create_shcool():
 
         db.session.commit()
 
+        log_admin_action('create', 'school', new_shcool.id, f'name={new_shcool.name}')
+
         result = {
             'id':new_shcool.id,
             'name':new_shcool.name
@@ -8470,6 +8599,7 @@ def update_shcool(id):
             return jsonify({'message': 'This school name is already used. Please choose another'}), 409
         shcool.name = name
         db.session.commit()
+        log_admin_action('update', 'school', id, f'name={name}')
         res ={
             'id':id,
             'name':name
@@ -8485,9 +8615,11 @@ def delete_shcool(id):
         return jsonify({'message': 'Super admin access required'}), 403
     try:
         shcool = Shcool.query.get_or_404(id)
+        deleted_name = shcool.name
         SchoolPublicPage.query.filter_by(shcool_id=shcool.id).delete(synchronize_session=False)
         db.session.delete(shcool)
         db.session.commit()
+        log_admin_action('delete', 'school', id, f'name={deleted_name}')
         return jsonify({'message': 'Shcool deleted successfully'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

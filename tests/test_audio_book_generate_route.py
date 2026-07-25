@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from flask import Flask
 
@@ -46,8 +46,20 @@ class FakePage:
         self.similarity = None
 
 
+class SynchronousFakeThread:
+    """Runs the job inline instead of on a real OS thread, so tests stay deterministic."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self.target = target
+        self.args = args
+        self.kwargs = kwargs or {}
+
+    def start(self):
+        self.target(*self.args, **self.kwargs)
+
+
 class AudioBookGenerateAlignmentRouteTest(unittest.TestCase):
-    def test_generate_alignment_route_saves_text_from_audio(self):
+    def test_generate_alignment_route_runs_job_and_saves_text_from_audio(self):
         app = Flask(__name__)
         fake_audio = tempfile.NamedTemporaryFile(delete=False)
         fake_audio.close()
@@ -98,6 +110,11 @@ class AudioBookGenerateAlignmentRouteTest(unittest.TestCase):
             },
         }
 
+        page_query = MagicMock()
+        page_query.get.return_value = page
+        book_query = MagicMock()
+        book_query.get.return_value = book
+
         try:
             with app.test_request_context(
                 '/admin/audio-books/1/pages/2/generate-alignment',
@@ -106,13 +123,19 @@ class AudioBookGenerateAlignmentRouteTest(unittest.TestCase):
             ):
                 with patch.object(routes, 'get_manageable_audio_book', return_value=book), \
                     patch.object(routes, 'get_book_page', return_value=page), \
+                    patch.object(routes.AudioBookPage, 'query', page_query), \
+                    patch.object(routes.AudioBook, 'query', book_query), \
                     patch.object(routes, 'generate_model_alignment', return_value=generated_alignment) as model_mock, \
-                    patch.object(routes.db, 'session', fake_session):
+                    patch.object(routes.db, 'session', fake_session), \
+                    patch.object(routes.threading, 'Thread', SynchronousFakeThread):
                     response, status_code = routes.handle_generate_alignment(1, 2, 'admin')
 
             data = response.get_json()
 
-            self.assertEqual(status_code, 200)
+            # The route responds immediately (202) instead of blocking for the whole
+            # transcription; the synchronous fake thread above still lets us verify the
+            # background job itself produced the correct end state deterministically.
+            self.assertEqual(status_code, 202)
             self.assertEqual(data['page']['official_text'], 'Hello from audio.')
             self.assertEqual(data['page']['alignment_json']['officialText'], 'Hello from audio.')
             self.assertEqual(data['page']['alignment_json']['textSource'], 'audio-transcript')
@@ -129,6 +152,32 @@ class AudioBookGenerateAlignmentRouteTest(unittest.TestCase):
                 language='en',
                 options={},
             )
+        finally:
+            os.unlink(fake_audio.name)
+
+    def test_generate_alignment_route_rejects_when_already_processing(self):
+        app = Flask(__name__)
+        fake_audio = tempfile.NamedTemporaryFile(delete=False)
+        fake_audio.close()
+
+        page = FakePage(fake_audio.name)
+        page.alignment_status = 'processing-local'
+        book = SimpleNamespace(id=1, language='en')
+        fake_session = FakeSession()
+
+        try:
+            with app.test_request_context(
+                '/admin/audio-books/1/pages/2/generate-alignment',
+                method='POST',
+                json={'source_text_from_audio': True},
+            ):
+                with patch.object(routes, 'get_manageable_audio_book', return_value=book), \
+                    patch.object(routes, 'get_book_page', return_value=page), \
+                    patch.object(routes.db, 'session', fake_session):
+                    response, status_code = routes.handle_generate_alignment(1, 2, 'admin')
+
+            self.assertEqual(status_code, 409)
+            self.assertEqual(fake_session.commits, 0)
         finally:
             os.unlink(fake_audio.name)
 
