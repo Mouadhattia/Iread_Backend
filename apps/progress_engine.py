@@ -144,6 +144,14 @@ def submit_attempt(user_id, book_id, surface_form, game, mode, correct,
     newly_mastered = correct and previous_stage != STAGE_MASTERED and progress.stage == STAGE_MASTERED
     streak_state = _update_streak(user_id, occurred_on)
     unlocked = _evaluate_achievements(user_id) if correct else []
+    # Passport certificates ride on the milestones the achievement pass just
+    # unlocked (band cleared / book mastered) — no extra queries. Local import
+    # avoids a circular dependency (certificates reconcile via this engine).
+    if unlocked:
+        from apps.certificates import issue_certificates_from_unlocked
+        new_certificates = issue_certificates_from_unlocked(user_id, unlocked)
+    else:
+        new_certificates = []
     near_miss = find_nearest_near_miss(user_id)
 
     return {
@@ -156,6 +164,7 @@ def submit_attempt(user_id, book_id, surface_form, game, mode, correct,
         'cefr_level': word_sense.effective_cefr_level,
         'streak': streak_state,
         'unlocked_achievements': unlocked,
+        'new_certificates': new_certificates,
         'nearest_near_miss': near_miss,
     }
 

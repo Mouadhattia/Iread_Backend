@@ -58,6 +58,7 @@ from apps.progress_engine import (
     record_self_reported_word,
     submit_attempt,
 )
+from apps.certificates import get_certificates_for_user, issue_certificates_for_user
 from extensions import mail,login_manager,db
 from flask_mail import Message
 from config import ConfigClass
@@ -581,10 +582,28 @@ def serialize_book_for_pack(book, audio_map=None):
         'audio_book_id': audio_book_id
     }
 
+def user_in_active_school(user_id, school_id):
+    """Membership in a school that is still active. A closed/suspended school
+    grants no content access (PRD §7): the reader keeps their account and
+    passport, but that school's paid packs/books stop resolving. Followed and
+    public/global packs are handled separately and are unaffected."""
+    if not user_id or not school_id:
+        return False
+    return (
+        User_shcool.query
+        .join(Shcool, Shcool.id == User_shcool.shcool_id)
+        .filter(
+            User_shcool.user_id == user_id,
+            User_shcool.shcool_id == school_id,
+            Shcool.is_active.is_(True),
+        )
+        .first() is not None
+    )
+
 def reader_has_school_access(school_id):
     if not current_user.is_authenticated or not school_id:
         return False
-    return User_shcool.query.filter_by(user_id=current_user.id, shcool_id=school_id).first() is not None
+    return user_in_active_school(current_user.id, school_id)
 
 def school_has_platform_book_access(school_id, book_id):
     if not school_id or not book_id:
@@ -628,6 +647,26 @@ def reader_can_access_platform_book_in_any_school(book):
         for membership in memberships
     )
 
+def reader_follows_pack_with_book(book_id):
+    """True if the current reader has followed (redeemed a code for) any pack
+    that contains this book. This is the school-independent access path that
+    lets a B2C / school-less reader open the stories of a global pack they've
+    subscribed to with an iRead code — exactly the way a student reads a school
+    pack they've redeemed a code for (PRD §4). A Follow_pack is only ever
+    created approved via a valid code, so following is itself the authorization."""
+    if not current_user.is_authenticated or not book_id:
+        return False
+    return (
+        db.session.query(Follow_pack.pack_id)
+        .join(Book_pack, Book_pack.pack_id == Follow_pack.pack_id)
+        .filter(
+            Follow_pack.user_id == current_user.id,
+            Follow_pack.approved.is_(True),
+            Book_pack.book_id == book_id,
+        )
+        .first() is not None
+    )
+
 def get_reader_story_progress(story_id):
     if not current_user.is_authenticated:
         return None
@@ -661,6 +700,11 @@ def user_can_access_story(story):
     book = Book.query.get(story.book_id)
     if not book:
         return False
+    # School-independent access: a reader who followed a pack containing this
+    # book (via an iRead or school code) can read its stories, even with no
+    # school membership at all (B2C, PRD §4).
+    if reader_follows_pack_with_book(book.id):
+        return True
     if story.shcool_id is not None:
         return reader_can_access_book_in_school(book, story.shcool_id)
 
@@ -741,7 +785,7 @@ def user_can_view_pack(pack):
         return False
     if Follow_pack.query.filter_by(user_id=current_user.id, pack_id=pack.id).first():
         return True
-    return User_shcool.query.filter_by(user_id=current_user.id, shcool_id=pack.shcool_id).first() is not None
+    return user_in_active_school(current_user.id, pack.shcool_id)
 
 def user_can_view_pack_in_school(pack, school_id):
     if not pack or not getattr(pack, 'active', True):
@@ -756,7 +800,7 @@ def user_can_view_pack_in_school(pack, school_id):
         return True
     if not current_user.is_authenticated:
         return False
-    if User_shcool.query.filter_by(user_id=current_user.id, shcool_id=school_id).first() is None:
+    if not user_in_active_school(current_user.id, school_id):
         return False
     if getattr(pack, 'is_global_pack', False):
         return school_has_global_pack_access(school_id, pack.id)
@@ -2170,22 +2214,40 @@ def join_school_by_invitation():
 @login_required
 def get_reader_book_stories(book_id):
     try:
-        school_id, school_error, school_status = resolve_current_user_school_id()
-        if school_error:
-            return jsonify({'message': school_error}), school_status
-
         book = Book.query.get(book_id)
-        if not reader_can_access_book_in_school(book, school_id):
-            return jsonify({'message': 'Book not found in this school'}), 404
+        if not book:
+            return jsonify({'message': 'Book not found'}), 404
 
-        if getattr(book, 'is_platform_book', False):
-            stories_query = BookStory.query.filter(
-                BookStory.book_id == book_id,
-                BookStory.shcool_id.is_(None),
-                BookStory.active.is_(True)
-            )
+        # School-independent path first: a reader who followed a pack containing
+        # this book (e.g. a B2C reader who redeemed an iRead code for a global
+        # pack) reads its stories without needing a school context at all.
+        if reader_follows_pack_with_book(book_id):
+            if getattr(book, 'is_platform_book', False):
+                stories_query = BookStory.query.filter(
+                    BookStory.book_id == book_id,
+                    BookStory.shcool_id.is_(None),
+                    BookStory.active.is_(True)
+                )
+            else:
+                stories_query = BookStory.query.filter_by(
+                    book_id=book_id, shcool_id=book.shcool_id, active=True
+                )
         else:
-            stories_query = BookStory.query.filter_by(book_id=book_id, shcool_id=school_id, active=True)
+            school_id, school_error, school_status = resolve_current_user_school_id()
+            if school_error:
+                return jsonify({'message': school_error}), school_status
+
+            if not reader_can_access_book_in_school(book, school_id):
+                return jsonify({'message': 'Book not found in this school'}), 404
+
+            if getattr(book, 'is_platform_book', False):
+                stories_query = BookStory.query.filter(
+                    BookStory.book_id == book_id,
+                    BookStory.shcool_id.is_(None),
+                    BookStory.active.is_(True)
+                )
+            else:
+                stories_query = BookStory.query.filter_by(book_id=book_id, shcool_id=school_id, active=True)
 
         stories = stories_query.order_by(BookStory.id.desc()).all()
         return jsonify({'stories': [serialize_reader_story(story) for story in stories]}), 200
@@ -4471,6 +4533,139 @@ def get_words_i_know_route():
         return jsonify(payload), status_code
     except Exception as error:
         logging.error('Words I know failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+# ---------------------------------------------------------------------------
+# Global Reading Passport (PRD §2) — one portable record of the reader's whole
+# journey, independent of any school. Aggregates identity, the schools that
+# have supported the learner, reading history, vocabulary/CEFR progress,
+# achievements, and certificates.
+# ---------------------------------------------------------------------------
+
+def _count_earned_achievements(achievement_catalog):
+    earned = 0
+    total = 0
+    for entry in achievement_catalog:
+        tiers = entry.get('tiers')
+        if tiers:
+            total += len(tiers)
+            earned += sum(1 for tier in tiers if tier.get('earned'))
+        else:
+            total += 1
+            if entry.get('earned'):
+                earned += 1
+    return earned, total
+
+
+def build_reader_passport(user_id, include_email=False):
+    reader = User.query.get(user_id)
+    if reader is None:
+        return None
+
+    memberships = (
+        db.session.query(User_shcool, Shcool)
+        .join(Shcool, Shcool.id == User_shcool.shcool_id)
+        .filter(User_shcool.user_id == user_id)
+        .all()
+    )
+    schools = [
+        {
+            'id': school.id,
+            'name': school.name,
+            'is_active': school.is_active,
+            'is_default': membership.is_default,
+        }
+        for membership, school in memberships
+    ]
+
+    completed_stories = ReaderStoryProgress.query.filter_by(user_id=user_id, completed=True).count()
+    stories_in_progress = ReaderStoryProgress.query.filter(
+        ReaderStoryProgress.user_id == user_id,
+        ReaderStoryProgress.completed.is_(False),
+    ).count()
+    books_completed = (
+        db.session.query(func.count(func.distinct(BookStory.book_id)))
+        .join(ReaderStoryProgress, ReaderStoryProgress.story_id == BookStory.id)
+        .filter(ReaderStoryProgress.user_id == user_id, ReaderStoryProgress.completed.is_(True))
+        .scalar()
+    ) or 0
+
+    # Reconcile certificates on view so a milestone earned before certificates
+    # existed still shows up in the passport.
+    issue_certificates_for_user(user_id)
+    certificates = get_certificates_for_user(user_id)
+
+    summary = get_progress_summary(user_id)
+    earned, total = _count_earned_achievements(get_achievement_status(user_id))
+
+    reader_level = getattr(reader, 'level', None) if reader.type == 'reader' else None
+
+    passport = {
+        'reader': {
+            'user_id': reader.id,
+            'username': reader.username,
+            'display_name': reader.display_name,
+            'img': reader.img,
+            'type': reader.type,
+            'passport_code': 'IRP-%06d' % reader.id,
+            'cefr_level': reader_level,
+            'member_since': reader.created_at.isoformat() if reader.created_at else None,
+        },
+        'schools': schools,
+        'reading': {
+            'stories_completed': completed_stories,
+            'stories_in_progress': stories_in_progress,
+            'books_completed': books_completed,
+        },
+        'vocabulary': {
+            'guessed_or_better': summary['guessed_or_better'],
+            'mastered': summary['mastered'],
+            'band_rollup': summary['band_rollup'],
+            'words_i_know_count': summary['words_i_know_count'],
+        },
+        'streak': summary['streak'],
+        'achievements': {'earned': earned, 'total': total},
+        'certificates': certificates,
+    }
+    if include_email:
+        passport['reader']['email'] = reader.email
+    return passport
+
+
+@reader.route('/passport', methods=['GET'])
+def get_reader_passport_route():
+    try:
+        user_id = _resolve_progress_user_id()
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+
+        own = current_user.is_authenticated and current_user.id == user_id
+        passport = build_reader_passport(user_id, include_email=own)
+        if passport is None:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+        return jsonify(passport), 200
+    except AttemptError as error:
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        logging.error('Reader passport failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@reader.route('/certificates', methods=['GET'])
+def get_reader_certificates_route():
+    try:
+        user_id = _resolve_progress_user_id()
+        if not user_id:
+            return jsonify({'message': 'User not found', 'code': 'USER_NOT_FOUND'}), 404
+        issue_certificates_for_user(user_id)
+        return jsonify({'certificates': get_certificates_for_user(user_id)}), 200
+    except AttemptError as error:
+        payload, status_code = attempt_error_response(error)
+        return jsonify(payload), status_code
+    except Exception as error:
+        logging.error('Reader certificates failed: %s', error, exc_info=True)
         return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
 
 

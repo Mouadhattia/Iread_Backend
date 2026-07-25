@@ -4029,6 +4029,67 @@ def delete_user():
         return jsonify({'message': 'Internal server error'}), 500
 
 
+@admin.route('/readers/<int:user_id>/remove_from_school', methods=['POST'])
+@login_required
+@admin_required
+def remove_reader_from_school(user_id):
+    """PRD §6 — offboard a student from a school WITHOUT touching their Global
+    Reading Passport. Removes only the User_shcool membership for the given
+    school; the reader's account, reading history, word progress, streaks,
+    achievements, and certificates all remain. Deliberately distinct from
+    /delete_user, which destroys the whole account."""
+    try:
+        data = request.get_json(silent=True) or {}
+        requested_school_id = data.get('school_id') or data.get('shcool_id')
+
+        if requested_school_id is not None:
+            school_id = int(requested_school_id)
+            if not is_super_admin():
+                allowed = get_scoped_school_ids()
+                if not allowed or school_id not in allowed:
+                    return jsonify({'message': 'You do not manage this school'}), 403
+        elif is_super_admin():
+            return jsonify({'message': 'school_id is required'}), 400
+        else:
+            school_id = get_current_school_id()
+            if not school_id:
+                return jsonify({'message': 'No school context for this admin'}), 400
+
+        reader = Reader.query.get(user_id)
+        if reader is None:
+            return jsonify({'message': 'Reader not found'}), 404
+
+        membership = User_shcool.query.filter_by(user_id=user_id, shcool_id=school_id).first()
+        if membership is None:
+            return jsonify({'message': 'This student is not enrolled in that school'}), 404
+
+        was_default = membership.is_default
+        db.session.delete(membership)
+        db.session.flush()
+
+        # Keep a sensible default among any remaining memberships so the
+        # reader still resolves a school context next time they sign in.
+        remaining = User_shcool.query.filter_by(user_id=user_id).all()
+        if was_default and remaining and not any(m.is_default for m in remaining):
+            remaining[0].is_default = True
+
+        db.session.commit()
+
+        return jsonify({
+            'message': 'Student removed from this school. Their Reading Passport is preserved.',
+            'user_id': user_id,
+            'school_id': school_id,
+            'remaining_schools': len(remaining),
+        }), 200
+    except (TypeError, ValueError):
+        db.session.rollback()
+        return jsonify({'message': 'school_id must be a number'}), 400
+    except Exception as error:
+        db.session.rollback()
+        logging.error('remove_reader_from_school failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
 ## @brief Route to revoke administrator roles from another administrator.
 #
 # This route is used by administrators to revoke administrator roles from another administrator based on the email provided.
@@ -7011,6 +7072,76 @@ def generate_codes(pack_id):
         return jsonify({"message": f"{num_codes_to_generate} codes generated successfully", "generated_codes": generated_codes})
     else:
         return jsonify({"error": "Pack not found"}), 404
+
+
+# ---------------------------------------------------------------------------
+# iRead-issued codes for GLOBAL packs (PRD §4). The school code endpoints above
+# are scoped to school-owned packs (get_school_pack excludes is_global_pack), so
+# global packs need their own super-admin code generation — the codes a B2C /
+# school-less reader redeems to follow (and then read) an official iRead pack,
+# exactly the way a student redeems a school code for a school pack.
+# ---------------------------------------------------------------------------
+
+def get_global_pack_for_codes(pack_id):
+    return Pack.query.filter_by(id=pack_id, is_global_pack=True).first()
+
+
+@admin.route('/super/global-packs/<int:pack_id>/codes', methods=['GET'])
+def super_get_global_pack_codes(pack_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    pack = get_global_pack_for_codes(pack_id)
+    if pack is None:
+        return jsonify({'message': 'Global pack not found'}), 404
+    codes = Code.query.filter_by(pack_id=pack_id, status=StatusEnum.ACTIVE).all()
+    return jsonify({
+        'id': pack.id,
+        'title': pack.title,
+        'codes': [
+            {'id': code.id, 'code': code.code, 'status': code.status.value, 'pack_id': code.pack_id}
+            for code in codes
+        ],
+    }), 200
+
+
+@admin.route('/super/global-packs/<int:pack_id>/codes', methods=['POST'])
+def super_generate_global_pack_codes(pack_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    pack = get_global_pack_for_codes(pack_id)
+    if pack is None:
+        return jsonify({'message': 'Global pack not found'}), 404
+
+    data = request.get_json() or {}
+    try:
+        num_codes = int(data.get('num_codes', 10))
+    except (TypeError, ValueError):
+        return jsonify({'message': 'num_codes must be a number'}), 400
+    if num_codes < 1 or num_codes > 500:
+        return jsonify({'message': 'num_codes must be between 1 and 500'}), 400
+
+    generated_codes = []
+    for _ in range(num_codes):
+        code = generate_unique_code(pack_id)
+        db.session.add(Code(pack_id=pack_id, code=code))
+        generated_codes.append(code)
+    db.session.commit()
+    return jsonify({
+        'message': f'{num_codes} codes generated successfully',
+        'generated_codes': generated_codes,
+    }), 200
+
+
+@admin.route('/super/global-packs/codes/<int:code_id>', methods=['DELETE'])
+def super_delete_global_pack_code(code_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    code = Code.query.get(code_id)
+    if code is None or get_global_pack_for_codes(code.pack_id) is None:
+        return jsonify({'message': 'Code not found'}), 404
+    db.session.delete(code)
+    db.session.commit()
+    return jsonify({'message': 'Code deleted successfully'}), 200
 
 @admin.route('/update_code/<int:code_id>', methods=['PUT'])
 def update_code_status(code_id):
