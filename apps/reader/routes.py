@@ -478,6 +478,11 @@ def get_valid_school_invitation(code):
 
     return invitation_code, None, None
 
+def add_user_to_default_school(user_id):
+    default_school = Shcool.query.filter_by(name="IRead").first()
+    if default_school:
+        add_user_to_school(user_id, default_school.id)
+
 def redeem_school_invitation_for_user(invitation_code, user_id):
     added = add_user_to_school(user_id, invitation_code.shcool_id)
     if added:
@@ -1303,6 +1308,8 @@ def register():
         if reader_account:
             if invitation_code:
                 redeem_school_invitation_for_user(invitation_code, reader_account.id)
+            else:
+                add_user_to_default_school(reader_account.id)
             db.session.commit()
 
         # Send a confirmation email as before
@@ -1371,6 +1378,8 @@ def google_register():
                 db.session.commit()
                 if invitation_code:
                     redeem_school_invitation_for_user(invitation_code, new_user.id)
+                else:
+                    add_user_to_default_school(new_user.id)
                 db.session.commit()
                 login_user(new_user)
                 return jsonify({'message':'Your are logged in succesfully','accounts':[]}),200
@@ -1806,6 +1815,8 @@ def create_account():
                 school = Shcool.query.get(selected_school_id)
         if school:
             add_user_to_school(new_account.id, school.id)
+        else:
+            add_user_to_default_school(new_account.id)
 
         db.session.commit()
         userData ={
