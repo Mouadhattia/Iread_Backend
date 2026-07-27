@@ -15,6 +15,13 @@ class SchoolPackInstance(db.Model):
     pack_id = db.Column(db.Integer, db.ForeignKey(Pack.id), nullable=False, index=True)
     created_by = db.Column(db.Integer, db.ForeignKey(User.id), nullable=False)
     active = db.Column(db.Boolean, nullable=False, default=True)
+    # Per-school publish flag + display-name override -- a global pack's
+    # `Pack.public`/`Pack.title` are shared across every school that has
+    # joined it (super-admin/B2C scope), so a school's own "publish this to
+    # my readers" and "rename it for my school" choices need their own
+    # per-instance fields instead of mutating the shared Pack row.
+    public = db.Column(db.Boolean, nullable=False, default=False)
+    display_name = db.Column(db.String(255), nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
 

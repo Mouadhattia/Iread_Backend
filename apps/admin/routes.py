@@ -1315,6 +1315,8 @@ def serialize_school_pack_instance(instance):
         'pack_id': instance.pack_id,
         'created_by': instance.created_by,
         'active': instance.active,
+        'public': instance.public,
+        'display_name': instance.display_name,
         'created_at': instance.created_at.isoformat() if instance.created_at else None,
         'updated_at': instance.updated_at.isoformat() if instance.updated_at else None,
         'pack': serialize_super_pack(pack, instance.shcool_id) if pack else None
@@ -1446,9 +1448,16 @@ def serialize_super_pack(pack, school_id=None):
         enrolled_count = enrolled_query.filter(Follow_pack.user_id.in_(school_user_ids)).count() if school_user_ids else 0
     else:
         enrolled_count = enrolled_query.count()
+    # A global pack's `public`/`title` are shared across every school that
+    # joined it (super-admin/B2C scope). When we have a school context,
+    # surface that school's own publish choice + rename instead.
+    effective_title = (instance.display_name or pack.title) if instance else pack.title
+    effective_public = instance.public if instance else pack.public
     return {
         'id': pack.id,
-        'title': pack.title,
+        'title': effective_title,
+        'default_title': pack.title,
+        'display_name': instance.display_name if instance else None,
         'level': pack.level,
         'age': pack.age.value if pack.age else None,
         'price': pack.price,
@@ -1459,7 +1468,7 @@ def serialize_super_pack(pack, school_id=None):
         'faq': pack.faq,
         'duration': pack.duration,
         'product_id_invoicing_api': pack.product_id_invoicing_api,
-        'public': pack.public,
+        'public': effective_public,
         'school_id': context_school_id if global_pack and context_school_id else pack.shcool_id,
         'shcool_id': context_school_id if global_pack and context_school_id else pack.shcool_id,
         'owner_school_id': pack.shcool_id,
@@ -3352,6 +3361,88 @@ def remove_global_pack_instance_by_pack(pack_id):
             'message': 'Global pack removed from this school',
             'pack_id': pack.id,
             'instance_id': instance.id
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/global-packs/<int:pack_id>/instance', methods=['PUT', 'PATCH'])
+def update_school_global_pack_instance(pack_id):
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+        pack = get_global_pack_or_404(pack_id)
+        if not pack:
+            return jsonify({'message': 'Global pack not found'}), 404
+        instance = get_school_global_pack_instance(school_id, pack.id)
+        if not instance:
+            return jsonify({'message': 'Global pack is not added to this school'}), 404
+
+        data = request.get_json() or {}
+        if 'display_name' in data:
+            display_name = str(data.get('display_name') or '').strip()
+            instance.display_name = display_name or None
+        db.session.add(instance)
+        db.session.commit()
+        return jsonify({
+            'message': 'Global pack updated for this school',
+            'instance': serialize_school_pack_instance(instance),
+            'pack': serialize_global_pack(pack, school_id=school_id)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/global-packs/<int:pack_id>/publish', methods=['POST'])
+def publish_school_global_pack(pack_id):
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+        pack = get_global_pack_or_404(pack_id)
+        if not pack:
+            return jsonify({'message': 'Global pack not found'}), 404
+        instance = get_school_global_pack_instance(school_id, pack.id)
+        if not instance:
+            return jsonify({'message': 'Global pack is not added to this school'}), 404
+
+        data = request.get_json(silent=True) or {}
+        if 'display_name' in data:
+            display_name = str(data.get('display_name') or '').strip()
+            instance.display_name = display_name or None
+        instance.public = True
+        db.session.add(instance)
+        db.session.commit()
+        return jsonify({
+            'message': 'Global pack published for this school',
+            'instance': serialize_school_pack_instance(instance),
+            'pack': serialize_global_pack(pack, school_id=school_id)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/global-packs/<int:pack_id>/unpublish', methods=['POST'])
+def unpublish_school_global_pack(pack_id):
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+        pack = get_global_pack_or_404(pack_id)
+        if not pack:
+            return jsonify({'message': 'Global pack not found'}), 404
+        instance = get_school_global_pack_instance(school_id, pack.id)
+        if not instance:
+            return jsonify({'message': 'Global pack is not added to this school'}), 404
+
+        instance.public = False
+        db.session.add(instance)
+        db.session.commit()
+        return jsonify({
+            'message': 'Global pack unpublished for this school',
+            'instance': serialize_school_pack_instance(instance),
+            'pack': serialize_global_pack(pack, school_id=school_id)
         }), 200
     except Exception as error:
         db.session.rollback()

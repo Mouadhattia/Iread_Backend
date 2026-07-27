@@ -623,6 +623,11 @@ def school_has_global_pack_access(school_id, pack_id):
         return False
     return SchoolPackInstance.query.filter_by(shcool_id=school_id, pack_id=pack_id, active=True).first() is not None
 
+def get_school_global_pack_instance(school_id, pack_id):
+    if not school_id or not pack_id:
+        return None
+    return SchoolPackInstance.query.filter_by(shcool_id=school_id, pack_id=pack_id, active=True).first()
+
 def reader_can_access_book_in_school(book, school_id):
     if not book or not getattr(book, 'active', True):
         return False
@@ -736,11 +741,16 @@ def get_books_in_pack(pack_id):
         .all()
     )
 
-def serialize_pack_details(pack):
+def serialize_pack_details(pack, school_id=None):
     enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
     num_active_codes = Code.query.filter_by(pack_id=pack.id, status=StatusEnum.ACTIVE).count()
     books = [serialize_book_for_pack(book) for book in get_books_in_pack(pack.id)]
     global_pack = bool(getattr(pack, 'is_global_pack', False))
+    # A global pack's title/public are shared platform-wide; a school's own
+    # rename + publish choice for it lives on its SchoolPackInstance instead.
+    instance = get_school_global_pack_instance(school_id, pack.id) if school_id and global_pack else None
+    effective_title = (instance.display_name or pack.title) if instance else pack.title
+    effective_public = instance.public if instance else pack.public
 
     return {
         'id': pack.id,
@@ -749,7 +759,9 @@ def serialize_pack_details(pack):
         'is_global_pack': global_pack,
         'source': 'global' if global_pack else 'school',
         'read_only': global_pack,
-        'title': pack.title,
+        'title': effective_title,
+        'default_title': pack.title,
+        'display_name': instance.display_name if instance else None,
         'level': pack.level,
         'age': pack.age.value if pack.age else None,
         'price': pack.price,
@@ -763,7 +775,7 @@ def serialize_pack_details(pack):
         'enrolled': enrolled,
         'duration': pack.duration,
         'product_id_invoicing_api': pack.product_id_invoicing_api,
-        'public': pack.public,
+        'public': effective_public,
         'books': books,
         'books_in_pack': books
     }
@@ -811,9 +823,10 @@ def get_pack_in_school(pack_id, school_id, public_only=False):
     if not pack:
         return None
     if getattr(pack, 'is_global_pack', False):
-        if not school_has_global_pack_access(school_id, pack.id):
+        instance = get_school_global_pack_instance(school_id, pack.id)
+        if not instance:
             return None
-        if public_only and not pack.public:
+        if public_only and not instance.public:
             return None
         return pack
     if pack.shcool_id != school_id:
@@ -1128,9 +1141,6 @@ def register_from_school_public_page(slug):
         db.session.add(new_user)
         db.session.flush()
 
-        iread_school = Shcool.query.filter_by(name='IRead').first()
-        if iread_school:
-            add_user_to_school(new_user.id, iread_school.id)
         redeem_school_invitation_for_user(invitation_code, new_user.id)
         db.session.commit()
 
@@ -1280,9 +1290,6 @@ def register():
         db.session.commit()
 
         if reader_account:
-            shcool = Shcool.query.filter_by(name="IRead").first()
-            if shcool:
-                add_user_to_school(reader_account.id, shcool.id)
             if invitation_code:
                 redeem_school_invitation_for_user(invitation_code, reader_account.id)
             db.session.commit()
@@ -1349,11 +1356,8 @@ def google_register():
                 # Create a new user in your Flask application
                 password_hash = bcrypt.generate_password_hash(password)
                 new_user = Reader(username=username, email=email, password_hashed=password_hash, created_at=datetime.now(),confirmed=True,approved=True,quiz_id=quiz_id)
-                db.session.add(new_user)    
+                db.session.add(new_user)
                 db.session.commit()
-                shcool=  Shcool.query.filter_by(name="IRead").first()
-                if shcool:
-                    add_user_to_school(new_user.id, shcool.id)
                 if invitation_code:
                     redeem_school_invitation_for_user(invitation_code, new_user.id)
                 db.session.commit()
@@ -1380,7 +1384,10 @@ def google_register():
 def confirmation_of_token(token):
     try:
         if reader_confirm_token(token):
-             return redirect(f"{ConfigClass.FRONT_URL}/authentication/account-confirmed", code=200)
+            return render_template(
+                'account_confirmed_redirect.html',
+                redirect_url=f"{ConfigClass.FRONT_URL}/authentication/account-confirmed"
+            )
         else:
             return jsonify({'message':'Invalid or expired link'}),404
     except Exception as error:
@@ -1786,8 +1793,6 @@ def create_account():
             selected_school_id = session.get('selected_school_id')
             if selected_school_id:
                 school = Shcool.query.get(selected_school_id)
-        if not school:
-            school = Shcool.query.filter_by(name="IRead").first()
         if school:
             add_user_to_school(new_account.id, school.id)
 
@@ -3852,23 +3857,36 @@ def get_packs_by_shcoo():
         if title_search:
             packs_query = packs_query.filter(Pack.title.ilike(f'%{title_search}%'))
         if not school :
-            
+
             return jsonify({'message': 'No School ID'}),400
         if all != 1:
-            packs_query = packs_query.filter(Pack.public.is_(True))
+            # A school-owned pack is public via its own Pack.public flag; a
+            # joined global pack is only shown here once this school has
+            # published its own SchoolPackInstance (per-school publish, not
+            # the shared/platform Pack.public used for B2C browsing).
+            packs_query = packs_query.filter(
+                or_(
+                    and_(Pack.shcool_id == school, Pack.public.is_(True)),
+                    and_(SchoolPackInstance.id.isnot(None), SchoolPackInstance.public.is_(True))
+                )
+            )
 
         packs = packs_query.distinct().all()
 
-        
-       
+
+
         if packs:
             packs_info = []
             for pack in packs:
                 enrolled = Follow_pack.query.filter_by(pack_id=pack.id).count()
                 num_active_codes = Code.query.filter_by(pack_id=pack.id, status=StatusEnum.ACTIVE).count()
+                is_global = bool(getattr(pack, 'is_global_pack', False))
+                instance = get_school_global_pack_instance(school, pack.id) if is_global else None
                 pack_info = {
                     'id': pack.id,
-                    'title': pack.title,
+                    'title': (instance.display_name or pack.title) if instance else pack.title,
+                    'default_title': pack.title,
+                    'display_name': instance.display_name if instance else None,
                     'level': pack.level,
                     'age': pack.age.value,
                     'price': pack.price,
@@ -3878,9 +3896,9 @@ def get_packs_by_shcoo():
                     'faq': pack.faq,
                     'codes': num_active_codes ,
                     'enrolled' :enrolled,
-                    'duration':pack.duration
+                    'duration':pack.duration,
+                    'public': instance.public if instance else pack.public
                 }
-                is_global = bool(getattr(pack, 'is_global_pack', False))
                 pack_info['owner_school_id'] = pack.shcool_id
                 pack_info['school_id'] = school if is_global else pack.shcool_id
                 pack_info['is_global_pack'] = is_global
@@ -3918,7 +3936,7 @@ def get_school_pack_details():
         if not user_can_view_pack_in_school(pack, school_id):
             return jsonify({'message': 'You do not have access to this pack'}), 403
 
-        pack_details = serialize_pack_details(pack)
+        pack_details = serialize_pack_details(pack, school_id)
         if getattr(pack, 'is_global_pack', False):
             pack_details['school_id'] = school_id
             pack_details['shcool_id'] = school_id
