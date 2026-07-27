@@ -3280,9 +3280,13 @@ def link_code():
 @login_required
 def get_followed_pack_list():
     try:
-        school_id, school_error, school_status = resolve_current_user_school_id()
-        if school_error:
-            return jsonify({'message': school_error}), school_status
+        school_id = None
+        # A schoolless B2C reader has no User_shcool row at all -- that's not an
+        # error, it just means their followed list is global-pack-only (Pack.shcool_id IS NULL).
+        if User_shcool.query.filter_by(user_id=current_user.id).first():
+            school_id, school_error, school_status = resolve_current_user_school_id()
+            if school_error:
+                return jsonify({'message': school_error}), school_status
 
         packs = (
             db.session.query(Pack, Follow_pack.approved)
@@ -3319,9 +3323,11 @@ def get_followed_pack_list():
 @login_required
 def get_unfollowed_books():
     try:
-        school_id, school_error, school_status = resolve_current_user_school_id()
-        if school_error:
-            return jsonify({'message': school_error}), school_status
+        school_id = None
+        if User_shcool.query.filter_by(user_id=current_user.id).first():
+            school_id, school_error, school_status = resolve_current_user_school_id()
+            if school_error:
+                return jsonify({'message': school_error}), school_status
 
         # Get the packs that the user is following
         followed_packs = (
