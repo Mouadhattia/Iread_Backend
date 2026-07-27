@@ -718,15 +718,23 @@ def get_school_accessible_session(session_id):
         return None
     return school_accessible_session_query().filter(Session.id == session_id).first()
 
+def code_belongs_to_current_school(code):
+    if not code:
+        return False
+    if get_school_pack(code.pack_id):
+        return True
+    school_id = get_current_school_id()
+    return bool(school_id and school_has_global_pack_access(school_id, code.pack_id))
+
 def get_school_code(code_id):
     code = Code.query.get(code_id)
-    if not code or not get_school_pack(code.pack_id):
+    if not code_belongs_to_current_school(code):
         return None
     return code
 
 def get_school_code_by_value(code_value):
     code = Code.query.filter_by(code=code_value).first()
-    if not code or not get_school_pack(code.pack_id):
+    if not code_belongs_to_current_school(code):
         return None
     return code
 
@@ -3395,6 +3403,54 @@ def get_school_global_pack_details(pack_id):
     except Exception as error:
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
+
+# ---------------------------------------------------------------------------
+# School-admin codes for GLOBAL packs their school has joined (mirrors the
+# classic /code_in_pack + /generate_code_in_pack pair for school-owned packs,
+# see PRD ask: schools should be able to generate/share codes for packs
+# instantiated from a global pack, same as classic packs). Scoped by
+# school_has_global_pack_access rather than get_school_pack, since global
+# packs are shared rows (SchoolPackInstance is a join table, not a per-school
+# copy) — get_school_pack deliberately excludes is_global_pack packs.
+# ---------------------------------------------------------------------------
+
+@admin.route('/global-packs/<int:pack_id>/codes', methods=['GET'])
+def get_school_global_pack_codes(pack_id):
+    school_id = get_current_school_id()
+    if not school_id:
+        return jsonify({'message': 'Current admin has no school assigned'}), 403
+    pack = get_global_pack_or_404(pack_id)
+    if not pack or not school_has_global_pack_access(school_id, pack.id):
+        return jsonify({'message': 'Global pack not found in this school'}), 404
+    codes = Code.query.filter_by(pack_id=pack_id, status=StatusEnum.ACTIVE).all()
+    return jsonify({
+        'id': pack.id,
+        'title': pack.title,
+        'codes': [{'code': code.code, 'status': code.status.value, 'id': code.id, 'pack_id': code.pack_id} for code in codes]
+    }), 200
+
+
+@admin.route('/global-packs/<int:pack_id>/codes', methods=['POST'])
+def generate_school_global_pack_codes(pack_id):
+    school_id = get_current_school_id()
+    if not school_id:
+        return jsonify({'message': 'Current admin has no school assigned'}), 403
+    pack = get_global_pack_or_404(pack_id)
+    if not pack or not school_has_global_pack_access(school_id, pack.id):
+        return jsonify({'message': 'Global pack not found in this school'}), 404
+
+    data = request.get_json() or {}
+    num_codes_to_generate = data.get('num_codes', 10)
+    generated_codes = []
+    for _ in range(num_codes_to_generate):
+        code = generate_unique_code(pack_id)
+        db.session.add(Code(pack_id=pack_id, code=code))
+        generated_codes.append(code)
+    db.session.commit()
+    return jsonify({
+        'message': f'{num_codes_to_generate} codes generated successfully',
+        'generated_codes': generated_codes
+    }), 200
 
 
 ## @brief Route to invite a reader to become an administrator.
