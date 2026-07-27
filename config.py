@@ -16,6 +16,7 @@ class ConfigClass:
     MAIL_PASSWORD = 'gvwdouhlcazzytnp'  # Replace with your Gmail app-specific password
     MAIL_DEBUG = False   
     FRONT_URL = 'https://iread.education'
+    ADMIN_FRONT_URL = os.environ.get('ADMIN_FRONT_URL') or 'https://admin.iread.education'
     API_URL = 'https://api.iread.education'
     QUIZ_API = 'https://quiz.iread.education/'
     QUIZ_API_KEY = '65800f77a2ce2e2c88ebd8bd'

@@ -79,7 +79,7 @@ from flask_mail import Message
 from functools import wraps
 from datetime import datetime, timedelta, date
 from sqlalchemy import func, or_, and_, case
-from apps.main.email import admin_confirm_token
+from apps.main.email import admin_confirm_token, reader_confirm_token
 from apps.jitsi import ensure_jitsi_room, is_online_session, serialize_jitsi_call
 from apps.game_calendar import (
     GameCalendarError,
@@ -1625,7 +1625,9 @@ login_manager.init_app(admin)
 
 @admin.before_request
 def require_admin_access():
-    if request.method == 'OPTIONS' or request.endpoint == 'admin.confirm':
+    if request.method == 'OPTIONS' or request.endpoint in (
+        'admin.confirm', 'admin.forget_password', 'admin.reset_password'
+    ):
         return None
     if not is_admin_role():
         return abort(401)
@@ -3595,6 +3597,43 @@ def confirm(token):
         return jsonify({'message':'Invalid or exprired link'}),404
 
     return jsonify({'message':'Congratulation you are now admin'}),200
+
+
+## @brief Route for handling forgotten passwords for school/super admins.
+#
+# Mirrors apps/reader/routes.py's forget_password, but links to the admin
+# dashboard front-end instead of the reader-facing site.
+@admin.route('/forget_password', methods=['POST'])
+def forget_password():
+    try:
+        email = request.json['email']
+        if not user_email_exist(email):
+            return jsonify({'message': 'There is no account with this email'}), 404
+        confirmation_token = generate_confirmed_token(email)
+        confirm_link = f"{ConfigClass.ADMIN_FRONT_URL}/authentication/reset-password/{confirmation_token}"
+        msg = Message('Proof your identity', recipients=[email], sender=ConfigClass.MAIL_USERNAME)
+        msg.body = confirm_link
+        mail.send(msg)
+        return jsonify({'message': 'You have received a confirmation email to proof your identity'}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal serveur error'}), 500
+
+
+## @brief Route for resetting forgotten passwords for school/super admins.
+@admin.route('/password_reset/<token>', methods=['POST'])
+def reset_password(token):
+    try:
+        email = reader_confirm_token(token)
+        if not email:
+            return jsonify({'message': 'Invalid or expired link'}), 404
+        new_password = request.json['new_password']
+        password_hashed = bcrypt.generate_password_hash(new_password)
+        user = User.query.filter_by(email=email).first()
+        user.password_hashed = password_hashed
+        db.session.commit()
+        return jsonify({'message': f'{user.username}, you have successfully changed your password. You can now login'}), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal serveur error'}), 500
 
 
 ## @brief Route to display information about all users.

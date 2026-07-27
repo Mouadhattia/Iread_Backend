@@ -2007,6 +2007,31 @@ def set_default_school():
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
+## @brief Let a logged-in Reader change which of their own schools loads by
+# default on future logins, instead of always falling back to whichever
+# school they last clicked in the navbar switcher.
+@reader.route('/set_own_default_school', methods=['POST'])
+@login_required
+def set_own_default_school():
+    try:
+        data = request.get_json(silent=True) or {}
+        school_id = data.get('school_id')
+        if not school_id:
+            return jsonify({'message': 'school_id is required'}), 400
+
+        school = Shcool.query.get(int(school_id))
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        if not set_default_school_for_user(current_user.id, school.id):
+            return jsonify({'message': 'You are not a member of that school'}), 400
+
+        db.session.commit()
+        return jsonify({'message': 'Default school updated', 'default_school_id': school.id}), 200
+    except Exception as error:
+        db.session.rollback()
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
 # get user account with email
 @reader.route('/get_accounts')
 @login_required
