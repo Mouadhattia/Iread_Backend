@@ -3,6 +3,21 @@
 from datetime import timedelta
 import os
 
+from dotenv import load_dotenv
+
+## @brief Load .env from the project root before any setting is read.
+#
+# Must run at import time, ahead of the ConfigClass body: those os.environ
+# lookups execute when the class is defined, so a later load would be too late.
+#
+# Real environment variables win over .env (override=False), so a server that
+# sets STRIPE_SECRET_KEY in its own process environment is not overridden by a
+# stale file left on disk.
+#
+# This covers every entry point at once -- `flask run`, app.py, `flask db`, and
+# the scripts/ jobs -- because they all import config.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=False)
+
 ## @brief Configuration of the mysql database and parameters for sending email.
 class ConfigClass:
     SQLALCHEMY_DATABASE_URI = 'mysql://root:''@localhost/iread'

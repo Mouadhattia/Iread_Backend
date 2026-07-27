@@ -77,3 +77,4 @@ Werkzeug==2.2.3
 dtw-python==1.5.3
 whisper-timestamped==1.15.9
 yarl==1.9.4
+python-dotenv==1.0.1
