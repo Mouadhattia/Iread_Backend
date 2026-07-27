@@ -39,9 +39,36 @@ class ConfigClass:
     # endpoint lets anyone mark any invoice paid, so the handler refuses to
     # process anything when this is unset.
     STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET') or ''
-    ## @brief Let Stripe Tax compute VAT (Irish standard rate, with EU B2B
-    # reverse charge where the customer has a valid VAT number on file).
-    STRIPE_TAX_ENABLED = (os.environ.get('STRIPE_TAX_ENABLED') or 'true').lower() in ('1', 'true', 'yes')
+    ## @brief Whether iRead itself is VAT-registered.
+    #
+    # A business that is not VAT-registered must not charge VAT, must not show
+    # a VAT amount on its invoices, and must not call them VAT invoices. Until
+    # registration happens this stays false and invoices go out net, with a
+    # note explaining why no VAT is shown.
+    #
+    # Registration is not optional forever: Irish VAT registration becomes
+    # obligatory once turnover passes the services threshold (in the low tens
+    # of thousands of euro -- confirm the current figure with an accountant),
+    # and supplying services to businesses in other EU member states generally
+    # forces registration regardless of turnover. At these contract values that
+    # threshold arrives after only a handful of schools, so treat this as a
+    # switch that will be flipped, not a permanent state.
+    PLATFORM_VAT_REGISTERED = (os.environ.get('PLATFORM_VAT_REGISTERED') or '').lower() in ('1', 'true', 'yes')
+    ## @brief iRead's own VAT number, shown on invoices once registered.
+    PLATFORM_VAT_NUMBER = os.environ.get('PLATFORM_VAT_NUMBER') or ''
+    ## @brief Let Stripe Tax compute VAT. Meaningless until we are registered
+    # and have entered a tax registration in the Stripe dashboard -- with no
+    # registration Stripe computes 0% anyway, so leaving it on would only
+    # produce a misleading "VAT €0.00" line on every invoice.
+    STRIPE_TAX_ENABLED = (
+        (os.environ.get('STRIPE_TAX_ENABLED') or '').lower() in ('1', 'true', 'yes')
+        or PLATFORM_VAT_REGISTERED
+    )
+    ## @brief Printed on invoices while not VAT-registered, so a school's
+    # finance office understands the absence of a VAT line.
+    INVOICE_NO_VAT_NOTE = os.environ.get('INVOICE_NO_VAT_NOTE') or (
+        'No VAT charged: the supplier is not registered for VAT.'
+    )
     ## @brief Days a school gets to pay before an invoice is overdue.
     INVOICE_DUE_DAYS = int(os.environ.get('INVOICE_DUE_DAYS') or 30)
     STORY_UPLOAD_DIR = os.environ.get('STORY_UPLOAD_DIR') or os.path.join(os.getcwd(), 'uploads', 'stories')

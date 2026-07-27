@@ -204,6 +204,13 @@ def create_and_send_invoice(subscription, school, created_by=None, description=N
     }
     if ConfigClass.STRIPE_TAX_ENABLED:
         invoice_kwargs['automatic_tax'] = {'enabled': True}
+        if ConfigClass.PLATFORM_VAT_NUMBER:
+            invoice_kwargs['footer'] = 'VAT number: %s' % ConfigClass.PLATFORM_VAT_NUMBER
+    else:
+        # Not VAT-registered: the invoice must not imply that VAT was charged
+        # or that a zero figure is a rated supply. Say plainly why there is no
+        # VAT line, so a school's finance office can file it correctly.
+        invoice_kwargs['footer'] = ConfigClass.INVOICE_NO_VAT_NOTE
 
     invoice = api.Invoice.create(**invoice_kwargs)
     invoice_id = _get(invoice, 'id')

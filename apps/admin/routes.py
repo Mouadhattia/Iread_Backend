@@ -90,7 +90,7 @@ from flask_mail import Message
 from functools import wraps
 from datetime import datetime, timedelta, date
 import calendar
-from sqlalchemy import func, or_, and_, case
+from sqlalchemy import func, or_, and_, case, extract
 from apps.main.email import admin_confirm_token, reader_confirm_token
 from apps.jitsi import ensure_jitsi_room, is_online_session, serialize_jitsi_call
 from apps.game_calendar import (
@@ -3409,6 +3409,179 @@ def get_school_activated_readers():
         return jsonify({'message': 'Internal server error'}), 500
 
 
+## @brief Platform-wide licensing report: what has been sold, what is being
+# used, what has been paid, and what is coming up for renewal.
+#
+# Returned as one payload rather than four endpoints because the page renders
+# it as a single dashboard -- four round trips would only make it slower to
+# paint and harder to keep internally consistent.
+@admin.route('/super/billing/overview', methods=['GET'])
+def super_get_billing_overview():
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        months = min(max(int(request.args.get('months', 12)), 1), 36)
+        renewal_days = min(max(int(request.args.get('renewal_days', 90)), 1), 365)
+    except (TypeError, ValueError):
+        return jsonify({'message': 'months and renewal_days must be numbers'}), 400
+
+    try:
+        live_contracts = (
+            SchoolSubscription.query
+            .filter(SchoolSubscription.status.in_(CONSUMING_STATUSES))
+            .all()
+        )
+
+        seats_licensed = sum(c.seat_limit or 0 for c in live_contracts)
+        contracted_cents = sum(c.total_cents or 0 for c in live_contracts)
+        seats_in_use = (
+            db.session.query(func.count(SchoolSeatActivation.id))
+            .filter(SchoolSeatActivation.released_at.is_(None))
+            .scalar()
+        ) or 0
+
+        # Invoiced money, split by whether it has actually arrived. Voided and
+        # uncollectible invoices are excluded from both -- they are never going
+        # to be paid and would overstate the pipeline.
+        invoice_rows = (
+            db.session.query(SchoolInvoice.status, func.sum(SchoolInvoice.total_cents))
+            .group_by(SchoolInvoice.status)
+            .all()
+        )
+        invoiced_by_status = {status: int(total or 0) for status, total in invoice_rows}
+        paid_cents = invoiced_by_status.get('paid', 0)
+        outstanding_cents = invoiced_by_status.get('open', 0) + invoiced_by_status.get('draft', 0)
+
+        return jsonify({
+            'totals': {
+                'schools_licensed': len({c.shcool_id for c in live_contracts}),
+                'contracts_live': len(live_contracts),
+                'seats_licensed': seats_licensed,
+                'seats_in_use': seats_in_use,
+                'seats_available': max(seats_licensed - seats_in_use, 0),
+                'utilisation_percent': round((seats_in_use / seats_licensed) * 100, 1)
+                if seats_licensed else None,
+                'contracted_cents': contracted_cents,
+                'paid_cents': paid_cents,
+                'outstanding_cents': outstanding_cents,
+                'currency': ConfigClass.BILLING_CURRENCY,
+            },
+            'by_tier': build_tier_breakdown(live_contracts),
+            'activations_over_time': build_activation_series(months),
+            'renewals': build_renewal_pipeline(renewal_days),
+        }), 200
+    except Exception as error:
+        logging.error('Failed to build billing overview: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Live contracts grouped by the plan they were sold on.
+#
+# Bespoke contracts (plan_id NULL) are reported under their own bucket rather
+# than dropped -- they are real revenue, and hiding them would make the tier
+# totals disagree with the headline figure.
+def build_tier_breakdown(live_contracts):
+    plans = ContractPlan.query.order_by(ContractPlan.sort_order.asc()).all()
+    buckets = {
+        plan.id: {
+            'plan_id': plan.id,
+            'plan_code': plan.code,
+            'plan_name': plan.name,
+            'contracts': 0,
+            'seats_licensed': 0,
+            'seats_in_use': 0,
+            'total_cents': 0,
+        }
+        for plan in plans
+    }
+    bespoke = {
+        'plan_id': None,
+        'plan_code': 'bespoke',
+        'plan_name': 'Bespoke',
+        'contracts': 0,
+        'seats_licensed': 0,
+        'seats_in_use': 0,
+        'total_cents': 0,
+    }
+
+    for contract in live_contracts:
+        bucket = buckets.get(contract.plan_id, bespoke)
+        bucket['contracts'] += 1
+        bucket['seats_licensed'] += contract.seat_limit or 0
+        bucket['seats_in_use'] += seats_used(contract.shcool_id)
+        bucket['total_cents'] += contract.total_cents or 0
+
+    ordered = [buckets[plan.id] for plan in plans]
+    if bespoke['contracts']:
+        ordered.append(bespoke)
+    return ordered
+
+
+## @brief Monthly count of seats activated, for the trend chart.
+#
+# Uses extract() rather than a dialect-specific date function so the same query
+# runs on MySQL in production and SQLite under test. Months with no activations
+# are filled with zero -- a gap in a time series reads as missing data, not as
+# "nothing happened".
+def build_activation_series(months):
+    today = date.today()
+    first_of_this_month = today.replace(day=1)
+    start = add_months(first_of_this_month, -(months - 1))
+
+    rows = (
+        db.session.query(
+            extract('year', SchoolSeatActivation.activated_at).label('y'),
+            extract('month', SchoolSeatActivation.activated_at).label('m'),
+            func.count(SchoolSeatActivation.id)
+        )
+        .filter(SchoolSeatActivation.activated_at >= datetime.combine(start, datetime.min.time()))
+        .group_by('y', 'm')
+        .all()
+    )
+    counts = {(int(year), int(month)): int(total) for year, month, total in rows}
+
+    labels, data = [], []
+    cursor = start
+    for _ in range(months):
+        labels.append(cursor.strftime('%b %Y'))
+        data.append(counts.get((cursor.year, cursor.month), 0))
+        cursor = add_months(cursor, 1)
+    return {'labels': labels, 'data': data}
+
+
+## @brief Contracts coming up for renewal, soonest first.
+def build_renewal_pipeline(renewal_days):
+    today = date.today()
+    horizon = today + timedelta(days=renewal_days)
+    upcoming = (
+        SchoolSubscription.query
+        .filter(SchoolSubscription.status.in_(CONSUMING_STATUSES))
+        .filter(SchoolSubscription.term_end <= horizon)
+        .order_by(SchoolSubscription.term_end.asc())
+        .all()
+    )
+
+    pipeline = []
+    for contract in upcoming:
+        school = Shcool.query.get(contract.shcool_id)
+        used = seats_used(contract.shcool_id)
+        pipeline.append({
+            'subscription_id': contract.id,
+            'school_id': contract.shcool_id,
+            'school_name': school.name if school else None,
+            'plan_name': contract.plan.name if contract.plan else 'Bespoke',
+            'seat_limit': contract.seat_limit,
+            'seats_used': used,
+            'term_end': contract.term_end.isoformat() if contract.term_end else None,
+            'days_left': (contract.term_end - today).days if contract.term_end else None,
+            'status': contract.status,
+            'auto_renew': contract.auto_renew,
+            'total_cents': contract.total_cents,
+            'currency': contract.currency,
+        })
+    return pipeline
+
+
 ## @brief Raise and email the licence invoice for a contract, via Stripe.
 @admin.route('/super/subscriptions/<int:subscription_id>/invoice', methods=['POST'])
 def super_issue_subscription_invoice(subscription_id):
@@ -3466,7 +3639,8 @@ def super_get_school_invoices(school_id):
         return jsonify({
             'school_id': school_id,
             'invoices': [serialize_school_invoice(invoice) for invoice in invoices],
-            'stripe_configured': stripe_is_configured()
+            'stripe_configured': stripe_is_configured(),
+            'platform_vat_registered': bool(ConfigClass.PLATFORM_VAT_REGISTERED)
         }), 200
     except Exception as error:
         logging.error('Failed to list invoices for school %s: %s', school_id, error)
