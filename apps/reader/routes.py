@@ -1062,6 +1062,12 @@ def register_super_admin():
         new_super_admin = SuperAdmin(**super_admin_data)
         db.session.add(new_super_admin)
         db.session.commit()
+        # Super admins are otherwise schoolless -- this membership is what lets
+        # the same account use the school-admin-scoped join/publish endpoints
+        # (get_current_school_id()) to curate which global packs "IRead" (the
+        # default B2C school) publishes for schoolless readers.
+        add_user_to_default_school(new_super_admin.id)
+        db.session.commit()
         login_user(new_super_admin)
 
         return jsonify({

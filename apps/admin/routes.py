@@ -4321,6 +4321,16 @@ def publish_school_global_pack(pack_id):
             return jsonify({'message': 'Global pack is not added to this school'}), 404
 
         data = request.get_json(silent=True) or {}
+        force = bool(data.get('force'))
+        is_default_school = Shcool.query.filter_by(id=school_id, name='IRead').first() is not None
+        if is_default_school and not force:
+            has_price = (pack.price or 0) > 0
+            has_active_codes = Code.query.filter_by(pack_id=pack.id, status=StatusEnum.ACTIVE).first() is not None
+            if has_price or has_active_codes:
+                return jsonify({
+                    'message': 'This pack is priced or has active redemption codes -- publishing it to IRead makes it free and unlimited for every registered reader, bypassing per-pack code access. Pass {"force": true} to publish anyway.'
+                }), 409
+
         if 'display_name' in data:
             display_name = str(data.get('display_name') or '').strip()
             instance.display_name = display_name or None
