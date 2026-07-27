@@ -59,6 +59,15 @@ from apps.progress_engine import (
     submit_attempt,
 )
 from apps.certificates import get_certificates_for_user, issue_certificates_for_user
+from apps.seats import (
+    SOURCE_PARENT_CODE,
+    SOURCE_READER_CODE,
+    activate_seat,
+    check_capacity,
+    release_all_seats,
+    release_seat_if_no_packs_remain,
+    resolve_billing_school,
+)
 from extensions import mail,login_manager,db
 from flask_mail import Message
 from config import ConfigClass
@@ -2928,6 +2937,9 @@ def delete_account():
             [ db.session.delete(notification) for notification in notifications ]
             [ db.session.delete(follow_session) for follow_session in follow_sessions ]
             [ db.session.delete(follow_pack) for follow_pack in follow_packs ]
+            # Hand every seat this reader held back to their school(s) before
+            # the account (and its cascading activation rows) goes away.
+            release_all_seats(current_user.id, reason='account_deleted')
             db.session.commit()
 
             db.session.delete(current_user)
@@ -3133,17 +3145,29 @@ def follow_pack():
             if code_to_use.status == StatusEnum.USED:
                 return jsonify({'message': 'Code has already been used'}), 400
 
-            # Change code status to 'used' (assuming StatusEnum is an Enum)
-            code_to_use.user_id = current_user.id
-            code_to_use.status = StatusEnum.USED
-            db.session.commit()
-
             pack = Pack.query.filter_by(id=token).first()
             if pack:
                 existing_pack = Follow_pack.query.filter_by(user_id=current_user.id, pack_id=pack.id).first()
                 if not existing_pack:
+                    # Seat check happens BEFORE the code is burned. Refusing a
+                    # student after marking their one-use code as USED would
+                    # cost them the code with nothing to show for it.
+                    # Inert until SEAT_ENFORCEMENT_ENABLED is turned on.
+                    allowed, refusal = check_capacity(
+                        resolve_billing_school(pack, current_user.id), audience='reader'
+                    )
+                    if not allowed:
+                        return jsonify({'message': refusal, 'code': 'SEAT_LIMIT_REACHED'}), 403
+
+                # Change code status to 'used' (assuming StatusEnum is an Enum)
+                code_to_use.user_id = current_user.id
+                code_to_use.status = StatusEnum.USED
+                db.session.commit()
+
+                if not existing_pack:
                     follow_pack = Follow_pack(user_id=current_user.id, pack_id=pack.id,approved=True)
                     db.session.add(follow_pack)
+                    activate_seat(current_user.id, pack, source=SOURCE_READER_CODE)
                     db.session.commit()
 
                     followed_pack = {
@@ -3199,10 +3223,17 @@ def parent_follow_pack(child_id):
         if existing_pack:
             return jsonify({'message': f'{child.username} already follows this pack'}), 200
 
+        # Checked before the code is burned -- see /follow_pack. Inert until
+        # SEAT_ENFORCEMENT_ENABLED is turned on.
+        allowed, refusal = check_capacity(resolve_billing_school(pack, child.id), audience='reader')
+        if not allowed:
+            return jsonify({'message': refusal, 'code': 'SEAT_LIMIT_REACHED'}), 403
+
         code_to_use.user_id = child.id
         code_to_use.status = StatusEnum.USED
         follow_pack = Follow_pack(user_id=child.id, pack_id=pack.id, approved=True)
         db.session.add(follow_pack)
+        activate_seat(child.id, pack, source=SOURCE_PARENT_CODE)
         db.session.commit()
 
         followed_pack = {
@@ -3379,8 +3410,22 @@ def unfollowed_pack():
         
         pack=Pack.query.filter_by(token=token).first()
         if pack:
-            unfollow_pack=db.session.query(Follow_pack).join(Pack).filter(Pack.id==Follow_pack.pack_id,Follow_pack.user_id==current_user.id).first()
+            # NB: this previously joined Pack without ever constraining the
+            # join to the requested pack, so it unfollowed whichever pack the
+            # reader happened to follow first, not the one they asked to drop.
+            unfollow_pack=Follow_pack.query.filter_by(user_id=current_user.id, pack_id=pack.id).first()
+            if not unfollow_pack:
+                return jsonify({'message': 'You are not followed this pack'}), 400
+
+            billing_school_id = resolve_billing_school(pack, current_user.id)
             db.session.delete(unfollow_pack)
+            db.session.flush()
+            # Only frees the seat if this was the reader's last pack from that
+            # school -- they are still an activated student otherwise.
+            if billing_school_id is not None:
+                release_seat_if_no_packs_remain(
+                    current_user.id, billing_school_id, reason='unfollowed_pack'
+                )
             db.session.commit()
             return jsonify({'message': 'This pack has been removed from your followed pack list'}), 200
         else:

@@ -28,6 +28,10 @@ class Pack(db.Model):
     book_number=db.Column(db.Integer,default=0)
     price=db.Column(db.Float,default=0)
     discount=db.Column(db.Float,default=0)
+    # iRead bills in EUR (Irish company). Existing rows were entered as TND
+    # amounts and are NOT converted by the migration -- prices are re-entered
+    # by hand -- so treat any pre-migration price as needing review.
+    currency=db.Column(db.String(3),nullable=False,default='EUR',server_default='EUR')
     faq = db.Column(db.JSON, nullable=True)
     product_id_invoicing_api =db.Column(db.String(100), nullable=True)
     duration =db.Column(db.Float,default=0)

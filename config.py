@@ -21,7 +21,14 @@ class ConfigClass:
     QUIZ_API = 'https://quiz.iread.education/'
     QUIZ_API_KEY = '65800f77a2ce2e2c88ebd8bd'
     INVOICING_API = 'https://invoicing.iread.education'
-    INVOICING_API_KEY = '65ba69fb713e132120743444'   
+    INVOICING_API_KEY = '65ba69fb713e132120743444'
+    ## @brief Hard-block school pack activations once a school hits its
+    # licensed seat limit. Off until the seat ledger has been backfilled and
+    # verified against real data -- with it off, seats are still recorded and
+    # reported, just never refused.
+    SEAT_ENFORCEMENT_ENABLED = (os.environ.get('SEAT_ENFORCEMENT_ENABLED') or '').lower() in ('1', 'true', 'yes')
+    ## @brief Platform billing currency. iRead is an Irish company.
+    BILLING_CURRENCY = os.environ.get('BILLING_CURRENCY') or 'EUR'
     STORY_UPLOAD_DIR = os.environ.get('STORY_UPLOAD_DIR') or os.path.join(os.getcwd(), 'uploads', 'stories')
     MAX_STORY_UPLOAD_MB = int(os.environ.get('MAX_STORY_UPLOAD_MB') or 50)
     AUDIOBOOK_UPLOAD_DIR = os.environ.get('AUDIOBOOK_UPLOAD_DIR') or os.path.join(os.getcwd(), 'uploads', 'audio-books')

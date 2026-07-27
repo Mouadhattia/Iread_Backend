@@ -38,6 +38,17 @@ from models.Follow_book import Follow_book
 from models.game_result import Game_result
 from models.user_log import UserLog
 from models.admin_audit_log import AdminAuditLog
+from models.contract_plan import ContractPlan
+from models.school_billing_profile import SchoolBillingProfile
+from models.school_invoice import SchoolInvoice
+from models.school_seat_activation import SchoolSeatActivation
+from models.school_subscription import (
+    ALL_SUBSCRIPTION_STATUSES,
+    CONSUMING_STATUSES,
+    STATUS_CANCELLED,
+    STATUS_DRAFT,
+    SchoolSubscription,
+)
 from models.word_progress import WordProgress, UserAchievement
 from models.session import Session,Location
 from models.pack_template import Pack_template
@@ -78,6 +89,7 @@ from config import ConfigClass
 from flask_mail import Message
 from functools import wraps
 from datetime import datetime, timedelta, date
+import calendar
 from sqlalchemy import func, or_, and_, case
 from apps.main.email import admin_confirm_token, reader_confirm_token
 from apps.jitsi import ensure_jitsi_room, is_online_session, serialize_jitsi_call
@@ -124,6 +136,17 @@ import json
 import webcolors
 import random
 import spacy
+from apps.seats import (
+    SOURCE_ADMIN_ASSIGN,
+    activate_seat,
+    attach_orphan_activations,
+    check_capacity,
+    get_active_subscription,
+    release_seat,
+    resolve_billing_school,
+    seat_summary,
+    seats_used,
+)
 from apps.admin.paserStory import get_tenses_words
 from apps.admin.graphDBscripts.db import Neo4jDriver,DataSetDB
 import nltk
@@ -464,6 +487,10 @@ def delete_super_user_dependencies(user_id):
     Profile.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     Teacher_postulate.query.filter_by(id=user_id).delete(synchronize_session=False)
     User_shcool.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    # Seats held by a deleted account return to their school. Deleted rather
+    # than released because the FK to user.id goes away with the account; the
+    # invoice already raised for the term is the durable billing record.
+    SchoolSeatActivation.query.filter_by(user_id=user_id).delete(synchronize_session=False)
 
     UserLog.query.filter_by(user_id=user_id).update({'user_id': None}, synchronize_session=False)
     Code.query.filter_by(user_id=user_id).update({'user_id': None}, synchronize_session=False)
@@ -1564,6 +1591,7 @@ def serialize_super_school(school):
         'user_count': user_count,
         'pack_count': pack_count,
         'book_count': book_count,
+        'seats': seat_summary(school.id),
         'is_active': school.is_active,
         'suspended_at': school.suspended_at.isoformat() if school.suspended_at else None,
         'suspended_by': school.suspended_by,
@@ -2978,6 +3006,539 @@ def super_remove_global_teacher(teacher_id):
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
+## @brief Seat usage for the calling school admin's own school.
+#
+# Backs the "remaining readers" meter. Deliberately scoped to the caller's
+# school rather than taking a school_id, so it cannot be used to enumerate
+# other tenants' seat counts -- the mistake the legacy invoicing page makes by
+# calling the billing microservice straight from the browser with no school
+# filter at all.
+@admin.route('/school/seat-usage', methods=['GET'])
+@login_required
+@admin_or_assistant_required
+def get_school_seat_usage():
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'No school context for this admin'}), 400
+        return jsonify({'school_id': school_id, 'seats': seat_summary(school_id)}), 200
+    except Exception as error:
+        logging.error('Failed to build seat usage: %s', error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Per-school seat usage for a super admin, for any school.
+@admin.route('/super/schools/<int:school_id>/seat-usage', methods=['GET'])
+def super_get_school_seat_usage(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+        return jsonify({'school_id': school_id, 'seats': seat_summary(school_id)}), 200
+    except Exception as error:
+        logging.error('Failed to build seat usage for school %s: %s', school_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief The contract pricing presets a super admin can pick from.
+@admin.route('/super/contract-plans', methods=['GET'])
+def super_get_contract_plans():
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        plans = ContractPlan.query.filter_by(active=True).order_by(ContractPlan.sort_order.asc()).all()
+        return jsonify({'plans': [serialize_contract_plan(plan) for plan in plans]}), 200
+    except Exception as error:
+        logging.error('Failed to list contract plans: %s', error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Contracts for one school, newest term first.
+@admin.route('/super/schools/<int:school_id>/subscriptions', methods=['GET'])
+def super_get_school_subscriptions(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+        subscriptions = (
+            SchoolSubscription.query
+            .filter_by(shcool_id=school_id)
+            .order_by(SchoolSubscription.term_start.desc(), SchoolSubscription.id.desc())
+            .all()
+        )
+        return jsonify({
+            'school_id': school_id,
+            'school_name': school.name,
+            'seats': seat_summary(school_id),
+            'subscriptions': [serialize_subscription(s) for s in subscriptions]
+        }), 200
+    except Exception as error:
+        logging.error('Failed to list subscriptions for school %s: %s', school_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Create a contract for a school.
+#
+# A plan_id prefills the seat cap and price; both stay overridable so a bespoke
+# deal does not need its own plan row. The values are copied onto the contract
+# rather than referenced, so editing the plan later cannot reprice a signed
+# contract.
+@admin.route('/super/schools/<int:school_id>/subscriptions', methods=['POST'])
+def super_create_school_subscription(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        plan = None
+        if data.get('plan_id'):
+            plan = ContractPlan.query.get(data.get('plan_id'))
+            if not plan:
+                return jsonify({'message': 'Contract plan not found'}), 404
+
+        seat_limit = data.get('seat_limit', plan.max_seats if plan else None)
+        if seat_limit is None:
+            return jsonify({'message': 'seat_limit is required when no plan is chosen'}), 400
+        try:
+            seat_limit = int(seat_limit)
+        except (TypeError, ValueError):
+            return jsonify({'message': 'seat_limit must be a number'}), 400
+        if seat_limit < 1:
+            return jsonify({'message': 'seat_limit must be at least 1'}), 400
+
+        status = data.get('status') or STATUS_DRAFT
+        if status not in ALL_SUBSCRIPTION_STATUSES:
+            return jsonify({'message': 'Unknown status'}), 400
+
+        term_start, term_end, date_error = parse_subscription_term(data, plan)
+        if date_error:
+            return jsonify({'message': date_error}), 400
+
+        # Two live contracts would make "which cap applies?" ambiguous, and the
+        # seat service would silently pick one. Refuse instead of guessing.
+        if status in CONSUMING_STATUSES:
+            conflict = existing_consuming_subscription(school_id)
+            if conflict is not None:
+                return jsonify({
+                    'message': 'This school already has a live contract (#%s). Cancel or expire it '
+                               'before starting another.' % conflict.id
+                }), 409
+
+        subscription = SchoolSubscription(
+            shcool_id=school_id,
+            plan_id=plan.id if plan else None,
+            seat_limit=seat_limit,
+            unit_price_cents=int(data.get('unit_price_cents', plan.unit_price_cents if plan else 0)),
+            total_cents=int(data.get('total_cents', plan.total_cents if plan else 0)),
+            currency=(data.get('currency') or (plan.currency if plan else ConfigClass.BILLING_CURRENCY)),
+            term_start=term_start,
+            term_end=term_end,
+            grace_days=int(data.get('grace_days', 30)),
+            status=status,
+            auto_renew=bool(data.get('auto_renew', False)),
+            notes=data.get('notes'),
+            created_by=current_user.id
+        )
+        db.session.add(subscription)
+        db.session.flush()
+
+        attached = attach_orphan_activations(school_id, subscription)
+        db.session.commit()
+
+        log_admin_action('create', 'school_subscription', subscription.id,
+                         'school=%s seats=%s status=%s' % (school_id, seat_limit, status))
+
+        return jsonify({
+            'message': 'Contract created successfully',
+            'subscription': serialize_subscription(subscription),
+            'seats_attached': attached,
+            'seats': seat_summary(school_id)
+        }), 201
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Failed to create subscription for school %s: %s', school_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Amend an existing contract.
+@admin.route('/super/subscriptions/<int:subscription_id>', methods=['PUT', 'PATCH'])
+def super_update_school_subscription(subscription_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        subscription = SchoolSubscription.query.get(subscription_id)
+        if not subscription:
+            return jsonify({'message': 'Contract not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+
+        if 'seat_limit' in data:
+            try:
+                seat_limit = int(data['seat_limit'])
+            except (TypeError, ValueError):
+                return jsonify({'message': 'seat_limit must be a number'}), 400
+            if seat_limit < 1:
+                return jsonify({'message': 'seat_limit must be at least 1'}), 400
+            # Warn rather than refuse: a school can legitimately be downgraded
+            # while over the new cap, and blocking the edit would leave the
+            # super admin with no way to record the agreed contract.
+            subscription.seat_limit = seat_limit
+
+        if 'status' in data:
+            new_status = data['status']
+            if new_status not in ALL_SUBSCRIPTION_STATUSES:
+                return jsonify({'message': 'Unknown status'}), 400
+            if new_status in CONSUMING_STATUSES and subscription.status not in CONSUMING_STATUSES:
+                conflict = existing_consuming_subscription(subscription.shcool_id, exclude_id=subscription.id)
+                if conflict is not None:
+                    return jsonify({
+                        'message': 'This school already has a live contract (#%s).' % conflict.id
+                    }), 409
+            subscription.status = new_status
+
+        for money_field in ('unit_price_cents', 'total_cents'):
+            if money_field in data:
+                try:
+                    setattr(subscription, money_field, int(data[money_field]))
+                except (TypeError, ValueError):
+                    return jsonify({'message': '%s must be a number' % money_field}), 400
+
+        if 'grace_days' in data:
+            try:
+                subscription.grace_days = int(data['grace_days'])
+            except (TypeError, ValueError):
+                return jsonify({'message': 'grace_days must be a number'}), 400
+
+        if 'term_start' in data or 'term_end' in data:
+            term_start, term_end, date_error = parse_subscription_term(data, subscription.plan, subscription)
+            if date_error:
+                return jsonify({'message': date_error}), 400
+            subscription.term_start = term_start
+            subscription.term_end = term_end
+
+        if 'auto_renew' in data:
+            subscription.auto_renew = bool(data['auto_renew'])
+        if 'notes' in data:
+            subscription.notes = data['notes']
+        if 'currency' in data and data['currency']:
+            subscription.currency = data['currency']
+
+        db.session.add(subscription)
+        db.session.commit()
+
+        log_admin_action('update', 'school_subscription', subscription.id,
+                         'school=%s seats=%s status=%s' % (
+                             subscription.shcool_id, subscription.seat_limit, subscription.status))
+
+        return jsonify({
+            'message': 'Contract updated successfully',
+            'subscription': serialize_subscription(subscription),
+            'seats': seat_summary(subscription.shcool_id)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Failed to update subscription %s: %s', subscription_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief End a contract early. Seats stay on the ledger -- the students are
+# still activated -- but the school stops having a live cap.
+@admin.route('/super/subscriptions/<int:subscription_id>/cancel', methods=['POST'])
+def super_cancel_school_subscription(subscription_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        subscription = SchoolSubscription.query.get(subscription_id)
+        if not subscription:
+            return jsonify({'message': 'Contract not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        subscription.status = STATUS_CANCELLED
+        if data.get('reason'):
+            subscription.notes = ((subscription.notes or '') + '\nCancelled: %s' % data['reason']).strip()
+        db.session.add(subscription)
+        db.session.commit()
+
+        log_admin_action('cancel', 'school_subscription', subscription.id,
+                         'school=%s reason=%s' % (subscription.shcool_id, data.get('reason')))
+
+        return jsonify({
+            'message': 'Contract cancelled',
+            'subscription': serialize_subscription(subscription)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Failed to cancel subscription %s: %s', subscription_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief The billing identity an invoice is made out to.
+@admin.route('/super/schools/<int:school_id>/billing-profile', methods=['GET'])
+def super_get_school_billing_profile(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+        profile = SchoolBillingProfile.query.filter_by(shcool_id=school_id).first()
+        return jsonify({'billing_profile': serialize_billing_profile(profile, school)}), 200
+    except Exception as error:
+        logging.error('Failed to read billing profile for school %s: %s', school_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+@admin.route('/super/schools/<int:school_id>/billing-profile', methods=['PUT', 'PATCH'])
+def super_update_school_billing_profile(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        profile = SchoolBillingProfile.query.filter_by(shcool_id=school_id).first()
+        if profile is None:
+            profile = SchoolBillingProfile(shcool_id=school_id)
+
+        for field in ('legal_name', 'billing_email', 'billing_phone', 'address_line1',
+                      'address_line2', 'city', 'region', 'postal_code', 'vat_number',
+                      'purchase_order_ref'):
+            if field in data:
+                setattr(profile, field, (data[field] or None))
+        if 'country' in data:
+            country = (data['country'] or '').strip().upper()
+            if country and len(country) != 2:
+                return jsonify({'message': 'country must be a 2-letter ISO code, e.g. IE'}), 400
+            profile.country = country or None
+
+        db.session.add(profile)
+        db.session.commit()
+
+        log_admin_action('update', 'school_billing_profile', profile.id, 'school=%s' % school_id)
+
+        return jsonify({
+            'message': 'Billing details saved',
+            'billing_profile': serialize_billing_profile(profile, school)
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Failed to save billing profile for school %s: %s', school_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief A school admin's own licence: contract, seats and invoice history.
+# Read-only -- schools do not edit their own commercial terms.
+@admin.route('/school/licence', methods=['GET'])
+@login_required
+@admin_required
+def get_school_licence():
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'No school context for this admin'}), 400
+
+        school = Shcool.query.get(school_id)
+        subscription = get_active_subscription(school_id)
+        invoices = (
+            SchoolInvoice.query
+            .filter_by(shcool_id=school_id)
+            .order_by(SchoolInvoice.issued_at.desc(), SchoolInvoice.id.desc())
+            .all()
+        )
+        return jsonify({
+            'school_id': school_id,
+            'school_name': school.name if school else None,
+            'seats': seat_summary(school_id),
+            'subscription': serialize_subscription(subscription) if subscription else None,
+            'invoices': [serialize_school_invoice(invoice) for invoice in invoices]
+        }), 200
+    except Exception as error:
+        logging.error('Failed to build school licence view: %s', error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief The students currently holding a seat, so an admin can see exactly
+# who the licence is being spent on.
+@admin.route('/school/activated-readers', methods=['GET'])
+@login_required
+@admin_or_assistant_required
+def get_school_activated_readers():
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'No school context for this admin'}), 400
+
+        activations = (
+            SchoolSeatActivation.query
+            .filter(SchoolSeatActivation.shcool_id == school_id,
+                    SchoolSeatActivation.released_at.is_(None))
+            .order_by(SchoolSeatActivation.activated_at.desc())
+            .all()
+        )
+        readers = []
+        for activation in activations:
+            user = User.query.get(activation.user_id)
+            pack = Pack.query.get(activation.first_pack_id) if activation.first_pack_id else None
+            readers.append({
+                'user_id': activation.user_id,
+                'username': user.username if user else None,
+                'email': user.email if user else None,
+                'activated_at': activation.activated_at.isoformat() if activation.activated_at else None,
+                'first_pack_id': activation.first_pack_id,
+                'first_pack_title': pack.title if pack else None,
+                'source': activation.source
+            })
+        return jsonify({'school_id': school_id, 'readers': readers, 'total': len(readers)}), 200
+    except Exception as error:
+        logging.error('Failed to list activated readers: %s', error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Resolve and validate a contract term from request data.
+# @return (term_start, term_end, error_message)
+def parse_subscription_term(data, plan=None, existing=None):
+    def parse_date(value, fallback):
+        if not value:
+            return fallback, None
+        try:
+            return datetime.strptime(str(value)[:10], '%Y-%m-%d').date(), None
+        except (TypeError, ValueError):
+            return None, 'Dates must be in YYYY-MM-DD format'
+
+    default_start = existing.term_start if existing else date.today()
+    term_start, error = parse_date(data.get('term_start'), default_start)
+    if error:
+        return None, None, error
+
+    term_months = (plan.term_months if plan else 12) or 12
+    if existing and not data.get('term_end'):
+        default_end = existing.term_end
+    else:
+        default_end = add_months(term_start, term_months)
+    term_end, error = parse_date(data.get('term_end'), default_end)
+    if error:
+        return None, None, error
+
+    if term_end <= term_start:
+        return None, None, 'The term must end after it starts'
+    return term_start, term_end, None
+
+
+## @brief Add whole months to a date, clamping the day to the target month's
+# length so 31 Jan + 1 month lands on 28/29 Feb rather than raising.
+def add_months(start, months):
+    month_index = start.month - 1 + months
+    year = start.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def existing_consuming_subscription(school_id, exclude_id=None):
+    query = SchoolSubscription.query.filter(
+        SchoolSubscription.shcool_id == school_id,
+        SchoolSubscription.status.in_(CONSUMING_STATUSES)
+    )
+    if exclude_id:
+        query = query.filter(SchoolSubscription.id != exclude_id)
+    return query.first()
+
+
+def serialize_subscription(subscription):
+    if subscription is None:
+        return None
+    return {
+        'id': subscription.id,
+        'school_id': subscription.shcool_id,
+        'plan_id': subscription.plan_id,
+        'plan_name': subscription.plan.name if subscription.plan else None,
+        'plan_code': subscription.plan.code if subscription.plan else None,
+        'seat_limit': subscription.seat_limit,
+        'seats_used': seats_used(subscription.shcool_id),
+        'unit_price_cents': subscription.unit_price_cents,
+        'total_cents': subscription.total_cents,
+        'currency': subscription.currency,
+        'term_start': subscription.term_start.isoformat() if subscription.term_start else None,
+        'term_end': subscription.term_end.isoformat() if subscription.term_end else None,
+        'grace_days': subscription.grace_days,
+        'status': subscription.status,
+        'auto_renew': subscription.auto_renew,
+        'notes': subscription.notes,
+        'created_at': subscription.created_at.isoformat() if subscription.created_at else None
+    }
+
+
+def serialize_billing_profile(profile, school=None):
+    if profile is None:
+        return {
+            'school_id': school.id if school else None,
+            'legal_name': school.name if school else None,
+            'billing_email': None, 'billing_phone': None,
+            'address_line1': None, 'address_line2': None, 'city': None, 'region': None,
+            'postal_code': None, 'country': None, 'vat_number': None,
+            'purchase_order_ref': None, 'stripe_customer_id': None, 'exists': False
+        }
+    return {
+        'school_id': profile.shcool_id,
+        'legal_name': profile.legal_name,
+        'billing_email': profile.billing_email,
+        'billing_phone': profile.billing_phone,
+        'address_line1': profile.address_line1,
+        'address_line2': profile.address_line2,
+        'city': profile.city,
+        'region': profile.region,
+        'postal_code': profile.postal_code,
+        'country': profile.country,
+        'vat_number': profile.vat_number,
+        'purchase_order_ref': profile.purchase_order_ref,
+        'stripe_customer_id': profile.stripe_customer_id,
+        'exists': True
+    }
+
+
+def serialize_school_invoice(invoice):
+    return {
+        'id': invoice.id,
+        'number': invoice.number,
+        'status': invoice.status,
+        'subtotal_cents': invoice.subtotal_cents,
+        'tax_cents': invoice.tax_cents,
+        'total_cents': invoice.total_cents,
+        'currency': invoice.currency,
+        'seats': invoice.seats,
+        'period_start': invoice.period_start.isoformat() if invoice.period_start else None,
+        'period_end': invoice.period_end.isoformat() if invoice.period_end else None,
+        'hosted_invoice_url': invoice.hosted_invoice_url,
+        'invoice_pdf': invoice.invoice_pdf,
+        'issued_at': invoice.issued_at.isoformat() if invoice.issued_at else None,
+        'due_at': invoice.due_at.isoformat() if invoice.due_at else None,
+        'paid_at': invoice.paid_at.isoformat() if invoice.paid_at else None
+    }
+
+
+def serialize_contract_plan(plan):
+    return {
+        'id': plan.id,
+        'code': plan.code,
+        'name': plan.name,
+        'min_seats': plan.min_seats,
+        'max_seats': plan.max_seats,
+        'unit_price_cents': plan.unit_price_cents,
+        'total_cents': plan.total_cents,
+        'currency': plan.currency,
+        'term_months': plan.term_months,
+    }
+
+
 @admin.route('/super/schools', methods=['GET'])
 def super_get_schools():
     if not is_super_admin():
@@ -4287,6 +4848,9 @@ def remove_reader_from_school(user_id):
 
         was_default = membership.is_default
         db.session.delete(membership)
+        # Offboarding returns the seat: the student is no longer one of this
+        # school's activated readers, whatever they keep in their passport.
+        release_seat(user_id, school_id, reason='removed_from_school')
         db.session.flush()
 
         # Keep a sensible default among any remaining memberships so the
@@ -6790,9 +7354,16 @@ def create_follow_pack():
         if existing_pack:
             return jsonify({'message': 'You already follow this pack'}), 400
 
+        # Refuse once the school is at its licensed reader limit. Inert until
+        # SEAT_ENFORCEMENT_ENABLED is turned on.
+        allowed, refusal = check_capacity(resolve_billing_school(pack, user_id), audience='admin')
+        if not allowed:
+            return jsonify({'message': refusal, 'code': 'SEAT_LIMIT_REACHED'}), 403
+
         # Add a new follow_pack record
         follow_pack_entry = Follow_pack(user_id=user_id, pack_id=pack_id, approved=True)
         db.session.add(follow_pack_entry)
+        activate_seat(user_id, pack, source=SOURCE_ADMIN_ASSIGN)
         db.session.commit()
 
         followed_pack = {
