@@ -231,7 +231,29 @@ def create_and_send_invoice(subscription, school, created_by=None, description=N
         subscription.status = STATUS_PENDING_PAYMENT
         db.session.add(subscription)
 
+    db.session.flush()
+    _notify(lambda: _notifications().notify_licence_invoice_issued(school.id, local_invoice))
+
     return local_invoice
+
+
+##
+# @brief Imported lazily -- apps.notifications pulls in a wide slice of the
+# model graph that this module otherwise has no use for.
+def _notifications():
+    import apps.notifications as notifications
+    return notifications
+
+
+##
+# @brief Run a notification side effect without letting it break the billing
+# action that triggered it. A failed notification must never roll back a
+# successfully raised invoice.
+def _notify(callback):
+    try:
+        callback()
+    except Exception as error:
+        logging.warning('Billing notification failed: %s', error, exc_info=True)
 
 
 ##
@@ -382,6 +404,9 @@ def handle_webhook_event(event):
 
     if event_type == 'invoice.paid':
         _activate_subscription_for(local_invoice)
+        db.session.flush()
+        _notify(lambda: _notifications().notify_licence_invoice_paid(
+            local_invoice.shcool_id, local_invoice))
 
     db.session.commit()
     return 'handled:%s' % event_type

@@ -33,7 +33,12 @@ from models.follow_pack import Follow_pack
 from models.pack import Pack
 from models.school_pack_instance import SchoolPackInstance
 from models.school_seat_activation import SchoolSeatActivation
-from models.school_subscription import CONSUMING_STATUSES, SchoolSubscription
+from models.school_subscription import (
+    CONSUMING_STATUSES,
+    STATUS_CANCELLED,
+    STATUS_EXPIRED,
+    SchoolSubscription,
+)
 from models.user_shcool import User_shcool
 
 # Where an activation came from, for auditing a seat back to its cause.
@@ -41,6 +46,12 @@ SOURCE_READER_CODE = 'reader_code'
 SOURCE_PARENT_CODE = 'parent_code'
 SOURCE_ADMIN_ASSIGN = 'admin_assign'
 SOURCE_BACKFILL = 'backfill'
+
+# A licence that has run its course. Distinct from "never had one".
+ENDED_STATUSES = (STATUS_EXPIRED, STATUS_CANCELLED)
+
+# Usage points at which the school is warned. 100 doubles as "you are full".
+SEAT_WARNING_THRESHOLDS = (80, 90, 100)
 
 
 ##
@@ -118,6 +129,24 @@ def get_active_subscription(school_id):
 
 
 ##
+# @brief The most recent contract of any status, including ended ones.
+#
+# Distinct from get_active_subscription: a school whose licence has expired has
+# no *consuming* contract, but it is emphatically not the same as a school that
+# never had one. The first must stop activating students; the second has no cap
+# to enforce.
+def get_latest_subscription(school_id):
+    if not school_id:
+        return None
+    return (
+        SchoolSubscription.query
+        .filter(SchoolSubscription.shcool_id == school_id)
+        .order_by(SchoolSubscription.term_end.desc(), SchoolSubscription.id.desc())
+        .first()
+    )
+
+
+##
 # @brief Open (unreleased) seat rows for a school.
 def open_activations_query(school_id):
     return SchoolSeatActivation.query.filter(
@@ -159,6 +188,20 @@ def check_capacity(school_id, audience='admin'):
 
     subscription = get_active_subscription(school_id)
     if subscription is None:
+        # No live contract. An expired or cancelled one still bites -- the
+        # school had a licence and it ended. A school that never had a
+        # contract has no cap to enforce and is always allowed.
+        latest = get_latest_subscription(school_id)
+        if latest is not None and latest.status in ENDED_STATUSES:
+            if audience == 'reader':
+                return False, (
+                    'Your school\'s reading licence has ended. '
+                    'Please ask your teacher or school administrator.'
+                )
+            return False, (
+                'This school\'s licence ended on %s. Renew it to activate more students.'
+                % (latest.term_end.isoformat() if latest.term_end else 'its end date')
+            )
         return True, None
 
     if seats_used(school_id) < subscription.seat_limit:
@@ -180,6 +223,7 @@ def check_capacity(school_id, audience='admin'):
 # @return the SchoolSeatActivation row (new or pre-existing), or None if this
 #         activation bills nobody or the bookkeeping failed.
 def activate_seat(user_id, pack, source=None):
+    school_id = None
     try:
         with db.session.begin_nested():
             school_id = resolve_billing_school(pack, user_id)
@@ -200,13 +244,51 @@ def activate_seat(user_id, pack, source=None):
                 source=source,
             )
             db.session.add(activation)
-            return activation
     except Exception as error:
         logging.error(
             'Seat activation failed for user=%s pack=%s: %s',
             user_id, getattr(pack, 'id', None), error
         )
         return None
+
+    # Outside the savepoint on purpose: the seat is the thing that must be
+    # recorded correctly. A failure to raise the "you are nearly full" warning
+    # is an annoyance, not a reason to lose the activation it was warning about.
+    try:
+        with db.session.begin_nested():
+            notify_seat_threshold_if_crossed(school_id)
+    except Exception as error:
+        logging.warning('Seat threshold notification failed for school=%s: %s',
+                        school_id, error)
+
+    return activation
+
+
+##
+# @brief Warn a school's admins as their seat usage climbs.
+#
+# Fires only when a seat is newly consumed, so it cannot spam on page loads.
+# Deduped per (contract, threshold) so each warning is delivered once per term,
+# not once per student who tips it over.
+def notify_seat_threshold_if_crossed(school_id):
+    subscription = get_active_subscription(school_id)
+    if subscription is None or not subscription.seat_limit:
+        return None
+
+    used = seats_used(school_id)
+    percent = (used / subscription.seat_limit) * 100
+    crossed = [t for t in SEAT_WARNING_THRESHOLDS if percent >= t]
+    if not crossed:
+        return None
+
+    # Imported here rather than at module scope: notifications pulls in a large
+    # slice of the model graph, and seats.py is imported by request paths that
+    # have no interest in it.
+    from apps.notifications import notify_seat_threshold_reached
+
+    return notify_seat_threshold_reached(
+        school_id, subscription, used, max(crossed)
+    )
 
 
 ##
@@ -310,6 +392,13 @@ def attach_orphan_activations(school_id, subscription):
 def seat_summary(school_id):
     used = seats_used(school_id)
     subscription = get_active_subscription(school_id)
+    if subscription is None:
+        # An ended licence is still shown -- a school whose term lapsed needs
+        # to see why it can no longer activate students, rather than a blank
+        # "no contract" panel identical to a school that never had one.
+        latest = get_latest_subscription(school_id)
+        if latest is not None and latest.status in ENDED_STATUSES:
+            subscription = latest
 
     if subscription is None:
         return {

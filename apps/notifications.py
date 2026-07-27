@@ -30,7 +30,17 @@ TYPE_ICONS = {
     'word_suggestion_submitted': 'fe fe-edit-3',
     'word_suggestion_approved': 'fe fe-check-circle',
     'word_suggestion_rejected': 'fe fe-x-circle',
+    'seat_threshold_reached': 'fe fe-users',
+    'seat_limit_reached': 'fe fe-alert-triangle',
+    'licence_invoice_issued': 'fe fe-file-text',
+    'licence_invoice_paid': 'fe fe-check-circle',
+    'licence_term_ending': 'fe fe-clock',
+    'licence_expired': 'fe fe-alert-octagon',
 }
+
+# Where a school admin is sent to act on a billing notification.
+SCHOOL_LICENCE_LINK = '/school/licence'
+SUPER_ADMIN_CONTRACTS_LINK = '/super-admin/subscriptions'
 
 
 def _unique_ids(user_ids):
@@ -544,4 +554,141 @@ def notify_daily_game_created(school_id, book, game_type, play_date):
         play_date=play_date,
         expires_at=expires_at,
         dedupe_key=f'daily-game:{school_id}:{book.id}:{game_type}:{play_date.isoformat()}'
+    )
+
+
+## @brief School admins only -- billing is not a teacher's concern, and
+# get_school_staff_ids deliberately includes teachers.
+def get_school_admin_ids(school_id):
+    if not school_id:
+        return []
+    return [
+        user_id for (user_id,) in
+        db.session.query(User.id)
+        .join(User_shcool, User_shcool.user_id == User.id)
+        .filter(User_shcool.shcool_id == school_id, User.type == 'admin')
+        .all()
+    ]
+
+
+## @brief Warn a school that it is running out of licensed reader places.
+#
+# Deduped per (contract, threshold) so a school is told once at 80%, once at
+# 90% and once when full -- not once per student who crosses the line.
+def notify_seat_threshold_reached(school_id, subscription, seats_used, threshold):
+    limit = subscription.seat_limit
+    at_capacity = threshold >= 100
+
+    if at_capacity:
+        title = 'Reader limit reached'
+        message = (
+            f'All {limit} licensed reader places are in use. '
+            'New students cannot be activated until places are freed or the licence is extended.'
+        )
+    else:
+        remaining = max(limit - seats_used, 0)
+        title = f'{threshold}% of reader places used'
+        message = (
+            f'{seats_used} of {limit} licensed reader places are in use — '
+            f'{remaining} remaining.'
+        )
+
+    return create_notifications_for_users(
+        get_school_admin_ids(school_id),
+        'seat_limit_reached' if at_capacity else 'seat_threshold_reached',
+        title,
+        message,
+        link=SCHOOL_LICENCE_LINK,
+        school_id=school_id,
+        payload={
+            'subscription_id': subscription.id,
+            'seats_used': seats_used,
+            'seat_limit': limit,
+            'threshold': threshold,
+        },
+        dedupe_key=f'seat-threshold:{subscription.id}:{threshold}'
+    )
+
+
+## @brief Tell a school its licence invoice is ready to pay.
+def notify_licence_invoice_issued(school_id, invoice):
+    amount = (invoice.total_cents or 0) / 100
+    return create_notifications_for_users(
+        get_school_admin_ids(school_id),
+        'licence_invoice_issued',
+        'Licence invoice issued',
+        f'Your iRead licence invoice for {amount:,.2f} {invoice.currency} is ready. '
+        'Open it to pay by card or bank transfer.',
+        link=SCHOOL_LICENCE_LINK,
+        school_id=school_id,
+        payload={
+            'invoice_id': invoice.id,
+            'total_cents': invoice.total_cents,
+            'currency': invoice.currency,
+            'hosted_invoice_url': invoice.hosted_invoice_url,
+        },
+        dedupe_key=f'licence-invoice-issued:{invoice.id}'
+    )
+
+
+## @brief Confirm payment to the school, and tell the platform it landed.
+def notify_licence_invoice_paid(school_id, invoice):
+    amount = (invoice.total_cents or 0) / 100
+    school_notifications = create_notifications_for_users(
+        get_school_admin_ids(school_id),
+        'licence_invoice_paid',
+        'Licence payment received',
+        f'Thank you — your payment of {amount:,.2f} {invoice.currency} has been received '
+        'and your licence is active.',
+        link=SCHOOL_LICENCE_LINK,
+        school_id=school_id,
+        payload={'invoice_id': invoice.id, 'total_cents': invoice.total_cents},
+        dedupe_key=f'licence-invoice-paid:{invoice.id}'
+    )
+    super_notifications = create_notifications_for_users(
+        get_super_admin_ids(),
+        'licence_invoice_paid',
+        'Licence payment received',
+        f'{invoice.school.name if invoice.school else "A school"} paid '
+        f'{amount:,.2f} {invoice.currency}.',
+        link=SUPER_ADMIN_CONTRACTS_LINK,
+        school_id=school_id,
+        payload={'invoice_id': invoice.id, 'school_id': school_id},
+        dedupe_key=f'licence-invoice-paid-super:{invoice.id}'
+    )
+    return school_notifications + super_notifications
+
+
+## @brief Remind both sides that a term is running out, while there is still
+# time to renew.
+def notify_licence_term_ending(school_id, subscription, days_left):
+    end_date = subscription.term_end.isoformat() if subscription.term_end else 'soon'
+    return create_notifications_for_users(
+        get_school_admin_ids(school_id) + get_super_admin_ids(),
+        'licence_term_ending',
+        'Licence ends in %s days' % days_left,
+        f'Your iRead licence runs until {end_date}. Renew it to keep activating new readers.',
+        link=SCHOOL_LICENCE_LINK,
+        school_id=school_id,
+        payload={
+            'subscription_id': subscription.id,
+            'term_end': end_date,
+            'days_left': days_left,
+        },
+        dedupe_key=f'licence-term-ending:{subscription.id}:{days_left}'
+    )
+
+
+## @brief Tell a school its licence has lapsed and what that means.
+def notify_licence_expired(school_id, subscription):
+    return create_notifications_for_users(
+        get_school_admin_ids(school_id) + get_super_admin_ids(),
+        'licence_expired',
+        'Licence expired',
+        'Your iRead licence has ended. Existing readers keep their access, but no new '
+        'students can be activated until it is renewed.',
+        link=SCHOOL_LICENCE_LINK,
+        school_id=school_id,
+        payload={'subscription_id': subscription.id},
+        dedupe_key=f'licence-expired:{subscription.id}'
     )
