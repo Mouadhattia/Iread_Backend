@@ -29,6 +29,21 @@ class ConfigClass:
     SEAT_ENFORCEMENT_ENABLED = (os.environ.get('SEAT_ENFORCEMENT_ENABLED') or '').lower() in ('1', 'true', 'yes')
     ## @brief Platform billing currency. iRead is an Irish company.
     BILLING_CURRENCY = os.environ.get('BILLING_CURRENCY') or 'EUR'
+
+    ## @brief Stripe credentials. Environment only -- never commit these.
+    # Without STRIPE_SECRET_KEY the billing service stays dormant and every
+    # Stripe-backed endpoint returns a clear "not configured" error instead of
+    # failing deep inside the SDK.
+    STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY') or ''
+    ## @brief Signing secret for /billing/stripe/webhook. An unverified webhook
+    # endpoint lets anyone mark any invoice paid, so the handler refuses to
+    # process anything when this is unset.
+    STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET') or ''
+    ## @brief Let Stripe Tax compute VAT (Irish standard rate, with EU B2B
+    # reverse charge where the customer has a valid VAT number on file).
+    STRIPE_TAX_ENABLED = (os.environ.get('STRIPE_TAX_ENABLED') or 'true').lower() in ('1', 'true', 'yes')
+    ## @brief Days a school gets to pay before an invoice is overdue.
+    INVOICE_DUE_DAYS = int(os.environ.get('INVOICE_DUE_DAYS') or 30)
     STORY_UPLOAD_DIR = os.environ.get('STORY_UPLOAD_DIR') or os.path.join(os.getcwd(), 'uploads', 'stories')
     MAX_STORY_UPLOAD_MB = int(os.environ.get('MAX_STORY_UPLOAD_MB') or 50)
     AUDIOBOOK_UPLOAD_DIR = os.environ.get('AUDIOBOOK_UPLOAD_DIR') or os.path.join(os.getcwd(), 'uploads', 'audio-books')

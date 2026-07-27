@@ -147,6 +147,12 @@ from apps.seats import (
     seat_summary,
     seats_used,
 )
+from apps.stripe_billing import (
+    StripeNotConfigured,
+    create_and_send_invoice,
+    void_invoice,
+)
+from apps.stripe_billing import is_configured as stripe_is_configured
 from apps.admin.paserStory import get_tenses_words
 from apps.admin.graphDBscripts.db import Neo4jDriver,DataSetDB
 import nltk
@@ -3401,6 +3407,103 @@ def get_school_activated_readers():
     except Exception as error:
         logging.error('Failed to list activated readers: %s', error)
         return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Raise and email the licence invoice for a contract, via Stripe.
+@admin.route('/super/subscriptions/<int:subscription_id>/invoice', methods=['POST'])
+def super_issue_subscription_invoice(subscription_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        subscription = SchoolSubscription.query.get(subscription_id)
+        if not subscription:
+            return jsonify({'message': 'Contract not found'}), 404
+        school = Shcool.query.get(subscription.shcool_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        invoice = create_and_send_invoice(
+            subscription, school,
+            created_by=current_user.id,
+            description=data.get('description')
+        )
+        db.session.commit()
+
+        log_admin_action('invoice', 'school_subscription', subscription.id,
+                         'school=%s stripe_invoice=%s' % (school.id, invoice.stripe_invoice_id))
+
+        return jsonify({
+            'message': 'Invoice raised and sent to the school',
+            'invoice': serialize_school_invoice(invoice),
+            'subscription': serialize_subscription(subscription)
+        }), 201
+    except StripeNotConfigured as error:
+        db.session.rollback()
+        return jsonify({'message': str(error), 'code': 'STRIPE_NOT_CONFIGURED'}), 503
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'message': str(error)}), 400
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Failed to raise invoice for contract %s: %s', subscription_id, error,
+                      exc_info=True)
+        return jsonify({'message': 'Stripe rejected the invoice: %s' % error}), 502
+
+
+## @brief Invoices for one school.
+@admin.route('/super/schools/<int:school_id>/invoices', methods=['GET'])
+def super_get_school_invoices(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        invoices = (
+            SchoolInvoice.query
+            .filter_by(shcool_id=school_id)
+            .order_by(SchoolInvoice.issued_at.desc(), SchoolInvoice.id.desc())
+            .all()
+        )
+        return jsonify({
+            'school_id': school_id,
+            'invoices': [serialize_school_invoice(invoice) for invoice in invoices],
+            'stripe_configured': stripe_is_configured()
+        }), 200
+    except Exception as error:
+        logging.error('Failed to list invoices for school %s: %s', school_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Void an invoice raised in error.
+@admin.route('/super/invoices/<int:invoice_id>/void', methods=['POST'])
+def super_void_invoice(invoice_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        invoice = SchoolInvoice.query.get(invoice_id)
+        if not invoice:
+            return jsonify({'message': 'Invoice not found'}), 404
+        if invoice.status == 'paid':
+            return jsonify({
+                'message': 'A paid invoice cannot be voided. Refund it in Stripe instead.'
+            }), 400
+
+        voided = void_invoice(invoice)
+        db.session.commit()
+
+        log_admin_action('void', 'school_invoice', invoice_id,
+                         'school=%s' % invoice.shcool_id)
+
+        return jsonify({
+            'message': 'Invoice voided',
+            'invoice': serialize_school_invoice(voided or invoice)
+        }), 200
+    except StripeNotConfigured as error:
+        db.session.rollback()
+        return jsonify({'message': str(error), 'code': 'STRIPE_NOT_CONFIGURED'}), 503
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Failed to void invoice %s: %s', invoice_id, error)
+        return jsonify({'message': 'Stripe rejected the request: %s' % error}), 502
 
 
 ## @brief Resolve and validate a contract term from request data.

@@ -61,6 +61,7 @@ spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 SQLAlchemy==2.0.25
 srsly==2.4.8
+stripe==11.1.0
 thinc==8.2.2
 tqdm==4.66.1
 typer==0.9.0

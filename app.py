@@ -91,6 +91,7 @@ from apps.teacher.routes import teacher
 from apps.admin.routes import admin
 from apps.main.routes import main
 from apps.audiobooks.routes import admin_audiobooks, teacher_audiobooks, reader_audiobooks
+from apps.billing_webhook import billing
 from apps.account_status import get_account_block_message
 
 @app.route('/')
@@ -134,6 +135,7 @@ app.register_blueprint(main)
 app.register_blueprint(admin_audiobooks)
 app.register_blueprint(teacher_audiobooks)
 app.register_blueprint(reader_audiobooks)
+app.register_blueprint(billing)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5003)
