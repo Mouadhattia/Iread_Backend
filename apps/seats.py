@@ -390,6 +390,31 @@ def attach_orphan_activations(school_id, subscription):
 # @brief Everything a dashboard needs to render "remaining readers" for one
 # school, whether or not that school has a contract yet.
 def seat_summary(school_id):
+    try:
+        return _build_seat_summary(school_id)
+    except Exception as error:
+        # The billing tables not being there (a deploy where the migration has
+        # not been applied yet) must not take down the pages that merely
+        # *display* a seat count -- serialize_super_school embeds this, so an
+        # exception here would 500 the whole super-admin schools list.
+        # Degrade this one card instead, and log loudly.
+        logging.error('Seat summary unavailable for school=%s: %s', school_id, error)
+        return {
+            'seats_used': None,
+            'seat_limit': None,
+            'seats_remaining': None,
+            'usage_percent': None,
+            'has_contract': False,
+            'status': None,
+            'term_start': None,
+            'term_end': None,
+            'plan_name': None,
+            'enforcement_enabled': bool(getattr(ConfigClass, 'SEAT_ENFORCEMENT_ENABLED', False)),
+            'unavailable': True,
+        }
+
+
+def _build_seat_summary(school_id):
     used = seats_used(school_id)
     subscription = get_active_subscription(school_id)
     if subscription is None:

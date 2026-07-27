@@ -3,7 +3,15 @@
 from datetime import timedelta
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    ## python-dotenv is a convenience, not a requirement. On a server where it
+    # is not installed (FTP deploys with no pip access), settings still come
+    # from real environment variables exactly as before -- the app must never
+    # fail to boot over an optional helper.
+    def load_dotenv(*args, **kwargs):
+        return False
 
 ## @brief Load .env from the project root before any setting is read.
 #
@@ -44,6 +52,14 @@ class ConfigClass:
     SEAT_ENFORCEMENT_ENABLED = (os.environ.get('SEAT_ENFORCEMENT_ENABLED') or '').lower() in ('1', 'true', 'yes')
     ## @brief Platform billing currency. iRead is an Irish company.
     BILLING_CURRENCY = os.environ.get('BILLING_CURRENCY') or 'EUR'
+
+    ## @brief Allow a super admin to apply database migrations from the web UI.
+    #
+    # Needed because production is deployed over FTP with no shell access. It
+    # is off by default and should be switched back off once a deploy is done:
+    # an always-on "change the database schema" endpoint is a large piece of
+    # attack surface to leave standing for the sake of occasional convenience.
+    ALLOW_WEB_MIGRATIONS = (os.environ.get('ALLOW_WEB_MIGRATIONS') or '').lower() in ('1', 'true', 'yes')
 
     ## @brief Stripe credentials. Environment only -- never commit these.
     # Without STRIPE_SECRET_KEY the billing service stays dormant and every

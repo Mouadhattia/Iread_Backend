@@ -153,6 +153,11 @@ from apps.stripe_billing import (
     void_invoice,
 )
 from apps.stripe_billing import is_configured as stripe_is_configured
+from apps.system_migrations import (
+    MigrationsDisabled,
+    get_migration_status,
+    run_upgrade,
+)
 from apps.admin.paserStory import get_tenses_words
 from apps.admin.graphDBscripts.db import Neo4jDriver,DataSetDB
 import nltk
@@ -3407,6 +3412,69 @@ def get_school_activated_readers():
     except Exception as error:
         logging.error('Failed to list activated readers: %s', error)
         return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief What the database schema is at, and what an upgrade would apply.
+#
+# Safe to call at any time -- it only reads. Kept separate from the upgrade
+# itself so the UI can always show the state, including the "this server has
+# web migrations switched off" case.
+@admin.route('/super/system/migrations', methods=['GET'])
+def super_get_migration_status():
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        return jsonify(get_migration_status()), 200
+    except Exception as error:
+        logging.error('Failed to read migration status: %s', error, exc_info=True)
+        return jsonify({
+            'message': 'Could not read the migration status: %s' % error
+        }), 500
+
+
+## @brief Apply every pending migration. Upgrade only -- there is deliberately
+# no downgrade endpoint, because that is the direction that destroys data.
+@admin.route('/super/system/migrations/upgrade', methods=['POST'])
+def super_run_migration_upgrade():
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        before = get_migration_status()
+        result = run_upgrade()
+
+        log_admin_action(
+            'migrate', 'database', None,
+            'from=%s to=%s applied=%s' % (
+                result['revision_before'], result['revision_after'],
+                ','.join(r['revision'] for r in result['applied']) or 'none'
+            )
+        )
+
+        return jsonify({
+            'message': 'Applied %s migration(s)' % len(result['applied'])
+            if result['changed'] else 'Database was already up to date',
+            'result': result,
+            'status': get_migration_status(),
+            'previous_status': before,
+        }), 200
+    except MigrationsDisabled as error:
+        return jsonify({'message': str(error), 'code': 'MIGRATIONS_DISABLED'}), 403
+    except Exception as error:
+        logging.error('Migration upgrade failed: %s', error, exc_info=True)
+        # The failure text matters here -- a half-applied migration needs the
+        # operator to see which revision broke, not a generic 500.
+        return jsonify({
+            'message': 'Migration failed: %s' % error,
+            'status': get_migration_status_safe(),
+        }), 500
+
+
+## @brief Migration status that never raises, for use inside error handlers.
+def get_migration_status_safe():
+    try:
+        return get_migration_status()
+    except Exception:
+        return None
 
 
 ## @brief Platform-wide licensing report: what has been sold, what is being
