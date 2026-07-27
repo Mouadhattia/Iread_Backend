@@ -101,13 +101,25 @@ def home():
 # school gets suspended mid-session — the login routes themselves reject a
 # fresh login attempt, but this catches sessions that were already valid
 # when the suspension happened.
+#
+# Runs on every authenticated request, ahead of any route's own try/except,
+# so a failure here must never propagate: an uncaught exception escapes
+# Flask's JSON error handling entirely and comes back as a raw Werkzeug HTML
+# 500 page, breaking every frontend's response.data.message parsing (seen
+# in production as a generic "Request failed with status code 500" instead
+# of a real message). Fail open — log and let the request through — rather
+# than let one bad school/user row 500 the whole site for that session.
 @app.before_request
 def enforce_active_account():
     if request.method == 'OPTIONS':
         return None
     if not current_user.is_authenticated:
         return None
-    block = get_account_block_message(current_user)
+    try:
+        block = get_account_block_message(current_user)
+    except Exception as error:
+        app.logger.exception('enforce_active_account failed for user %s: %s', current_user.get_id(), error)
+        return None
     if block:
         message, status = block
         logout_user()
