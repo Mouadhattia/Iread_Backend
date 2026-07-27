@@ -238,6 +238,7 @@ def get_or_create_school_public_page(school):
         shcool_id=school.id,
         slug=generate_unique_school_slug(school.name),
         active=True,
+        show_public_packs=True,
         headline=f'Read with {school.name}',
         description=f'Welcome to {school.name} on IREAD.',
         sections=default_school_public_sections(school.name)
@@ -259,6 +260,7 @@ def serialize_school_public_page(page):
         'school_name': school.name if school else None,
         'slug': page.slug,
         'active': page.active,
+        'show_public_packs': page.show_public_packs,
         'logo': page.logo,
         'cover_image': page.cover_image,
         'headline': page.headline,
@@ -328,6 +330,9 @@ def apply_content_to_draft(page, fields):
 def apply_school_public_page_payload(page, data, allow_slug=False):
     if 'active' in data:
         page.active = parse_bool_value(data.get('active'), 'active')
+
+    if 'show_public_packs' in data:
+        page.show_public_packs = parse_bool_value(data.get('show_public_packs'), 'show_public_packs')
 
     apply_content_to_live(page, normalize_public_page_content_fields(data))
 

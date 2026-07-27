@@ -496,6 +496,7 @@ def get_or_create_school_public_page(school):
         shcool_id=school.id,
         slug=generate_unique_school_slug(school.name),
         active=True,
+        show_public_packs=True,
         headline=f'Read with {school.name}',
         description=f'Welcome to {school.name} on IREAD.',
         sections=default_school_public_sections(school.name)
@@ -514,6 +515,7 @@ def serialize_public_school_page(page):
         'school_name': school.name if school else None,
         'slug': page.slug,
         'active': page.active,
+        'show_public_packs': page.show_public_packs,
         'logo': page.logo,
         'cover_image': page.cover_image,
         'headline': page.headline,

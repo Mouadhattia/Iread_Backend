@@ -86,6 +86,7 @@ class SchoolPublicPage(db.Model):
     shcool_id = db.Column(db.Integer, db.ForeignKey(Shcool.id), nullable=False, unique=True, index=True)
     slug = db.Column(db.String(255), nullable=False, unique=True, index=True)
     active = db.Column(db.Boolean, nullable=False, default=True)
+    show_public_packs = db.Column(db.Boolean, nullable=False, default=True)
     logo = db.Column(db.String(500), nullable=True)
     cover_image = db.Column(db.String(500), nullable=True)
     headline = db.Column(db.String(255), nullable=True)
