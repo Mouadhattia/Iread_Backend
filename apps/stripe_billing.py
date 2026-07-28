@@ -104,13 +104,24 @@ def ensure_customer(school, profile=None):
 
     if profile is None:
         profile = SchoolBillingProfile.query.filter_by(shcool_id=school.id).first()
+    # Each of these is a hard requirement of actually sending an invoice, not a
+    # nicety: Stripe needs somewhere to email it and a country to decide the
+    # tax treatment. Failing here with a specific message is much kinder than
+    # letting Stripe reject the call with its own wording.
     if profile is None:
         raise ValueError(
-            'Add billing details for this school before raising an invoice: '
-            'an EU VAT invoice needs a legal name, address and country.'
+            'This school has no billing details yet. Fill in the "Billing details" '
+            'section further down this page and save it, then raise the invoice.'
+        )
+    if not profile.billing_email:
+        raise ValueError(
+            'A billing email is required before invoicing — Stripe sends the '
+            'invoice to that address.'
         )
     if not profile.country:
-        raise ValueError('A billing country is required before invoicing (e.g. IE).')
+        raise ValueError(
+            'A billing country is required before invoicing (a 2-letter code, e.g. IE).'
+        )
 
     payload = {
         'name': profile.legal_name or school.name,
