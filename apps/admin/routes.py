@@ -3230,14 +3230,16 @@ def super_create_school_subscription(school_id):
         if date_error:
             return jsonify({'message': date_error}), 400
 
-        # Two live contracts would make "which cap applies?" ambiguous, and the
-        # seat service would silently pick one. Refuse instead of guessing.
+        # Only OVERLAPPING live contracts are refused. Two live contracts with
+        # sequential terms are just a renewal signed in advance, which schools
+        # do routinely -- it is same-date overlap that makes "which cap applies
+        # today?" ambiguous.
         if status in CONSUMING_STATUSES:
-            conflict = existing_consuming_subscription(school_id)
+            conflict = overlapping_consuming_subscription(school_id, term_start, term_end)
             if conflict is not None:
                 return jsonify({
-                    'message': 'This school already has a live contract (#%s). Cancel or expire it '
-                               'before starting another.' % conflict.id
+                    'message': overlap_conflict_message(conflict),
+                    'code': 'CONTRACT_TERM_OVERLAP'
                 }), 409
 
         subscription = SchoolSubscription(
@@ -3305,10 +3307,14 @@ def super_update_school_subscription(subscription_id):
             if new_status not in ALL_SUBSCRIPTION_STATUSES:
                 return jsonify({'message': 'Unknown status'}), 400
             if new_status in CONSUMING_STATUSES and subscription.status not in CONSUMING_STATUSES:
-                conflict = existing_consuming_subscription(subscription.shcool_id, exclude_id=subscription.id)
+                conflict = overlapping_consuming_subscription(
+                    subscription.shcool_id, subscription.term_start,
+                    subscription.term_end, exclude_id=subscription.id
+                )
                 if conflict is not None:
                     return jsonify({
-                        'message': 'This school already has a live contract (#%s).' % conflict.id
+                        'message': overlap_conflict_message(conflict),
+                        'code': 'CONTRACT_TERM_OVERLAP'
                     }), 409
             subscription.status = new_status
 
@@ -3789,14 +3795,14 @@ def super_issue_subscription_invoice(subscription_id):
         # a seat-consuming state. Two of those for one school makes "which cap
         # applies?" ambiguous, so it is refused here exactly as it is when a
         # contract is created or activated directly.
-        conflict = existing_consuming_subscription(
-            subscription.shcool_id, exclude_id=subscription.id
+        conflict = overlapping_consuming_subscription(
+            subscription.shcool_id, subscription.term_start,
+            subscription.term_end, exclude_id=subscription.id
         )
         if conflict is not None and not subscription.is_consuming():
             return jsonify({
-                'message': 'This school already has a live contract (#%s). Cancel or let '
-                           'it expire before invoicing another one.' % conflict.id,
-                'code': 'CONTRACT_ALREADY_LIVE'
+                'message': overlap_conflict_message(conflict),
+                'code': 'CONTRACT_TERM_OVERLAP'
             }), 409
 
         data = request.get_json(silent=True) or {}
@@ -3924,14 +3930,46 @@ def add_months(start, months):
     return date(year, month, day)
 
 
-def existing_consuming_subscription(school_id, exclude_id=None):
+## @brief A live contract whose term overlaps the dates given.
+#
+# The constraint is deliberately *overlap*, not "one live contract at a time".
+# A school renewing early legitimately has two live contracts at once -- this
+# year's running to August and next year's starting in September -- and it
+# should be able to sign and even invoice the second one in advance.
+#
+# What is genuinely unsafe is two live contracts covering the *same* dates,
+# because then "which seat cap applies today?" has two answers and
+# get_active_subscription would silently pick one.
+#
+# Standard interval overlap: A starts on or before B ends, and B starts on or
+# before A ends. Touching endpoints count as overlapping, so a term ending on
+# the 27th and another starting on the 27th is refused -- that day would
+# otherwise belong to both.
+def overlapping_consuming_subscription(school_id, term_start, term_end, exclude_id=None):
+    if not school_id or term_start is None or term_end is None:
+        return None
     query = SchoolSubscription.query.filter(
         SchoolSubscription.shcool_id == school_id,
-        SchoolSubscription.status.in_(CONSUMING_STATUSES)
+        SchoolSubscription.status.in_(CONSUMING_STATUSES),
+        SchoolSubscription.term_start <= term_end,
+        SchoolSubscription.term_end >= term_start,
     )
     if exclude_id:
         query = query.filter(SchoolSubscription.id != exclude_id)
     return query.first()
+
+
+## @brief Human-readable refusal for an overlapping contract.
+def overlap_conflict_message(conflict):
+    return (
+        'This school already has a live contract (#%s) covering %s to %s. '
+        'Contract terms cannot overlap — adjust the dates so this one starts '
+        'after that term ends, or cancel it first.' % (
+            conflict.id,
+            conflict.term_start.isoformat() if conflict.term_start else '?',
+            conflict.term_end.isoformat() if conflict.term_end else '?',
+        )
+    )
 
 
 def serialize_subscription(subscription):
