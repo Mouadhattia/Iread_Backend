@@ -33,6 +33,7 @@ from models.follow_pack import Follow_pack
 from models.pack import Pack
 from models.school_pack_instance import SchoolPackInstance
 from models.school_seat_activation import SchoolSeatActivation
+from models.shcool import Shcool
 from models.school_subscription import (
     CONSUMING_STATUSES,
     STATUS_CANCELLED,
@@ -52,6 +53,10 @@ ENDED_STATUSES = (STATUS_EXPIRED, STATUS_CANCELLED)
 
 # Usage points at which the school is warned. 100 doubles as "you are full".
 SEAT_WARNING_THRESHOLDS = (80, 90, 100)
+
+# Used only if the settings row itself cannot be read -- generous on purpose,
+# because the failure mode of guessing low is locking real students out.
+DEFAULT_TRIAL_SEATS_FALLBACK = 10
 
 
 ##
@@ -172,6 +177,28 @@ def get_open_activation(school_id, user_id):
 
 
 ##
+# @brief The free reader allowance for a school that has no contract.
+#
+# A per-school override wins over the platform default; NULL means "follow the
+# default". Zero is a legitimate override meaning "this school gets nothing
+# without a contract", which is why the override is nullable rather than
+# defaulting to 0.
+def get_trial_seat_limit(school_id):
+    if not school_id:
+        return 0
+    try:
+        school = Shcool.query.get(school_id)
+        if school is not None and school.trial_seats is not None:
+            return max(int(school.trial_seats), 0)
+        from models.platform_settings import PlatformSettings
+        return max(int(PlatformSettings.get().default_trial_seats or 0), 0)
+    except Exception as error:
+        # Never let a settings lookup failure block a student from reading.
+        logging.error('Trial seat lookup failed for school=%s: %s', school_id, error)
+        return DEFAULT_TRIAL_SEATS_FALLBACK
+
+
+##
 # @brief Whether a school may activate one more student right now.
 #
 # Returns (allowed, message). The message is caller-facing, so it is phrased
@@ -202,7 +229,20 @@ def check_capacity(school_id, audience='admin'):
                 'This school\'s licence ended on %s. Renew it to activate more students.'
                 % (latest.term_end.isoformat() if latest.term_end else 'its end date')
             )
-        return True, None
+
+        # Never had a contract: the school is on its free trial allowance.
+        trial_limit = get_trial_seat_limit(school_id)
+        if seats_used(school_id) < trial_limit:
+            return True, None
+        if audience == 'reader':
+            return False, (
+                'Your school has reached its reader limit. '
+                'Please ask your teacher or school administrator.'
+            )
+        return False, (
+            'This school has used all %s free reader places. '
+            'Set up a contract to activate more students.' % trial_limit
+        )
 
     if seats_used(school_id) < subscription.seat_limit:
         return True, None
@@ -409,6 +449,8 @@ def seat_summary(school_id):
             'term_start': None,
             'term_end': None,
             'plan_name': None,
+            'is_trial': False,
+            'trial_seats': None,
             'enforcement_enabled': bool(getattr(ConfigClass, 'SEAT_ENFORCEMENT_ENABLED', False)),
             'unavailable': True,
         }
@@ -426,12 +468,18 @@ def _build_seat_summary(school_id):
             subscription = latest
 
     if subscription is None:
+        # No contract ever: the school runs on its free trial allowance, which
+        # is a real cap and is reported as one so the dashboards can show the
+        # same meter rather than a blank "not applicable" panel.
+        trial_limit = get_trial_seat_limit(school_id)
         return {
             'seats_used': used,
-            'seat_limit': None,
-            'seats_remaining': None,
-            'usage_percent': None,
+            'seat_limit': trial_limit,
+            'seats_remaining': max(trial_limit - used, 0),
+            'usage_percent': round((used / trial_limit) * 100, 1) if trial_limit else None,
             'has_contract': False,
+            'is_trial': True,
+            'trial_seats': trial_limit,
             'status': None,
             'term_start': None,
             'term_end': None,
@@ -446,6 +494,8 @@ def _build_seat_summary(school_id):
         'seats_remaining': max(limit - used, 0),
         'usage_percent': round((used / limit) * 100, 1) if limit else None,
         'has_contract': True,
+        'is_trial': False,
+        'trial_seats': None,
         'status': subscription.status,
         'term_start': subscription.term_start.isoformat() if subscription.term_start else None,
         'term_end': subscription.term_end.isoformat() if subscription.term_end else None,

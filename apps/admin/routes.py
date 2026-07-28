@@ -3071,6 +3071,94 @@ def super_get_contract_plans():
         return jsonify({'message': 'Internal server error'}), 500
 
 
+## @brief Override a school's free reader allowance (used before any contract).
+#
+# Chiefly for grandfathering: a school carrying a large reader base from before
+# billing existed needs an allowance covering it, or its teachers hit the cap
+# the day enforcement is switched on. Send null to fall back to the platform
+# default.
+@admin.route('/super/schools/<int:school_id>/trial-seats', methods=['PUT'])
+def super_set_school_trial_seats(school_id):
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        school = Shcool.query.get(school_id)
+        if not school:
+            return jsonify({'message': 'School not found'}), 404
+
+        data = request.get_json(silent=True) or {}
+        raw = data.get('trial_seats', None)
+
+        if raw is None or raw == '':
+            school.trial_seats = None
+        else:
+            try:
+                trial_seats = int(raw)
+            except (TypeError, ValueError):
+                return jsonify({'message': 'trial_seats must be a number, or null to use the default'}), 400
+            if trial_seats < 0:
+                return jsonify({'message': 'trial_seats cannot be negative'}), 400
+            school.trial_seats = trial_seats
+
+        db.session.add(school)
+        db.session.commit()
+
+        log_admin_action('update', 'school', school_id,
+                         'trial_seats=%s' % school.trial_seats)
+
+        return jsonify({
+            'message': 'Free reader allowance updated',
+            'school_id': school_id,
+            'trial_seats': school.trial_seats,
+            'seats': seat_summary(school_id),
+        }), 200
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Failed to set trial seats for school %s: %s', school_id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
+## @brief Schools running on the free allowance with no contract -- the
+# revenue-leak list. Ordered by how many readers they have already activated.
+@admin.route('/super/billing/unlicensed', methods=['GET'])
+def super_get_unlicensed_schools():
+    if not is_super_admin():
+        return jsonify({'message': 'Super admin access required'}), 403
+    try:
+        licensed_ids = {
+            school_id for (school_id,) in
+            db.session.query(SchoolSubscription.shcool_id)
+            .filter(SchoolSubscription.status.in_(CONSUMING_STATUSES))
+            .distinct()
+            .all()
+        }
+
+        rows = []
+        for school in Shcool.query.all():
+            if school.id in licensed_ids:
+                continue
+            summary = seat_summary(school.id)
+            if not summary.get('seats_used'):
+                continue
+            rows.append({
+                'school_id': school.id,
+                'school_name': school.name,
+                'is_active': school.is_active,
+                'seats_used': summary.get('seats_used'),
+                'trial_seats': summary.get('seat_limit'),
+                'over_allowance': bool(
+                    summary.get('seat_limit') is not None
+                    and (summary.get('seats_used') or 0) > summary['seat_limit']
+                ),
+                'latest_status': summary.get('status'),
+            })
+        rows.sort(key=lambda row: row['seats_used'] or 0, reverse=True)
+        return jsonify({'schools': rows, 'total': len(rows)}), 200
+    except Exception as error:
+        logging.error('Failed to list unlicensed schools: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error'}), 500
+
+
 ## @brief Contracts for one school, newest term first.
 @admin.route('/super/schools/<int:school_id>/subscriptions', methods=['GET'])
 def super_get_school_subscriptions(school_id):
@@ -10545,7 +10633,10 @@ def get_platform_settings():
             return jsonify({'message': 'Super admin access required'}), 403
 
         settings = PlatformSettings.get()
-        return jsonify({'require_dictionary_approval': settings.require_dictionary_approval}), 200
+        return jsonify({
+            'require_dictionary_approval': settings.require_dictionary_approval,
+            'default_trial_seats': settings.default_trial_seats,
+        }), 200
     except Exception as error:
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
@@ -10563,8 +10654,22 @@ def update_platform_settings():
             settings.updated_by = current_user.id
             settings.updated_at = datetime.now()
 
+        if 'default_trial_seats' in data:
+            try:
+                trial_seats = int(data['default_trial_seats'])
+            except (TypeError, ValueError):
+                return jsonify({'message': 'default_trial_seats must be a number'}), 400
+            if trial_seats < 0:
+                return jsonify({'message': 'default_trial_seats cannot be negative'}), 400
+            settings.default_trial_seats = trial_seats
+            settings.updated_by = current_user.id
+            settings.updated_at = datetime.now()
+
         db.session.commit()
-        return jsonify({'require_dictionary_approval': settings.require_dictionary_approval}), 200
+        return jsonify({
+            'require_dictionary_approval': settings.require_dictionary_approval,
+            'default_trial_seats': settings.default_trial_seats,
+        }), 200
     except Exception as error:
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500

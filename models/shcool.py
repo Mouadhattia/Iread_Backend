@@ -14,6 +14,11 @@ class Shcool(db.Model):
     suspended_at = db.Column(db.DateTime, nullable=True)
     suspended_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     suspended_reason = db.Column(db.String(500), nullable=True)
+    ## @brief Per-school override of the free reader allowance used before any
+    # contract exists. NULL means "use PlatformSettings.default_trial_seats".
+    # Set explicitly for schools that need grandfathering -- e.g. one carrying
+    # a large legacy reader base from before billing existed.
+    trial_seats = db.Column(db.Integer, nullable=True)
     def __repr__(self):
         return '< shcool %s >' %self.id
 

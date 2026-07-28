@@ -16,6 +16,15 @@ class PlatformSettings(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     require_dictionary_approval = db.Column(db.Boolean, nullable=False, default=False)
+    ## @brief Reader places a school may use before it has any contract.
+    #
+    # A school with no contract is not an error state -- it is a school being
+    # piloted, or one whose paperwork has not caught up yet. A small free
+    # allowance lets it demo and onboard a class without a signed contract,
+    # while still closing the gap where an unlicensed school could onboard
+    # unlimited readers for nothing. Individual schools can override it via
+    # Shcool.trial_seats.
+    default_trial_seats = db.Column(db.Integer, nullable=False, default=10, server_default='10')
     updated_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
 
