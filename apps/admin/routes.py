@@ -9485,6 +9485,10 @@ def update_current_school_public_page():
             page.active = parse_bool_value(data.get('active'), 'active')
             db.session.add(page)
 
+        if 'show_public_packs' in data:
+            page.show_public_packs = parse_bool_value(data.get('show_public_packs'), 'show_public_packs')
+            db.session.add(page)
+
         apply_content_to_draft(page, normalize_public_page_content_fields(data))
         db.session.commit()
         return jsonify({

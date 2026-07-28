@@ -1963,38 +1963,74 @@ def get_child_analytics(child_id):
         logging.error('Child analytics failed: %s', error, exc_info=True)
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
-## @brief Let a Parent enroll one of their children in a new school.
-#
-# Unlike /set_default_school (which only picks a default among schools the
-# child already belongs to), this actually joins the child to a school they
-# aren't a member of yet -- the reader-side /join_school equivalent, but
-# performed by the Parent on the child's behalf. The newly joined school
-# becomes that child's default automatically, per add_user_to_school.
-@reader.route('/assign_child_school', methods=['POST'])
+## @brief Let a Parent preview which school an invitation code belongs to,
+#  without joining anything yet -- used for the "check code" step before the
+#  parent confirms joining a specific child to that school.
+@reader.route('/preview_school_invitation_code', methods=['POST'])
 @login_required
-def assign_child_school():
+def preview_school_invitation_code():
+    try:
+        if current_user.type in ['admin', 'super_admin']:
+            return jsonify({'message': 'Admins cannot preview reader invitation codes'}), 403
+
+        data = request.get_json(silent=True) or {}
+        invitation_code, invitation_error, invitation_status = get_valid_school_invitation(data.get('code'))
+        if invitation_error:
+            return jsonify({'message': invitation_error}), invitation_status
+
+        school = Shcool.query.get(invitation_code.shcool_id)
+        return jsonify({
+            'message': 'Invitation code is valid',
+            'school': {'id': school.id, 'name': school.name}
+        }), 200
+    except Exception as error:
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+## @brief Join one of a Parent's children to a school via invitation code.
+#  Replaces the old free-pick assign_child_school endpoint -- a parent may no
+#  longer attach a child to an arbitrary school; they must hold a valid,
+#  school-issued invitation code (school rights: the school controls who can
+#  join it, not the parent).
+@reader.route('/join_child_school_by_invitation', methods=['POST'])
+@login_required
+def join_child_school_by_invitation():
     try:
         if current_user.type != 'parent':
-            return jsonify({'message': 'Only a parent account can assign a school'}), 403
+            return jsonify({'message': 'Only a parent account can join a child to a school'}), 403
 
         data = request.get_json(silent=True) or {}
         child_user_id = data.get('child_user_id')
-        school_id = data.get('school_id')
-        if not child_user_id or not school_id:
-            return jsonify({'message': 'child_user_id and school_id are required'}), 400
+        if not child_user_id:
+            return jsonify({'message': 'child_user_id is required'}), 400
+
+        invitation_code, invitation_error, invitation_status = get_valid_school_invitation(data.get('code'))
+        if invitation_error:
+            return jsonify({'message': invitation_error}), invitation_status
 
         child = Reader.query.filter_by(id=child_user_id, parent_id=current_user.id).first()
         if not child:
             return jsonify({'message': 'Child not found for this parent'}), 404
 
-        school = Shcool.query.get(int(school_id))
-        if not school:
-            return jsonify({'message': 'School not found'}), 404
+        school = Shcool.query.get(invitation_code.shcool_id)
 
-        added = add_user_to_school(child.id, school.id)
+        already_joined = User_shcool.query.filter_by(
+            user_id=child.id,
+            shcool_id=invitation_code.shcool_id
+        ).first()
+        if already_joined:
+            return jsonify({
+                'message': 'Child is already joined to this school',
+                'school': {'id': school.id, 'name': school.name},
+                'schools': get_user_schools(child.id),
+                'default_school_id': get_default_school(child.id)
+            }), 200
+
+        redeem_school_invitation_for_user(invitation_code, child.id)
         db.session.commit()
+
         return jsonify({
-            'message': 'School assigned' if added else 'Child was already a member of that school',
+            'message': 'School joined successfully',
+            'school': {'id': school.id, 'name': school.name},
             'schools': get_user_schools(child.id),
             'default_school_id': get_default_school(child.id)
         }), 200
