@@ -1,0 +1,47 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}Licence payment received{% endblock %}
+
+{% block content %}
+<h1>Licence payment received</h1>
+<p>
+  <strong>{{ school_name }}</strong> has paid their iRead licence invoice.
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">School</td>
+    <td>{{ school_name }}</td>
+  </tr>
+  <tr>
+    <td class="label">Invoice</td>
+    <td>{{ invoice_number }}</td>
+  </tr>
+  <tr>
+    <td class="label">Amount</td>
+    <td><strong>{{ total }}</strong></td>
+  </tr>
+  <tr>
+    <td class="label">Readers</td>
+    <td>{{ seats }} reader places</td>
+  </tr>
+  {% if term_start and term_end %}
+  <tr>
+    <td class="label">Term</td>
+    <td>{{ term_start }} &ndash; {{ term_end }}</td>
+  </tr>
+  {% endif %}
+  <tr>
+    <td class="label">Seats used</td>
+    <td>{{ seats_used }} of {{ seats }}</td>
+  </tr>
+</table>
+
+<p>The contract has been moved to <strong>Active</strong> automatically.</p>
+
+{% if contracts_url %}
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ contracts_url }}">Open school contracts</a>
+</p>
+{% endif %}
+{% endblock %}

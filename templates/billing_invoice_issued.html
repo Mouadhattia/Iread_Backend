@@ -1,0 +1,58 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}Your iRead licence invoice{% endblock %}
+
+{% block content %}
+<h1>Your iRead licence invoice</h1>
+<p>Hello{% if school_name %} {{ school_name }}{% endif %},</p>
+<p>
+  Your iRead reading licence is ready. Here is what it covers, and how to pay.
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">Invoice</td>
+    <td>{{ invoice_number }}</td>
+  </tr>
+  <tr>
+    <td class="label">Plan</td>
+    <td>{{ plan_name }}</td>
+  </tr>
+  <tr>
+    <td class="label">Readers</td>
+    <td>{{ seats }} reader places</td>
+  </tr>
+  <tr>
+    <td class="label">Term</td>
+    <td>{{ term_start }} &ndash; {{ term_end }}</td>
+  </tr>
+  <tr>
+    <td class="label">Amount</td>
+    <td><strong>{{ total }}</strong>{% if not vat_registered %} (no VAT charged){% endif %}</td>
+  </tr>
+  {% if due_date %}
+  <tr>
+    <td class="label">Due by</td>
+    <td>{{ due_date }}</td>
+  </tr>
+  {% endif %}
+</table>
+
+{% if hosted_invoice_url %}
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ hosted_invoice_url }}">Pay this invoice</a>
+</p>
+<p>
+  You can pay by card or bank transfer on that page, and download the invoice
+  as a PDF for your records. A copy has also been emailed to you directly by
+  our payment provider, Stripe.
+</p>
+{% endif %}
+
+<p>
+  A reader place is used when a student joins one of your reading packs. You can
+  see how many are in use at any time under <strong>School settings &rarr;
+  Licence &amp; readers</strong>.
+</p>
+<p>If anything here looks wrong, just reply to this email and we will sort it out.</p>
+{% endblock %}

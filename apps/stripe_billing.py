@@ -251,6 +251,8 @@ def create_and_send_invoice(subscription, school, created_by=None, description=N
 
     db.session.flush()
     _notify(lambda: _notifications().notify_licence_invoice_issued(school.id, local_invoice))
+    _notify(lambda: _billing_email().send_invoice_issued_email(
+        school, local_invoice, subscription, profile))
 
     return local_invoice
 
@@ -261,6 +263,11 @@ def create_and_send_invoice(subscription, school, created_by=None, description=N
 def _notifications():
     import apps.notifications as notifications
     return notifications
+
+
+def _billing_email():
+    import apps.billing_email as billing_email
+    return billing_email
 
 
 ##
@@ -425,9 +432,39 @@ def handle_webhook_event(event):
         db.session.flush()
         _notify(lambda: _notifications().notify_licence_invoice_paid(
             local_invoice.shcool_id, local_invoice))
+        _send_payment_emails(local_invoice)
 
     db.session.commit()
     return 'handled:%s' % event_type
+
+
+##
+# @brief Confirmation to the school, and a heads-up to every super admin.
+#
+# Both are best-effort: the webhook must still commit the paid state and return
+# 200 even if the mail server is down, otherwise Stripe would retry a payment
+# we have already recorded.
+def _send_payment_emails(local_invoice):
+    from models.school_billing_profile import SchoolBillingProfile
+    from models.shcool import Shcool
+
+    school = local_invoice.school or Shcool.query.get(local_invoice.shcool_id)
+    if school is None:
+        return
+    subscription = local_invoice.subscription
+    profile = SchoolBillingProfile.query.filter_by(shcool_id=school.id).first()
+
+    seats_used_now = None
+    try:
+        from apps.seats import seats_used
+        seats_used_now = seats_used(school.id)
+    except Exception as error:
+        logging.warning('Could not read seat usage for payment email: %s', error)
+
+    _notify(lambda: _billing_email().send_payment_received_email(
+        school, local_invoice, subscription, profile))
+    _notify(lambda: _billing_email().send_payment_received_internal_email(
+        school, local_invoice, subscription, seats_used_now))
 
 
 ##

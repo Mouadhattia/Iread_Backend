@@ -1,0 +1,45 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}Payment received &mdash; your iRead licence is active{% endblock %}
+
+{% block content %}
+<h1>Payment received</h1>
+<p>Hello{% if school_name %} {{ school_name }}{% endif %},</p>
+<p>
+  Thank you &mdash; we have received your payment and your iRead licence is now
+  active.
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">Invoice</td>
+    <td>{{ invoice_number }}</td>
+  </tr>
+  <tr>
+    <td class="label">Amount</td>
+    <td><strong>{{ total }}</strong></td>
+  </tr>
+  <tr>
+    <td class="label">Readers</td>
+    <td>{{ seats }} reader places</td>
+  </tr>
+  {% if term_start and term_end %}
+  <tr>
+    <td class="label">Term</td>
+    <td>{{ term_start }} &ndash; {{ term_end }}</td>
+  </tr>
+  {% endif %}
+</table>
+
+{% if invoice_pdf %}
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ invoice_pdf }}">Download receipt (PDF)</a>
+</p>
+{% endif %}
+
+<p>
+  Your school can now activate up to {{ seats }} readers. Track how many are in
+  use under <strong>School settings &rarr; Licence &amp; readers</strong> &mdash;
+  we will let you know before you run out.
+</p>
+{% endblock %}
