@@ -1,0 +1,46 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}New school registration awaiting review{% endblock %}
+
+{% block content %}
+<h1>New school registration</h1>
+<p>
+  A school has registered on the admin dashboard and is waiting for approval.
+  The applicant has been told we will review the request and contact them.
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">School</td>
+    <td><strong>{{ school_name }}</strong></td>
+  </tr>
+  {% if admin_name %}
+  <tr>
+    <td class="label">Applicant</td>
+    <td>{{ admin_name }}</td>
+  </tr>
+  {% endif %}
+  {% if admin_email %}
+  <tr>
+    <td class="label">Email</td>
+    <td><a href="mailto:{{ admin_email }}">{{ admin_email }}</a></td>
+  </tr>
+  {% endif %}
+  <tr>
+    <td class="label">Submitted</td>
+    <td>{{ submitted_at }}</td>
+  </tr>
+</table>
+
+{% if review_url %}
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ review_url }}">Review this registration</a>
+</p>
+{% endif %}
+
+<p>
+  Approving the account emails the applicant automatically and lets them sign
+  in. The school starts on free trial reader places until a contract is raised
+  for it.
+</p>
+{% endblock %}

@@ -87,6 +87,20 @@ class ConfigClass:
     PLATFORM_VAT_REGISTERED = (os.environ.get('PLATFORM_VAT_REGISTERED') or '').lower() in ('1', 'true', 'yes')
     ## @brief iRead's own VAT number, shown on invoices once registered.
     PLATFORM_VAT_NUMBER = os.environ.get('PLATFORM_VAT_NUMBER') or ''
+    ## @brief The supplier's registered identity, printed on receipts.
+    #
+    # A receipt has to say who took the money, under the trading name the
+    # company is actually registered as. These are deliberately empty by
+    # default: the Irish registered name and address are still being
+    # finalised, and an invented one on a financial document is worse than an
+    # absent one, so the receipt template omits the block until they are set.
+    PLATFORM_LEGAL_NAME = os.environ.get('PLATFORM_LEGAL_NAME') or ''
+    PLATFORM_ADDRESS = os.environ.get('PLATFORM_ADDRESS') or ''
+    PLATFORM_COMPANY_NUMBER = os.environ.get('PLATFORM_COMPANY_NUMBER') or ''
+    ## @brief Where a recipient of a transactional email should write back.
+    # Replies to the sending mailbox already reach a human, so that is the
+    # default rather than a second address nobody watches.
+    SUPPORT_EMAIL = os.environ.get('SUPPORT_EMAIL') or MAIL_USERNAME
     ## @brief Let Stripe Tax compute VAT. Meaningless until we are registered
     # and have entered a tax registration in the Stripe dashboard -- with no
     # registration Stripe computes 0% anyway, so leaving it on would only

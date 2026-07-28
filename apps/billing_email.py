@@ -10,7 +10,9 @@
 # Every send is best-effort. An SMTP failure must never roll back a raised
 # invoice or a processed webhook: the money and the database state are the
 # things that must be right, and a missing email can be re-sent.
-from apps.emailer import send_html_email, unique_addresses
+from datetime import datetime
+
+from apps.emailer import get_super_admin_emails, send_html_email, unique_addresses
 from config import ConfigClass
 from extensions import db
 from models.user import User
@@ -19,11 +21,15 @@ from models.user_shcool import User_shcool
 
 ##
 # @brief Format integer cents for display in an email.
+#
+# Always two decimal places. Trimming a trailing zero turns EUR 19.50 into
+# "€19.5", which on a receipt reads as a typo at best and a different figure at
+# worst -- money is written to the minor unit or not at all.
 def format_money(cents, currency='EUR'):
     if cents is None:
         return '—'
     symbol = {'EUR': '€', 'GBP': '£', 'USD': '$'}.get((currency or '').upper(), '')
-    amount = '{:,.2f}'.format(cents / 100).rstrip('0').rstrip('.')
+    amount = '{:,.2f}'.format(cents / 100)
     return f'{symbol}{amount}' if symbol else f'{amount} {currency}'
 
 
@@ -34,6 +40,26 @@ def format_date(value):
         return value.strftime('%d %b %Y')
     except AttributeError:
         return str(value)
+
+
+##
+# @brief The customer block on a receipt: who this was billed to.
+#
+# Falls back to the school's own name when no billing profile has been filled
+# in, so the receipt is never addressed to nobody.
+def billing_address_lines(school, billing_profile=None):
+    if billing_profile is None:
+        return [school.name] if school and school.name else []
+
+    lines = [
+        billing_profile.legal_name or (school.name if school else None),
+        billing_profile.address_line1,
+        billing_profile.address_line2,
+        ' '.join(part for part in [billing_profile.postal_code, billing_profile.city] if part) or None,
+        billing_profile.region,
+        (billing_profile.country or '').upper() or None,
+    ]
+    return [line for line in lines if line]
 
 
 ##
@@ -56,16 +82,6 @@ def get_school_admin_emails(school_id):
         .join(User_shcool, User_shcool.user_id == User.id)
         .filter(User_shcool.shcool_id == school_id, User.type == 'admin')
         .all()
-        if email
-    ]
-
-
-##
-# @brief Email addresses of every super admin -- the platform side.
-def get_super_admin_emails():
-    return [
-        email for (email,) in
-        db.session.query(User.email).filter(User.type == 'super_admin').all()
         if email
     ]
 
@@ -103,19 +119,55 @@ def send_invoice_issued_email(school, invoice, subscription, billing_profile=Non
 
 
 ##
-# @brief Confirm receipt to the school.
+# @brief The school's receipt for a paid licence invoice.
+#
+# This is the document a finance office files, so it carries what a receipt is
+# expected to carry anywhere: what was bought, for whom, over what period, the
+# net/tax/gross split, the date the money was taken, and a link to the PDF.
+# Stripe's own copy is authoritative and is linked rather than reproduced --
+# but a school should not have to log in to a payment processor to find out
+# what it paid for.
 def send_payment_received_email(school, invoice, subscription, billing_profile=None):
+    seats = invoice.seats or (subscription.seat_limit if subscription else None)
+    currency = invoice.currency or ConfigClass.BILLING_CURRENCY
+    unit_price_cents = subscription.unit_price_cents if subscription else None
+    vat_registered = bool(ConfigClass.PLATFORM_VAT_REGISTERED)
+
     return send_email(
-        subject='Payment received — your iRead licence is active',
+        subject='Receipt for your iRead licence — %s' % (invoice.number or ('#%s' % invoice.id)),
         recipients=get_invoice_recipients(school.id, billing_profile),
         template='billing_payment_received.html',
         school_name=school.name,
+        billed_to=billing_address_lines(school, billing_profile),
+        customer_vat_number=(billing_profile.vat_number if billing_profile else None),
+        purchase_order_ref=(billing_profile.purchase_order_ref if billing_profile else None),
+
         invoice_number=invoice.number or ('#%s' % invoice.id),
-        total=format_money(invoice.total_cents, invoice.currency),
-        seats=invoice.seats or (subscription.seat_limit if subscription else '—'),
+        paid_on=format_date(invoice.paid_at) or format_date(datetime.now()),
+
+        plan_name=(subscription.plan.name if subscription and subscription.plan else 'Reading licence'),
+        seats=seats if seats is not None else '—',
+        unit_price=format_money(unit_price_cents, currency) if unit_price_cents else None,
         term_start=format_date(subscription.term_start if subscription else None),
         term_end=format_date(subscription.term_end if subscription else None),
-        invoice_pdf=invoice.invoice_pdf,
+
+        subtotal=format_money(invoice.subtotal_cents, currency),
+        tax=format_money(invoice.tax_cents, currency),
+        total=format_money(invoice.total_cents, currency),
+        show_tax_line=bool(vat_registered or invoice.tax_cents),
+        vat_registered=vat_registered,
+        no_vat_note=ConfigClass.INVOICE_NO_VAT_NOTE,
+
+        # Stripe stops exposing invoice_pdf on some invoice states; the hosted
+        # page always works and offers the same download, so it is the fallback
+        # rather than showing the school no way to get its receipt at all.
+        receipt_url=invoice.invoice_pdf or invoice.hosted_invoice_url,
+        receipt_is_pdf=bool(invoice.invoice_pdf),
+
+        supplier_name=ConfigClass.PLATFORM_LEGAL_NAME,
+        supplier_address=ConfigClass.PLATFORM_ADDRESS,
+        supplier_company_number=ConfigClass.PLATFORM_COMPANY_NUMBER,
+        supplier_vat_number=ConfigClass.PLATFORM_VAT_NUMBER if vat_registered else None,
     )
 
 

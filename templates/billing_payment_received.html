@@ -1,39 +1,87 @@
 {% extends "email_base.html" %}
 
-{% block email_title %}Payment received &mdash; your iRead licence is active{% endblock %}
+{% block email_title %}Receipt for your iRead licence{% endblock %}
 
 {% block content %}
-<h1>Payment received</h1>
-<p>Hello{% if school_name %} {{ school_name }}{% endif %},</p>
+<h1>Receipt</h1>
 <p>
-  Thank you &mdash; we have received your payment and your iRead licence is now
-  active.
+  Thank you &mdash; we have received your payment{% if school_name %} from
+  {{ school_name }}{% endif %}, and your iRead reading licence is now active.
 </p>
 
-<table class="email-info-table">
+<table style="width: 100%; border-collapse: collapse; margin: 0 0 24px;">
   <tr>
-    <td class="label">Invoice</td>
-    <td>{{ invoice_number }}</td>
+    <td style="padding: 0; vertical-align: top; font-size: 13.5px; color: #475569; line-height: 1.6;">
+      <div style="color: #94a3b8; font-weight: 700; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; margin-bottom: 4px;">
+        Billed to
+      </div>
+      {% for line in billed_to %}{{ line }}<br />{% endfor %}
+      {% if customer_vat_number %}VAT {{ customer_vat_number }}<br />{% endif %}
+      {% if purchase_order_ref %}PO {{ purchase_order_ref }}{% endif %}
+    </td>
+    <td style="padding: 0; vertical-align: top; text-align: right; font-size: 13.5px; color: #475569; line-height: 1.6;">
+      <div style="color: #94a3b8; font-weight: 700; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; margin-bottom: 4px;">
+        Receipt
+      </div>
+      {{ invoice_number }}<br />
+      Paid {{ paid_on }}<br />
+      <span style="display: inline-block; margin-top: 6px; padding: 3px 10px; background-color: #dcfce7; color: #15803d; border-radius: 999px; font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;">
+        Paid
+      </span>
+    </td>
   </tr>
-  <tr>
-    <td class="label">Amount</td>
-    <td><strong>{{ total }}</strong></td>
-  </tr>
-  <tr>
-    <td class="label">Readers</td>
-    <td>{{ seats }} reader places</td>
-  </tr>
-  {% if term_start and term_end %}
-  <tr>
-    <td class="label">Term</td>
-    <td>{{ term_start }} &ndash; {{ term_end }}</td>
-  </tr>
-  {% endif %}
 </table>
 
-{% if invoice_pdf %}
+<table style="width: 100%; border-collapse: collapse; margin: 0 0 8px; font-size: 14px;">
+  <tr>
+    <td style="padding: 8px 0; border-bottom: 2px solid #e2e8f0; color: #94a3b8; font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .04em;">
+      Description
+    </td>
+    <td style="padding: 8px 0; border-bottom: 2px solid #e2e8f0; color: #94a3b8; font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; text-align: right;">
+      Amount
+    </td>
+  </tr>
+  <tr>
+    <td style="padding: 12px 0; border-bottom: 1px solid #eef1f6; color: #334155; vertical-align: top;">
+      <strong>{{ plan_name }}</strong><br />
+      <span style="color: #64748b; font-size: 13px;">
+        {{ seats }} reader places{% if unit_price %} &middot; {{ unit_price }} per reader{% endif %}
+        {% if term_start and term_end %}<br />Term {{ term_start }} &ndash; {{ term_end }}{% endif %}
+      </span>
+    </td>
+    <td style="padding: 12px 0; border-bottom: 1px solid #eef1f6; color: #334155; text-align: right; vertical-align: top; white-space: nowrap;">
+      {{ subtotal }}
+    </td>
+  </tr>
+  <tr>
+    <td style="padding: 10px 0 4px; color: #64748b; text-align: right;">Subtotal</td>
+    <td style="padding: 10px 0 4px; color: #334155; text-align: right; white-space: nowrap;">{{ subtotal }}</td>
+  </tr>
+  {% if show_tax_line %}
+  <tr>
+    <td style="padding: 4px 0; color: #64748b; text-align: right;">VAT</td>
+    <td style="padding: 4px 0; color: #334155; text-align: right; white-space: nowrap;">{{ tax }}</td>
+  </tr>
+  {% endif %}
+  <tr>
+    <td style="padding: 10px 0; border-top: 2px solid #e2e8f0; color: #172033; font-weight: 800; text-align: right;">
+      Total paid
+    </td>
+    <td style="padding: 10px 0; border-top: 2px solid #e2e8f0; color: #172033; font-weight: 800; text-align: right; white-space: nowrap;">
+      {{ total }}
+    </td>
+  </tr>
+</table>
+
+{% if not vat_registered %}
+<p style="font-size: 12.5px; color: #94a3b8; margin: 0 0 20px;">{{ no_vat_note }}</p>
+{% endif %}
+
+{% if receipt_url %}
 <p style="text-align: center; margin: 28px 0;">
-  <a class="email-button" href="{{ invoice_pdf }}">Download receipt (PDF)</a>
+  <a class="email-button" href="{{ receipt_url }}">
+    {% if receipt_is_pdf %}Download receipt (PDF){% else %}View your receipt{% endif %}
+  </a>
 </p>
 {% endif %}
 
@@ -42,4 +90,14 @@
   use under <strong>School settings &rarr; Licence &amp; readers</strong> &mdash;
   we will let you know before you run out.
 </p>
+<p>If anything here looks wrong, reply to this email and we will sort it out.</p>
+
+{% if supplier_name or supplier_address or supplier_vat_number or supplier_company_number %}
+<p style="margin: 24px 0 0; padding-top: 16px; border-top: 1px solid #eef1f6; font-size: 12px; color: #94a3b8; line-height: 1.6;">
+  {% if supplier_name %}{{ supplier_name }}<br />{% endif %}
+  {% if supplier_address %}{{ supplier_address }}<br />{% endif %}
+  {% if supplier_company_number %}Company no. {{ supplier_company_number }}{% if supplier_vat_number %} &middot; {% endif %}{% endif %}
+  {% if supplier_vat_number %}VAT {{ supplier_vat_number }}{% endif %}
+</p>
+{% endif %}
 {% endblock %}

@@ -1,0 +1,75 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}We have received your iRead school registration{% endblock %}
+
+{% block content %}
+<h1>Thank you &mdash; we have your registration</h1>
+<p>Hello{% if admin_name %} {{ admin_name }}{% endif %},</p>
+<p>
+  We have received your request to register
+  <strong>{{ school_name }}</strong> on iRead. Your application is now with our
+  team for review, and we will be in touch.
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">School</td>
+    <td>{{ school_name }}</td>
+  </tr>
+  {% if admin_name %}
+  <tr>
+    <td class="label">Administrator</td>
+    <td>{{ admin_name }}</td>
+  </tr>
+  {% endif %}
+  <tr>
+    <td class="label">Email</td>
+    <td>{{ admin_email }}</td>
+  </tr>
+  <tr>
+    <td class="label">Submitted</td>
+    <td>{{ submitted_at }}</td>
+  </tr>
+  <tr>
+    <td class="label">Status</td>
+    <td><strong>Awaiting review</strong></td>
+  </tr>
+</table>
+
+<h2 style="margin: 28px 0 12px; color: #172033; font-size: 17px; font-weight: 700;">
+  What happens next
+</h2>
+<ol style="margin: 0 0 16px; padding-left: 20px; color: #475569;">
+  <li style="margin-bottom: 8px;">
+    Our team reviews your registration and confirms your school's details.
+  </li>
+  <li style="margin-bottom: 8px;">
+    We contact you at this address to agree the right reading licence for the
+    number of students you plan to enrol.
+  </li>
+  <li>
+    Once your account is approved you will receive a second email, and you can
+    sign in to your school dashboard and start adding classes, teachers and
+    readers.
+  </li>
+</ol>
+
+<p>
+  Until then your account is created but not yet active, so signing in will not
+  work. There is nothing further you need to do &mdash; please do not submit the
+  form again, as a second registration for the same school will be declined.
+</p>
+
+{% if sign_in_url %}
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ sign_in_url }}">Go to the iRead dashboard</a>
+</p>
+{% endif %}
+
+<p>
+  Questions in the meantime? Just reply to this email{% if support_email %} or write to
+  <a href="mailto:{{ support_email }}">{{ support_email }}</a>{% endif %} and a
+  real person will get back to you.
+</p>
+<p>We are glad you are here.<br />The iRead team</p>
+{% endblock %}

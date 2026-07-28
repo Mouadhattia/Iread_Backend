@@ -14,7 +14,7 @@ from datetime import datetime
 from flask import render_template
 
 from config import ConfigClass
-from extensions import mail
+from extensions import db, mail
 
 try:
     from flask_mail import Message
@@ -59,3 +59,18 @@ def unique_addresses(addresses):
             seen.add(key)
             unique.append(address)
     return unique
+
+
+##
+# @brief Email addresses of every super admin -- the platform side of anything
+# that needs a human at iRead to act (a payment landing, a school applying).
+#
+# Lives here rather than in one feature's module because more than one feature
+# now needs it; User is imported lazily so this transport module stays free of
+# import-order constraints on the model graph.
+def get_super_admin_emails():
+    from models.user import User
+    return unique_addresses([
+        email for (email,) in
+        db.session.query(User.email).filter(User.type == 'super_admin').all()
+    ])

@@ -987,8 +987,14 @@ def register_school_admin():
         db.session.add(User_shcool(user_id=new_admin.id, shcool_id=new_school.id))
         db.session.commit()
 
+        # After the commit, never before: the application is what matters, and
+        # a mail server that is down must not cost the school its registration.
+        from apps.school_admin_email import send_school_admin_signup_emails
+        email_results = send_school_admin_signup_emails(new_admin, new_school)
+
         return jsonify({
             'message': 'School admin account has been created and is pending super admin approval',
+            'confirmation_email_sent': bool(email_results.get('applicant')),
             'admin': {
                 'id': new_admin.id,
                 'username': new_admin.username,
@@ -2150,9 +2156,11 @@ def user_authenticated():
 
             if current_user.type == "admin":
 
-                school_id = User_shcool.query.filter_by(user_id=current_user.id).first().shcool_id
-
-                school = Shcool.query.get(school_id)
+                # An admin with no school membership row (or a membership
+                # pointing at a deleted school) still has to be able to log in,
+                # so resolve the school defensively rather than crashing.
+                membership = User_shcool.query.filter_by(user_id=current_user.id).first()
+                school = Shcool.query.get(membership.shcool_id) if membership else None
 
                 return jsonify({
                     'is_authenticated': current_user.is_authenticated,
@@ -2163,8 +2171,8 @@ def user_authenticated():
                     'quiz_id': quiz_id,
                     'id': current_user.id,
                     'client_id_invoicing_api': client_id_invoicing_api,
-                    'school_id': school.id,
-                    'school': school.name,
+                    'school_id': school.id if school else None,
+                    'school': school.name if school else None,
                     'must_change_password': bool(current_user.must_change_password)
                 })
 
@@ -2194,8 +2202,14 @@ def user_authenticated():
                         and current_user.parent_id is None
                     )
                 })
-    except Exception as e:     
-        return jsonify({'error': str(e), 'message': 'Internal server error'})
+
+        # Anonymous visitor (no session, or an expired/invalid one). This is a
+        # normal state -- the public site calls this on every boot -- so answer
+        # with a plain "not logged in" body instead of falling off the end of
+        # the view, which made Flask raise and return a 500.
+        return jsonify({'is_authenticated': False}), 200
+    except Exception as e:
+        return jsonify({'error': str(e), 'message': 'Internal server error'}), 500
 
 @reader.route('/get_all_schools', methods=['GET'])
 def get_all_schools():

@@ -457,7 +457,9 @@ def get_school_admin_approved_email_body(user):
         f'Hello {user.username},\n\n'
         f'Your school admin account for {school_names} has been approved.\n'
         f'You can now sign in to the IRead admin dashboard.\n\n'
-        f'{ConfigClass.FRONT_URL}'
+        # The admin dashboard, not FRONT_URL -- that is the reader site, which
+        # has no sign-in an approved school admin can use.
+        f'{ConfigClass.ADMIN_FRONT_URL}'
     )
 
 def send_school_admin_approved_email(user):
