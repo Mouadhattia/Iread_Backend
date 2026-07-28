@@ -120,9 +120,14 @@ from apps.game_calendar import (
     serialize_game_setting,
     upsert_calendar_entry,
 )
+from apps.account_email import (
+    get_parent_for_reader,
+    send_removed_from_school_emails,
+)
 from apps.notifications import (
     commit_notification_event,
     get_session_audience_ids,
+    notify_reader_removed_from_school,
     notify_book_added_to_pack,
     notify_daily_game_created,
     notify_global_pack_created,
@@ -5356,6 +5361,11 @@ def remove_reader_from_school(user_id):
         if membership is None:
             return jsonify({'message': 'This student is not enrolled in that school'}), 404
 
+        # Resolved before the membership goes away so the notification/email can
+        # still name the school and reach the managing parent.
+        school = Shcool.query.get(school_id)
+        parent = get_parent_for_reader(reader)
+
         was_default = membership.is_default
         db.session.delete(membership)
         # Offboarding returns the seat: the student is no longer one of this
@@ -5370,6 +5380,20 @@ def remove_reader_from_school(user_id):
             remaining[0].is_default = True
 
         db.session.commit()
+
+        # Told after the removal is durable, and never allowed to undo it: a
+        # failed bell or a dead mail server must not leave the student enrolled,
+        # nor turn a completed removal into an error the admin will retry.
+        try:
+            commit_notification_event(
+                notify_reader_removed_from_school, reader, school, parent=parent
+            )
+            send_removed_from_school_emails(reader, school, parent=parent)
+        except Exception as error:
+            logging.error(
+                'remove_reader_from_school: could not notify reader %s: %s',
+                user_id, error, exc_info=True
+            )
 
         return jsonify({
             'message': 'Student removed from this school. Their Reading Passport is preserved.',

@@ -10,20 +10,11 @@
 # Every send is best-effort. An SMTP failure must never roll back a raised
 # invoice or a processed webhook: the money and the database state are the
 # things that must be right, and a missing email can be re-sent.
-import logging
-from datetime import datetime
-
-from flask import render_template
-
+from apps.emailer import send_html_email, unique_addresses
 from config import ConfigClass
-from extensions import mail, db
+from extensions import db
 from models.user import User
 from models.user_shcool import User_shcool
-
-try:
-    from flask_mail import Message
-except ImportError:  # pragma: no cover - flask_mail is a core dependency
-    Message = None
 
 
 ##
@@ -49,23 +40,9 @@ def format_date(value):
 # @brief Send one HTML email, swallowing failures.
 # @return True if it was handed to the mail server.
 def send_email(subject, recipients, template, **context):
-    recipients = [address for address in (recipients or []) if address]
-    if not recipients:
-        logging.warning('Billing email "%s" had no recipients; skipped.', subject)
-        return False
-    if Message is None:
-        logging.error('flask_mail is unavailable; cannot send "%s".', subject)
-        return False
-
-    try:
-        html = render_template(template, current_year=datetime.now().year, **context)
-        message = Message(subject, recipients=recipients, sender=ConfigClass.MAIL_USERNAME)
-        message.html = html
-        mail.send(message)
-        return True
-    except Exception as error:
-        logging.error('Billing email "%s" failed: %s', subject, error, exc_info=True)
-        return False
+    return send_html_email(
+        subject, recipients, template, category='Billing email', **context
+    )
 
 
 ##
@@ -102,14 +79,7 @@ def get_invoice_recipients(school_id, billing_profile=None):
     if billing_profile is not None and billing_profile.billing_email:
         recipients.append(billing_profile.billing_email)
     recipients.extend(get_school_admin_emails(school_id))
-
-    seen, unique = set(), []
-    for address in recipients:
-        key = address.strip().lower()
-        if key and key not in seen:
-            seen.add(key)
-            unique.append(address)
-    return unique
+    return unique_addresses(recipients)
 
 
 ##

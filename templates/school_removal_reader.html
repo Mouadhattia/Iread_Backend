@@ -1,0 +1,52 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}You have been removed from {{ school_name }}{% endblock %}
+
+{% block content %}
+<h1>Your iRead account stays with you</h1>
+<p>Hello{% if reader_name %} {{ reader_name }}{% endif %},</p>
+<p>
+  <strong>{{ school_name }}</strong> has removed you from their reading programme
+  on iRead. This was done by that school, and it only affects your place there.
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">School</td>
+    <td>{{ school_name }}</td>
+  </tr>
+  <tr>
+    <td class="label">What ends</td>
+    <td>Access to {{ school_name }}&rsquo;s reading packs, books and sessions</td>
+  </tr>
+  <tr>
+    <td class="label">What stays</td>
+    <td>Your iRead account and your whole Reading Passport</td>
+  </tr>
+</table>
+
+<p>
+  <strong>Your account has not been deleted.</strong> You can still sign in with
+  the same email and password, and everything you have earned is still yours:
+</p>
+<ul style="margin: 0 0 16px; padding-left: 20px; color: #475569;">
+  <li>your reading history and the books you have finished</li>
+  <li>the words you have learned and your CEFR progress</li>
+  <li>your streaks, achievements and certificates</li>
+</ul>
+
+{% if dashboard_url %}
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ dashboard_url }}">Open my dashboard</a>
+</p>
+{% endif %}
+
+<p>
+  If you join another school on iRead later, your Reading Passport comes with
+  you &mdash; you carry on from where you left off rather than starting again.
+</p>
+<p>
+  If you think this was a mistake, please contact {{ school_name }} directly, as
+  they manage who is enrolled in their programme.
+</p>
+{% endblock %}

@@ -30,6 +30,8 @@ TYPE_ICONS = {
     'word_suggestion_submitted': 'fe fe-edit-3',
     'word_suggestion_approved': 'fe fe-check-circle',
     'word_suggestion_rejected': 'fe fe-x-circle',
+    'removed_from_school': 'fe fe-log-out',
+    'child_removed_from_school': 'fe fe-log-out',
     'seat_threshold_reached': 'fe fe-users',
     'seat_limit_reached': 'fe fe-alert-triangle',
     'licence_invoice_issued': 'fe fe-file-text',
@@ -41,6 +43,11 @@ TYPE_ICONS = {
 # Where a school admin is sent to act on a billing notification.
 SCHOOL_LICENCE_LINK = '/school/licence'
 SUPER_ADMIN_CONTRACTS_LINK = '/super-admin/subscriptions'
+
+# Readers and parents land on different dashboards in IREAD_FRONT, so a
+# notification that isn't about a pack/session/book has to say which one.
+READER_DASHBOARD_LINK = '/reader/dashboard'
+PARENT_DASHBOARD_LINK = '/parent/dashboard'
 
 
 def _unique_ids(user_ids):
@@ -555,6 +562,56 @@ def notify_daily_game_created(school_id, book, game_type, play_date):
         expires_at=expires_at,
         dedupe_key=f'daily-game:{school_id}:{book.id}:{game_type}:{play_date.isoformat()}'
     )
+
+
+## @brief Tell a reader (and the parent who manages them) that a school has
+# offboarded them -- and, in the same breath, that their account is still here.
+#
+# PRD §6: removal severs the school membership only. The whole point of the
+# message is the second sentence, because "removed" reads as "deleted" to a
+# family unless the notification says otherwise. No dedupe_key: the caller only
+# gets here after deleting a membership that had to exist, so a repeat request
+# 404s instead of duplicating, and a reader who re-enrols and is removed again
+# genuinely should hear about it twice.
+#
+# @param reader The offboarded Reader.
+# @param school The Shcool they were removed from.
+# @param parent Their Parent (a User row), or None for self-registered readers.
+def notify_reader_removed_from_school(reader, school, parent=None):
+    school_name = (school.name if school else None) or 'your school'
+    reader_name = (
+        getattr(reader, 'display_name', None) or getattr(reader, 'username', None) or 'Your child'
+    )
+    school_id = school.id if school else None
+    removed_at = datetime.utcnow().isoformat()
+    payload = {'school_id': school_id, 'school_name': school_name, 'removed_at': removed_at}
+
+    notifications = create_notifications_for_users(
+        [reader.id],
+        'removed_from_school',
+        f'You were removed from {school_name}',
+        f'{school_name} has removed you from their reading programme. Your iRead '
+        'account and your Reading Passport — books, words, streaks, achievements '
+        'and certificates — all stay with you.',
+        link=READER_DASHBOARD_LINK,
+        school_id=school_id,
+        payload=payload,
+    )
+
+    if parent is not None:
+        notifications += create_notifications_for_users(
+            [parent.id],
+            'child_removed_from_school',
+            f'{reader_name} was removed from {school_name}',
+            f'{school_name} has removed {reader_name} from their reading programme. '
+            'The iRead account and the full Reading Passport are preserved — you can '
+            'join another school any time with its invitation code.',
+            link=PARENT_DASHBOARD_LINK,
+            school_id=school_id,
+            payload=dict(payload, reader_id=reader.id, reader_name=reader_name),
+        )
+
+    return notifications
 
 
 ## @brief School admins only -- billing is not a teacher's concern, and

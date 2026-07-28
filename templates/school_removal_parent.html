@@ -1,0 +1,58 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}{{ reader_name }} has been removed from {{ school_name }}{% endblock %}
+
+{% block content %}
+<h1>{{ reader_name }}&rsquo;s iRead account stays open</h1>
+<p>Hello{% if parent_name %} {{ parent_name }}{% endif %},</p>
+<p>
+  <strong>{{ school_name }}</strong> has removed <strong>{{ reader_name }}</strong>
+  from their reading programme on iRead. This was done by the school, and it
+  only affects their place there.
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">Reader</td>
+    <td>{{ reader_name }}</td>
+  </tr>
+  <tr>
+    <td class="label">School</td>
+    <td>{{ school_name }}</td>
+  </tr>
+  <tr>
+    <td class="label">What ends</td>
+    <td>Access to {{ school_name }}&rsquo;s reading packs, books and sessions</td>
+  </tr>
+  <tr>
+    <td class="label">What stays</td>
+    <td>The iRead account and the full Reading Passport</td>
+  </tr>
+</table>
+
+<p>
+  <strong>The account has not been deleted.</strong> {{ reader_name }} can still
+  sign in as before, and everything they have earned is preserved:
+</p>
+<ul style="margin: 0 0 16px; padding-left: 20px; color: #475569;">
+  <li>reading history and finished books</li>
+  <li>words learned and CEFR progress</li>
+  <li>streaks, achievements and certificates</li>
+</ul>
+
+{% if dashboard_url %}
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ dashboard_url }}">Open my parent dashboard</a>
+</p>
+{% endif %}
+
+<p>
+  If {{ reader_name }} joins another school on iRead later, their Reading
+  Passport comes with them &mdash; you can join a new school from your parent
+  dashboard using that school&rsquo;s invitation code.
+</p>
+<p>
+  If you think this was a mistake, please contact {{ school_name }} directly, as
+  they manage who is enrolled in their programme.
+</p>
+{% endblock %}
