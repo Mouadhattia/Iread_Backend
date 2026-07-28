@@ -40,7 +40,12 @@ from models.user_log import UserLog
 from models.admin_audit_log import AdminAuditLog
 from models.contract_plan import ContractPlan
 from models.school_billing_profile import SchoolBillingProfile
-from models.school_invoice import SchoolInvoice
+from models.school_invoice import (
+    INVOICE_DRAFT,
+    INVOICE_OPEN,
+    INVOICE_PAID,
+    SchoolInvoice,
+)
 from models.school_seat_activation import SchoolSeatActivation
 from models.school_subscription import (
     ALL_SUBSCRIPTION_STATUSES,
@@ -3663,6 +3668,44 @@ def super_issue_subscription_invoice(subscription_id):
         if not school:
             return jsonify({'message': 'School not found'}), 404
 
+        # Guard 1 -- never bill the same term twice. Without this, clicking
+        # Invoice again raises a second Stripe invoice for the same contract
+        # and the school can pay both.
+        blocking_invoice = (
+            SchoolInvoice.query
+            .filter(SchoolInvoice.subscription_id == subscription.id)
+            .filter(SchoolInvoice.status.in_((INVOICE_DRAFT, INVOICE_OPEN, INVOICE_PAID)))
+            .order_by(SchoolInvoice.id.desc())
+            .first()
+        )
+        if blocking_invoice is not None:
+            already_paid = blocking_invoice.status == INVOICE_PAID
+            return jsonify({
+                'message': (
+                    'This contract has already been paid (invoice %s). Create a new '
+                    'contract for the next term rather than invoicing this one again.'
+                    if already_paid else
+                    'An invoice for this contract is already awaiting payment (%s). '
+                    'Void it first if you need to re-issue it.'
+                ) % (blocking_invoice.number or '#%s' % blocking_invoice.id),
+                'code': 'INVOICE_ALREADY_EXISTS',
+                'invoice': serialize_school_invoice(blocking_invoice)
+            }), 409
+
+        # Guard 2 -- invoicing moves a contract to "awaiting payment", which is
+        # a seat-consuming state. Two of those for one school makes "which cap
+        # applies?" ambiguous, so it is refused here exactly as it is when a
+        # contract is created or activated directly.
+        conflict = existing_consuming_subscription(
+            subscription.shcool_id, exclude_id=subscription.id
+        )
+        if conflict is not None and not subscription.is_consuming():
+            return jsonify({
+                'message': 'This school already has a live contract (#%s). Cancel or let '
+                           'it expire before invoicing another one.' % conflict.id,
+                'code': 'CONTRACT_ALREADY_LIVE'
+            }), 409
+
         data = request.get_json(silent=True) or {}
         invoice = create_and_send_invoice(
             subscription, school,
@@ -3818,7 +3861,31 @@ def serialize_subscription(subscription):
         'status': subscription.status,
         'auto_renew': subscription.auto_renew,
         'notes': subscription.notes,
-        'created_at': subscription.created_at.isoformat() if subscription.created_at else None
+        'created_at': subscription.created_at.isoformat() if subscription.created_at else None,
+        # Lets the UI disable the Invoice button instead of letting the super
+        # admin click it and be refused -- the server still enforces it.
+        **summarize_subscription_invoices(subscription)
+    }
+
+
+## @brief Whether a contract has already been billed, and how that went.
+def summarize_subscription_invoices(subscription):
+    invoices = (
+        SchoolInvoice.query
+        .filter(SchoolInvoice.subscription_id == subscription.id)
+        .order_by(SchoolInvoice.id.desc())
+        .all()
+    )
+    paid = next((i for i in invoices if i.status == INVOICE_PAID), None)
+    awaiting = next((i for i in invoices if i.status in (INVOICE_DRAFT, INVOICE_OPEN)), None)
+    latest = invoices[0] if invoices else None
+    return {
+        'invoice_count': len(invoices),
+        'has_paid_invoice': paid is not None,
+        'has_open_invoice': awaiting is not None,
+        'can_invoice': paid is None and awaiting is None,
+        'latest_invoice_status': latest.status if latest else None,
+        'latest_invoice_number': (latest.number or ('#%s' % latest.id)) if latest else None,
     }
 
 
