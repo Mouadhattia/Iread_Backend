@@ -1588,6 +1588,45 @@ def serialize_super_book(book):
     book_data['has_headwords'] = get_book_text_entry(book.id) is not None
     return book_data
 
+## @brief Approval state of a school's own school-admin accounts.
+#
+# `Shcool.is_active` is only a suspension switch (it defaults to True), so a
+# school that signed itself up is "not suspended" from the moment the form is
+# submitted — while its school admin still sits in the super admin's approval
+# queue. Approval lives on the User row, never on the school, so school status
+# has to be derived from its admins: in this product "active" means approved.
+#
+# Returns (admin_count, approved_admin_count). `approved` is nullable on legacy
+# rows, so it is read for truthiness exactly like the login check does.
+def school_admin_approval_state(school_id):
+    rows = (
+        db.session.query(User.approved)
+        .join(User_shcool, User_shcool.user_id == User.id)
+        .filter(User_shcool.shcool_id == school_id, User.type == 'admin')
+        .all()
+    )
+    approved = sum(1 for row in rows if row[0])
+    return len(rows), approved
+
+
+## @brief School ids that have at least one school admin and none approved yet.
+# The platform-wide counterpart of school_admin_approval_state(), for analytics.
+def pending_approval_school_ids():
+    with_admin = set()
+    with_approved_admin = set()
+    rows = (
+        db.session.query(User_shcool.shcool_id, User.approved)
+        .join(User, User.id == User_shcool.user_id)
+        .filter(User.type == 'admin')
+        .all()
+    )
+    for school_id, approved in rows:
+        with_admin.add(school_id)
+        if approved:
+            with_approved_admin.add(school_id)
+    return with_admin - with_approved_admin
+
+
 def serialize_super_school(school):
     user_count = User_shcool.query.filter_by(shcool_id=school.id).count()
     pack_count = Pack.query.filter_by(shcool_id=school.id).count()
@@ -1608,6 +1647,16 @@ def serialize_super_school(school):
         .count()
     )
     suspender = User.query.get(school.suspended_by) if school.suspended_by else None
+    admin_count, approved_admin_count = school_admin_approval_state(school.id)
+    # A school with no admin at all (created by a super admin without login
+    # credentials) has nothing to approve -- it is not pending, just empty.
+    awaiting_admin_approval = admin_count > 0 and approved_admin_count == 0
+    if not school.is_active:
+        status = 'suspended'
+    elif awaiting_admin_approval:
+        status = 'pending_approval'
+    else:
+        status = 'active'
     return {
         'id': school.id,
         'name': school.name,
@@ -1616,6 +1665,11 @@ def serialize_super_school(school):
         'book_count': book_count,
         'seats': seat_summary(school.id),
         'is_active': school.is_active,
+        'status': status,
+        'admin_count': admin_count,
+        'approved_admin_count': approved_admin_count,
+        'pending_admin_count': admin_count - approved_admin_count,
+        'awaiting_admin_approval': awaiting_admin_approval,
         'suspended_at': school.suspended_at.isoformat() if school.suspended_at else None,
         'suspended_by': school.suspended_by,
         'suspended_by_name': suspender.username if suspender else None,
@@ -1718,7 +1772,7 @@ def super_dashboard():
             'users': User.query.count(),
             'readers': User.query.filter_by(type='reader').count(),
             'admins': User.query.filter_by(type='admin').count(),
-            'pending_admins': User.query.filter_by(type='admin', approved=False).count(),
+            'pending_admins': User.query.filter(User.type == 'admin', User.approved.isnot(True)).count(),
             'super_admins': User.query.filter_by(type='super_admin').count(),
             'teachers': User.query.filter_by(type='teacher').count(),
             'assistants': User.query.filter_by(type='assistant').count(),
@@ -1750,6 +1804,17 @@ def super_analytics():
         schools_suspended = Shcool.query.filter_by(is_active=False).count()
         schools_total = Shcool.query.count()
         users_suspended = User.query.filter_by(is_active=False).count()
+        # Self-signed-up schools are not suspended, but they are not live
+        # either until their admin is approved -- keep them out of "active" so
+        # this KPI agrees with the approval queue below and the schools page.
+        pending_school_ids = pending_approval_school_ids()
+        schools_pending_approval = (
+            Shcool.query.filter(
+                Shcool.is_active.is_(True),
+                Shcool.id.in_(pending_school_ids)
+            ).count()
+            if pending_school_ids else 0
+        )
 
         dau = db.session.query(func.count(func.distinct(UserLog.user_id))).filter(
             UserLog.created_at == today
@@ -1763,7 +1828,8 @@ def super_analytics():
 
         pulse = {
             'schools_total': schools_total,
-            'schools_active': schools_total - schools_suspended,
+            'schools_active': schools_total - schools_suspended - schools_pending_approval,
+            'schools_pending_approval': schools_pending_approval,
             'schools_suspended': schools_suspended,
             'users_total': User.query.count(),
             'users_suspended': users_suspended,
@@ -1784,10 +1850,31 @@ def super_analytics():
             .limit(10)
             .all()
         )
+        pending_schools = (
+            Shcool.query.filter(
+                Shcool.is_active.is_(True),
+                Shcool.id.in_(pending_school_ids)
+            )
+            .order_by(Shcool.id.desc())
+            .limit(10)
+            .all()
+            if pending_school_ids else []
+        )
         needs_attention = {
-            'pending_school_admins': User.query.filter_by(type='admin', approved=False).count(),
-            'pending_teachers': User.query.filter_by(type='teacher', approved=False).count(),
+            # `approved` is nullable on legacy rows and the login check reads it
+            # for truthiness, so anything that is not exactly True is pending.
+            'pending_school_admins': User.query.filter(
+                User.type == 'admin', User.approved.isnot(True)
+            ).count(),
+            'pending_teachers': User.query.filter(
+                User.type == 'teacher', User.approved.isnot(True)
+            ).count(),
             'pending_word_suggestions': WordSenseSuggestion.query.filter_by(status=STATUS_PENDING).count(),
+            'pending_schools_count': schools_pending_approval,
+            'pending_schools': [
+                {'id': school.id, 'name': school.name}
+                for school in pending_schools
+            ],
             'suspended_schools_count': schools_suspended,
             'suspended_schools': [
                 {'id': school.id, 'name': school.name, 'suspended_reason': school.suspended_reason}
@@ -1909,7 +1996,11 @@ def super_get_users():
         if role:
             users_query = users_query.filter(User.type == role)
         if approved is not None:
-            users_query = users_query.filter(User.approved == approved)
+            # NULL approved (legacy rows) blocks login just like False does, so
+            # the pending filter has to catch it too -- see needs_attention.
+            users_query = users_query.filter(
+                User.approved.is_(True) if approved else User.approved.isnot(True)
+            )
         if school_id:
             users_query = users_query.join(User_shcool, User.id == User_shcool.user_id).filter(User_shcool.shcool_id == school_id)
         if search:
