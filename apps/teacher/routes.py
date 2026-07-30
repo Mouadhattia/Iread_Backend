@@ -18,6 +18,13 @@ from models.user_shcool import User_shcool
 from functools import wraps
 from apps.reader.routes import bcrypt
 from apps.jitsi import is_online_session, serialize_jitsi_call
+from apps.storage import (
+    StorageError,
+    assert_within_quota,
+    category_dir,
+    delete_by_absolute_path,
+    register_existing_file,
+)
 from extensions import db
 from config import ConfigClass
 from werkzeug.utils import secure_filename
@@ -127,11 +134,14 @@ def get_file_size(file_storage):
     file_storage.stream.seek(0)
     return file_size
 
+## @brief Where a book's story PDF is written.
+#
+# The school's own `books/files` bucket in the self-hosted storage tree, so a
+# teacher's upload counts toward the same school quota and appears in the same
+# storage manager as an admin's. Must stay in step with the admin blueprint's
+# copy of this function.
 def get_story_upload_dir(school_id, book_id):
-    upload_root = os.path.abspath(ConfigClass.STORY_UPLOAD_DIR)
-    upload_dir = os.path.join(upload_root, str(school_id), str(book_id))
-    os.makedirs(upload_dir, exist_ok=True)
-    return upload_dir
+    return category_dir(school_id, 'books/files')
 
 def serialize_book_story(story):
     return {
@@ -297,6 +307,13 @@ def upload_teacher_book_story(book_id):
         if file_size > max_file_size:
             return jsonify({'message': f'PDF file is too large. Max size is {ConfigClass.MAX_STORY_UPLOAD_MB} MB'}), 413
 
+        # The school's disk allowance is a hard limit, checked before the bytes
+        # are written so there is nothing to unwind on refusal.
+        try:
+            assert_within_quota(school_id, file_size)
+        except StorageError as storage_error:
+            return jsonify({'message': str(storage_error)}), 413
+
         title = (request.form.get('title') or '').strip()
         if not title:
             title = os.path.splitext(secure_filename(pdf_file.filename))[0] or 'Story'
@@ -325,6 +342,19 @@ def upload_teacher_book_story(book_id):
         db.session.add(story)
         db.session.flush()
         story.file_url = f'/reader/stories/{story.id}/pdf'
+        # Index the file so it counts toward the school's usage and is visible
+        # in the storage manager.
+        register_existing_file(
+            school_id,
+            'books/files',
+            saved_file_path,
+            uploaded_by=current_user.id,
+            original_filename=original_filename,
+            title=title,
+            linked_type='story',
+            linked_id=story.id,
+            mime_type=story.mime_type
+        )
         db.session.commit()
 
         return jsonify({
@@ -377,9 +407,10 @@ def delete_teacher_book_story(story_id):
 
         file_path = story.file_path
         db.session.delete(story)
+        # Drops the storage index row alongside the bytes so the school's quota
+        # is released; done before the commit so both land together.
+        delete_by_absolute_path(file_path)
         db.session.commit()
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
 
         return jsonify({'message': 'Story deleted successfully'}), 200
     except Exception as error:

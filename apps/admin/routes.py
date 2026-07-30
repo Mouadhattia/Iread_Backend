@@ -90,6 +90,14 @@ from models.chat import Chat
 import logging
 import requests
 from apps.main.email import generate_confirmed_token
+from apps.storage import (
+    StorageError,
+    assert_within_quota,
+    category_dir,
+    delete_by_absolute_path,
+    ensure_school_tree,
+    register_existing_file,
+)
 from config import ConfigClass
 from flask_mail import Message
 from functools import wraps
@@ -1155,12 +1163,20 @@ def get_file_size(file_storage):
     file_storage.stream.seek(0)
     return file_size
 
+## @brief Where a book's story PDF is written.
+#
+# Now the school's own `books/files` bucket in the self-hosted storage tree, so
+# story PDFs count toward the school's disk quota and show up in the storage
+# manager alongside everything else. Previously each book had its own folder
+# under a separate uploads root, which is why these files were invisible to any
+# usage reporting.
+#
+# The book id no longer appears in the path -- stored names are uuids, so there
+# is nothing to collide, and a flat bucket is what the storage manager browses.
+# Rows written before this change still hold their old absolute paths and are
+# still served from there, so nothing needs moving.
 def get_story_upload_dir(school_id, book_id):
-    upload_root = os.path.abspath(ConfigClass.STORY_UPLOAD_DIR)
-    owner_folder = str(school_id) if school_id is not None else 'platform'
-    upload_dir = os.path.join(upload_root, owner_folder, str(book_id))
-    os.makedirs(upload_dir, exist_ok=True)
-    return upload_dir
+    return category_dir(school_id, 'books/files')
 
 def serialize_book_story(story):
     return {
@@ -7304,6 +7320,14 @@ def upload_admin_book_story(book_id):
         if file_size > max_file_size:
             return jsonify({'message': f'PDF file is too large. Max size is {ConfigClass.MAX_STORY_UPLOAD_MB} MB'}), 413
 
+        # Checked before the bytes are written: the school's disk allowance is a
+        # hard limit, and refusing up front avoids saving a file we would then
+        # have to unwind.
+        try:
+            assert_within_quota(school_id, file_size)
+        except StorageError as storage_error:
+            return jsonify({'message': str(storage_error)}), 413
+
         title = (request.form.get('title') or '').strip()
         if not title:
             title = os.path.splitext(secure_filename(pdf_file.filename))[0] or 'Story'
@@ -7332,6 +7356,21 @@ def upload_admin_book_story(book_id):
         db.session.add(story)
         db.session.flush()
         story.file_url = f'/reader/stories/{story.id}/pdf'
+        # Index the file we just wrote so it counts toward the school's usage
+        # and is listed in the storage manager. Registered rather than uploaded
+        # through save_upload because this route needs the path itself for the
+        # PDF parsing that follows.
+        register_existing_file(
+            school_id,
+            'books/files',
+            saved_file_path,
+            uploaded_by=current_user.id,
+            original_filename=original_filename,
+            title=title,
+            linked_type='story',
+            linked_id=story.id,
+            mime_type=story.mime_type
+        )
         db.session.commit()
 
         return jsonify({
@@ -7384,9 +7423,11 @@ def delete_admin_book_story(story_id):
 
         file_path = story.file_path
         db.session.delete(story)
+        # Drops the storage index row alongside the bytes, so the school gets
+        # the quota back. Done before the commit so the story, its index row and
+        # the freed space are one atomic change.
+        delete_by_absolute_path(file_path)
         db.session.commit()
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
 
         return jsonify({'message': 'Story deleted successfully'}), 200
     except Exception as error:
@@ -9960,6 +10001,17 @@ def create_shcool():
         db.session.add(new_shcool)
         db.session.flush()
         get_or_create_school_public_page(new_shcool)
+        # Lay out the school's storage folders now so its admin opens the
+        # storage manager to the full set of sections. Best-effort: the folders
+        # are also created on first upload, so a disk problem here must not stop
+        # a school from being created.
+        try:
+            ensure_school_tree(new_shcool.id)
+        except OSError as storage_setup_error:
+            logging.warning(
+                'Could not pre-create storage folders for school %s: %s',
+                new_shcool.id, storage_setup_error
+            )
 
         school_admin = None
         if email and password:

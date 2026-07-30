@@ -12,6 +12,12 @@ from sqlalchemy.exc import IntegrityError
 from werkzeug.utils import secure_filename
 
 from apps.audiobooks.alignment import generate_model_alignment
+from apps.storage import (
+    assert_within_quota,
+    category_dir,
+    delete_by_absolute_path,
+    register_existing_file,
+)
 from config import ConfigClass
 from extensions import db
 from models.audio_book import AudioBook, AudioBookPage, AudioBookProgress
@@ -327,12 +333,30 @@ def validate_upload_size(file_storage, max_mb, label):
     return file_size
 
 
-def get_audio_book_upload_dir(book, *parts):
-    upload_root = os.path.abspath(ConfigClass.AUDIOBOOK_UPLOAD_DIR)
-    owner_folder = str(book.shcool_id) if book.shcool_id is not None else 'platform'
-    upload_dir = os.path.join(upload_root, owner_folder, str(book.id), *[str(part) for part in parts])
-    os.makedirs(upload_dir, exist_ok=True)
-    return upload_dir
+## @brief Which storage bucket each kind of audiobook asset belongs in.
+#
+# Maps the audiobook's own vocabulary onto the shared per-school storage tree,
+# so an audiobook's cover sits with the other book covers and its narration with
+# the other story audio -- which is what makes them countable against the
+# school's quota and browsable in the storage manager.
+AUDIO_BOOK_STORAGE_CATEGORIES = {
+    'cover': 'books/covers',
+    'image': 'stories/images',
+    'audio': 'stories/audio'
+}
+
+
+## @brief Directory for one of an audiobook's assets.
+#
+# Now the owning school's bucket in the self-hosted storage tree rather than a
+# private per-book folder tree. The book and page ids no longer appear in the
+# path -- stored names carry a uuid, so nothing collides, and a flat bucket is
+# what the storage manager lists. Rows written before this change keep their old
+# absolute paths and are still served from them, so no files need moving.
+#
+# @param asset: 'cover', 'image' or 'audio'.
+def get_audio_book_upload_dir(book, asset):
+    return category_dir(book.shcool_id, AUDIO_BOOK_STORAGE_CATEGORIES[asset])
 
 
 def save_uploaded_file(file_storage, upload_dir, prefix):
@@ -591,18 +615,55 @@ def get_upload_file(*names):
     return None
 
 
+## @brief Space this asset frees by replacing an existing file.
+#
+# Passed to the quota check so re-recording a page's narration in a school that
+# is near its limit is judged on the net change, not on the incoming size alone
+# -- otherwise replacing a 40 MB take with a 40 MB take would be refused.
+def superseded_size(old_path):
+    if old_path and os.path.exists(old_path):
+        try:
+            return os.path.getsize(old_path)
+        except OSError:
+            return 0
+    return 0
+
+
+## @brief Index a saved audiobook asset and drop the index row of the file it
+# replaced, keeping the school's usage figure honest across a re-upload.
+def reindex_audio_book_asset(book, asset, saved_file_path, old_path, file_storage,
+                             linked_type, linked_id, title=None):
+    if old_path:
+        delete_by_absolute_path(old_path)
+    return register_existing_file(
+        book.shcool_id,
+        AUDIO_BOOK_STORAGE_CATEGORIES[asset],
+        saved_file_path,
+        uploaded_by=current_user.id if current_user.is_authenticated else None,
+        original_filename=secure_filename(file_storage.filename or ''),
+        title=title,
+        linked_type=linked_type,
+        linked_id=linked_id,
+        mime_type=file_storage.mimetype or None
+    )
+
+
 def save_cover_image(book):
     cover_file = get_upload_file('cover_image', 'cover', 'image')
     if not cover_file:
         return None
     if not is_allowed_image_file(cover_file):
         raise ValueError('Only jpg, jpeg, png, or webp cover images are allowed')
-    validate_upload_size(cover_file, ConfigClass.MAX_AUDIOBOOK_IMAGE_UPLOAD_MB, 'Cover image')
-    saved_file_path, _ = save_uploaded_file(cover_file, get_audio_book_upload_dir(book, 'cover'), 'cover')
+    file_size = validate_upload_size(cover_file, ConfigClass.MAX_AUDIOBOOK_IMAGE_UPLOAD_MB, 'Cover image')
     old_path = book.cover_image_path
+    assert_within_quota(book.shcool_id, file_size, replaces_bytes=superseded_size(old_path))
+    saved_file_path, _ = save_uploaded_file(cover_file, get_audio_book_upload_dir(book, 'cover'), 'cover')
     book.cover_image_path = saved_file_path
     book.cover_image_url = f'/admin/audio-books/{book.id}/cover'
-    remove_file_if_exists(old_path)
+    reindex_audio_book_asset(
+        book, 'cover', saved_file_path, old_path, cover_file,
+        'audio_book', book.id, title=book.title
+    )
     return saved_file_path
 
 
@@ -613,13 +674,17 @@ def save_page_image(book, page):
     if not is_allowed_image_file(image_file):
         raise ValueError('Only jpg, jpeg, png, or webp page images are allowed')
     file_size = validate_upload_size(image_file, ConfigClass.MAX_AUDIOBOOK_IMAGE_UPLOAD_MB, 'Page image')
-    saved_file_path, _ = save_uploaded_file(image_file, get_audio_book_upload_dir(book, 'pages', page.id), 'image')
     old_path = page.image_path
+    assert_within_quota(book.shcool_id, file_size, replaces_bytes=superseded_size(old_path))
+    saved_file_path, _ = save_uploaded_file(image_file, get_audio_book_upload_dir(book, 'image'), 'image')
     page.image_path = saved_file_path
     page.image_url = f'/admin/audio-books/{book.id}/pages/{page.id}/image'
     page.image_mime_type = image_file.mimetype or None
     page.image_file_size = file_size
-    remove_file_if_exists(old_path)
+    reindex_audio_book_asset(
+        book, 'image', saved_file_path, old_path, image_file,
+        'audio_book_page', page.id, title='%s p.%s' % (book.title or 'Audiobook', page.page_number)
+    )
     return saved_file_path
 
 
@@ -630,13 +695,17 @@ def save_page_audio(book, page):
     if not is_allowed_audio_file(audio_file):
         raise ValueError('Only mp3, wav, m4a, webm, or ogg audio files are allowed')
     file_size = validate_upload_size(audio_file, ConfigClass.MAX_AUDIOBOOK_AUDIO_UPLOAD_MB, 'Audio')
-    saved_file_path, _ = save_uploaded_file(audio_file, get_audio_book_upload_dir(book, 'pages', page.id), 'audio')
     old_path = page.audio_path
+    assert_within_quota(book.shcool_id, file_size, replaces_bytes=superseded_size(old_path))
+    saved_file_path, _ = save_uploaded_file(audio_file, get_audio_book_upload_dir(book, 'audio'), 'audio')
     page.audio_path = saved_file_path
     page.audio_url = f'/admin/audio-books/{book.id}/pages/{page.id}/audio'
     page.audio_mime_type = audio_file.mimetype or None
     page.audio_file_size = file_size
-    remove_file_if_exists(old_path)
+    reindex_audio_book_asset(
+        book, 'audio', saved_file_path, old_path, audio_file,
+        'audio_book_page', page.id, title='%s p.%s' % (book.title or 'Audiobook', page.page_number)
+    )
     return saved_file_path
 
 

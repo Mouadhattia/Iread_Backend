@@ -116,6 +116,30 @@ class ConfigClass:
     )
     ## @brief Days a school gets to pay before an invoice is overdue.
     INVOICE_DUE_DAYS = int(os.environ.get('INVOICE_DUE_DAYS') or 30)
+    ## @brief Root of the self-hosted per-school file store. Everything a school
+    # uploads (story audio/images, book covers and PDFs, pack images) lives under
+    # `<SCHOOL_STORAGE_DIR>/school_<id>/<category>/`, with platform-owned assets
+    # under `platform/`. Replaces the former Cloudinary hosting, so this path
+    # must be on persistent, backed-up disk -- losing it loses every asset.
+    SCHOOL_STORAGE_DIR = os.environ.get('SCHOOL_STORAGE_DIR') or os.path.join(os.getcwd(), 'storage')
+    ## @brief Absolute origin the stored media URLs are built from, e.g.
+    # `https://api.iread.education`. The URLs go into the database (book.img,
+    # pack.img, user.img, ...) and are read by every frontend, so they must be
+    # absolute -- a relative `/media/...` would resolve against whichever app
+    # rendered it, not the API. Empty falls back to the request's own host,
+    # which is correct for local development but not for a queue/CLI context.
+    PUBLIC_MEDIA_BASE_URL = (os.environ.get('PUBLIC_MEDIA_BASE_URL') or '').rstrip('/')
+    ## @brief Default disk allowance per school, in MB. Overridable per school
+    # via Shcool.storage_quota_mb so a large customer can be raised without
+    # lifting the limit for everyone.
+    SCHOOL_STORAGE_QUOTA_MB = int(os.environ.get('SCHOOL_STORAGE_QUOTA_MB') or 5120)
+    ## @brief Per-file ceilings for the storage manager, by kind of asset.
+    MAX_MEDIA_IMAGE_UPLOAD_MB = int(os.environ.get('MAX_MEDIA_IMAGE_UPLOAD_MB') or 10)
+    MAX_MEDIA_AUDIO_UPLOAD_MB = int(os.environ.get('MAX_MEDIA_AUDIO_UPLOAD_MB') or 50)
+    MAX_MEDIA_DOCUMENT_UPLOAD_MB = int(os.environ.get('MAX_MEDIA_DOCUMENT_UPLOAD_MB') or 50)
+    ## @brief Legacy upload roots. New uploads go to SCHOOL_STORAGE_DIR, but
+    # rows written before the migration still hold absolute paths under these,
+    # so they stay configured for reads.
     STORY_UPLOAD_DIR = os.environ.get('STORY_UPLOAD_DIR') or os.path.join(os.getcwd(), 'uploads', 'stories')
     MAX_STORY_UPLOAD_MB = int(os.environ.get('MAX_STORY_UPLOAD_MB') or 50)
     AUDIOBOOK_UPLOAD_DIR = os.environ.get('AUDIOBOOK_UPLOAD_DIR') or os.path.join(os.getcwd(), 'uploads', 'audio-books')

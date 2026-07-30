@@ -19,6 +19,11 @@ class Shcool(db.Model):
     # Set explicitly for schools that need grandfathering -- e.g. one carrying
     # a large legacy reader base from before billing existed.
     trial_seats = db.Column(db.Integer, nullable=True)
+    ## @brief Per-school disk allowance in MB for the self-hosted file store.
+    # NULL means "use ConfigClass.SCHOOL_STORAGE_QUOTA_MB", so a single school
+    # can be raised for a large audiobook library without lifting the default
+    # for every tenant.
+    storage_quota_mb = db.Column(db.Integer, nullable=True)
     def __repr__(self):
         return '< shcool %s >' %self.id
 

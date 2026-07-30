@@ -19,7 +19,11 @@ class Session(db.Model):
     id=db.Column(db.Integer,primary_key=True)
     token=db.Column(db.String(36),unique=True)
     name=db.Column(db.String(65),nullable=False)
-    img=db.Column(db.String(100),nullable=True)
+    ## @brief Session cover image URL. Widened from 100 chars for self-hosted
+    # storage: a local media URL (origin + /media/ + school folder + category +
+    # uuid filename) runs to ~115 characters, so 100 would silently truncate it
+    # into a broken link.
+    img=db.Column(db.String(500),nullable=True)
     capacity=db.Column(db.Integer,default=20)
     book_id=db.Column(db.ForeignKey(Book.id))
     unit_id=db.Column(db.ForeignKey(Unit.id),nullable=True)

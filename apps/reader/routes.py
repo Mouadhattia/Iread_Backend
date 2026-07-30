@@ -59,6 +59,7 @@ from apps.progress_engine import (
     submit_attempt,
 )
 from apps.certificates import get_certificates_for_user, issue_certificates_for_user
+from apps.storage import ensure_school_tree
 from apps.seats import (
     SOURCE_PARENT_CODE,
     SOURCE_READER_CODE,
@@ -967,6 +968,17 @@ def register_school_admin():
         db.session.add(new_school)
         db.session.flush()
         get_or_create_school_public_page(new_school)
+        # Lay out the school's storage folders now so its admin opens the
+        # storage manager to the full set of sections. Best-effort: the folders
+        # are also created on first upload, so a disk problem here must not
+        # fail an otherwise valid signup.
+        try:
+            ensure_school_tree(new_school.id)
+        except OSError as storage_setup_error:
+            logging.warning(
+                'Could not pre-create storage folders for school %s: %s',
+                new_school.id, storage_setup_error
+            )
 
         admin_data = {
             'username': username,
