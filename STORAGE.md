@@ -145,3 +145,4 @@ python scripts/index_school_storage.py --prune
 # One school only.
 python scripts/index_school_storage.py --school 12
 ```
+.
