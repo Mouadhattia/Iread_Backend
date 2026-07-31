@@ -178,6 +178,14 @@ These prerequisites ensure that you have the necessary tools and software to set
 
    Flask-Migrate ensures that your database structure stays synchronized with your application's models. Always review the generated migration script before applying it to your database to ensure data integrity and consistency.
 
+   **On the server, only ever run `flask db upgrade`.** Steps a and b are for
+   local development. `flask db init` would overwrite the committed `migrations`
+   folder, and `flask db migrate` run on the server writes a version file that
+   the next deploy's `rsync --delete` removes — leaving the database pointing at
+   a revision that no longer exists anywhere. See
+   [MIGRATIONS.md](MIGRATIONS.md) if you are looking at
+   `Can't locate revision identified by ...`.
+
 ## Usage
 
 1. **Navigate to the project directory and run the Flask server**:

@@ -173,6 +173,7 @@ from apps.stripe_billing import (
 from apps.stripe_billing import is_configured as stripe_is_configured
 from apps.system_migrations import (
     MigrationsDisabled,
+    UnknownRevision,
     get_migration_status,
     run_upgrade,
 )
@@ -1784,18 +1785,57 @@ def super_dashboard():
     if not is_super_admin():
         return jsonify({'message': 'Super admin access required'}), 403
     try:
+        schools_total = Shcool.query.count()
+        schools_suspended = Shcool.query.filter_by(is_active=False).count()
+        # A self-signed-up school is live only once its admin is approved, so
+        # it is neither active nor suspended until then -- same rule as
+        # /super/analytics and the schools page, kept in step deliberately.
+        pending_school_ids = pending_approval_school_ids()
+        schools_pending_approval = (
+            Shcool.query.filter(
+                Shcool.is_active.is_(True),
+                Shcool.id.in_(pending_school_ids)
+            ).count()
+            if pending_school_ids else 0
+        )
+
+        # The overview page is the super admin's landing page, so it carries the
+        # action queue. These are all plain counts -- the lists and trend series
+        # stay on /super/analytics, which is far more expensive to compute.
+        needs_attention = {
+            # `approved` is nullable on legacy rows and the login check reads it
+            # for truthiness, so anything that is not exactly True is pending.
+            'pending_school_admins': User.query.filter(
+                User.type == 'admin', User.approved.isnot(True)
+            ).count(),
+            'pending_teachers': User.query.filter(
+                User.type == 'teacher', User.approved.isnot(True)
+            ).count(),
+            'pending_word_suggestions': WordSenseSuggestion.query.filter_by(status=STATUS_PENDING).count(),
+            # Same key names as /super/analytics' needs_attention block, where
+            # `pending_schools` is the list and `_count` is the number -- this
+            # endpoint returns counts only, so only the `_count` keys exist.
+            'pending_schools_count': schools_pending_approval,
+            'suspended_schools_count': schools_suspended,
+            'suspended_users_count': User.query.filter_by(is_active=False).count(),
+        }
+
         return jsonify({
             'users': User.query.count(),
             'readers': User.query.filter_by(type='reader').count(),
             'admins': User.query.filter_by(type='admin').count(),
-            'pending_admins': User.query.filter(User.type == 'admin', User.approved.isnot(True)).count(),
+            'pending_admins': needs_attention['pending_school_admins'],
             'super_admins': User.query.filter_by(type='super_admin').count(),
             'teachers': User.query.filter_by(type='teacher').count(),
             'assistants': User.query.filter_by(type='assistant').count(),
-            'schools': Shcool.query.count(),
+            'schools': schools_total,
+            'schools_active': schools_total - schools_suspended - schools_pending_approval,
+            'schools_pending_approval': schools_pending_approval,
+            'schools_suspended': schools_suspended,
             'packs': Pack.query.count(),
             'books': Book.query.count(),
-            'sessions': Session.query.count()
+            'sessions': Session.query.count(),
+            'needs_attention': needs_attention,
         }), 200
     except Exception as error:
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
@@ -3672,6 +3712,15 @@ def super_run_migration_upgrade():
         }), 200
     except MigrationsDisabled as error:
         return jsonify({'message': str(error), 'code': 'MIGRATIONS_DISABLED'}), 403
+    except UnknownRevision as error:
+        # 409, not 500: the server is healthy and the request was well formed --
+        # the database is in a state an upgrade cannot resolve, and the operator
+        # has to repair the pointer first.
+        return jsonify({
+            'message': str(error),
+            'code': 'UNKNOWN_REVISION',
+            'status': get_migration_status_safe(),
+        }), 409
     except Exception as error:
         logging.error('Migration upgrade failed: %s', error, exc_info=True)
         # The failure text matters here -- a half-applied migration needs the

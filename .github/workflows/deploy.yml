@@ -88,7 +88,19 @@ jobs:
           python -m pip install -r requirements.txt
 
           export FLASK_APP=app.py
-          python -m flask db upgrade
+
+          # A failed upgrade is usually one of two things, and alembic's own
+          # message only distinguishes them if you already know the difference.
+          # Run the diagnostic on failure so the job log says which one it is --
+          # in particular "Can't locate revision identified by ...", which is a
+          # broken alembic_version pointer and not a broken migration.
+          # Deliberately diagnose only; repairing the pointer rewrites database
+          # state and is not something a push should do unattended.
+          if ! python -m flask db upgrade; then
+            echo "::error::flask db upgrade failed -- running the migration diagnostic"
+            python scripts/repair_alembic_version.py --check || true
+            exit 1
+          fi
 
           pm2 restart iread --update-env
           pm2 save

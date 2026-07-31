@@ -32,6 +32,34 @@ class MigrationsDisabled(Exception):
     """Raised when web migrations are not enabled on this server."""
 
 
+class UnknownRevision(Exception):
+    """
+    Raised when the database points at a revision this codebase does not have.
+
+    This is its own failure rather than a generic error because the remedy is
+    completely different from "a migration failed": nothing is wrong with the
+    schema, the bookmark is wrong, and running an upgrade cannot fix it.
+    """
+
+
+##
+# @brief The message an operator needs when the pointer is unresolvable.
+#
+# Kept in one place so the API, the audit trail and the console script all say
+# the same thing.
+def unknown_revision_message(revision):
+    return (
+        "The database is stamped with revision '%s', which exists in no file "
+        "under migrations/versions/. Alembic cannot place the database on its "
+        "migration graph, so it will not report or apply anything until this is "
+        "corrected. This usually means a dump was restored from a server that "
+        "had a migration file this codebase does not, or that an applied "
+        "migration was later deleted from git. The schema itself is normally "
+        "fine -- only the pointer is wrong. Diagnose and repair it with: "
+        "python scripts/repair_alembic_version.py" % revision
+    )
+
+
 def web_migrations_enabled():
     return bool(getattr(ConfigClass, 'ALLOW_WEB_MIGRATIONS', False))
 
@@ -60,14 +88,39 @@ def get_head_revision():
 
 
 ##
+# @brief Whether a revision id actually exists in migrations/versions/.
+#
+# Everything else here walks the migration graph, and every one of those walks
+# raises if the starting point is not on it. Checking first is what turns an
+# unreadable 500 into a status the UI can explain.
+def revision_exists(script, revision):
+    if not revision:
+        return False
+    try:
+        return script.get_revision(revision) is not None
+    except Exception:
+        # alembic raises ResolutionError here, but older versions raise a bare
+        # CommandError; either way the answer is the same.
+        return False
+
+
+##
 # @brief Migrations that exist in the code but are not yet applied, oldest
 # first -- i.e. exactly what an upgrade would run.
+#
+# Returns [] when the database's revision is unresolvable: there is no honest
+# answer to "what is pending" from a starting point that is not on the graph,
+# and an empty list next to unknown_revision=True is less misleading than an
+# exception the caller has to translate.
 def get_pending_revisions():
     script = ScriptDirectory.from_config(_alembic_config())
     current = get_current_revision()
     head = script.get_current_head()
 
     if current == head:
+        return []
+
+    if current is not None and not revision_exists(script, current):
         return []
 
     pending = []
@@ -88,17 +141,23 @@ def get_pending_revisions():
 ##
 # @brief Everything the UI needs to decide whether to offer the button.
 def get_migration_status():
+    script = ScriptDirectory.from_config(_alembic_config())
     current = get_current_revision()
-    head = get_head_revision()
-    pending = get_pending_revisions()
+    head = script.get_current_head()
+    unknown = current is not None and not revision_exists(script, current)
+    pending = [] if unknown else get_pending_revisions()
     return {
         'current_revision': current,
         'head_revision': head,
-        'up_to_date': current == head,
+        # An unresolvable revision is never "up to date", whatever it happens to
+        # equal -- the state is unknown, not good.
+        'up_to_date': current == head and not unknown,
         'pending': pending,
         'pending_count': len(pending),
         'enabled': web_migrations_enabled(),
         'never_migrated': current is None,
+        'unknown_revision': unknown,
+        'diagnosis': unknown_revision_message(current) if unknown else None,
     }
 
 
@@ -122,6 +181,14 @@ def run_upgrade():
     from flask_migrate import upgrade as flask_migrate_upgrade
 
     before = get_current_revision()
+
+    # Stop before alembic does, so the operator gets the remedy instead of
+    # "Can't locate revision identified by ...". An upgrade cannot fix this and
+    # would only produce a confusing failure.
+    script = ScriptDirectory.from_config(_alembic_config())
+    if before is not None and not revision_exists(script, before):
+        raise UnknownRevision(unknown_revision_message(before))
+
     planned = get_pending_revisions()
 
     if not planned:
