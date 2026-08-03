@@ -40,10 +40,13 @@ from apps.jitsi import is_online_session, serialize_jitsi_call
 from apps.notifications import serialize_reader_notification
 from apps.game_calendar import (
     GameCalendarError,
+    GAMES_MODE_GLOBAL,
     SUPPORTED_GAME_TYPES,
     game_error_response,
+    get_book_leaderboard_scope,
     get_player_game_payload,
     normalize_game_type,
+    normalize_games_mode,
     parse_optional_play_date,
     split_legacy_words_from_text,
 )
@@ -4906,6 +4909,58 @@ def get_ranked_game_results():
         return jsonify({"error": str(e)}), 500   
 
 
+def leaderboard_sort_key(result):
+    """Best score first, fastest as the tiebreak, then insertion order.
+
+    Time alone used to decide the ranking, which rewarded quitting quickly
+    over playing well. Score leads now; a player with no recorded time still
+    sorts behind equally-scoring players who have one.
+    """
+    return (
+        -(result.score or 0),
+        not bool(result.time_spent_seconds and result.time_spent_seconds > 0),
+        result.time_spent_seconds or 0,
+        result.id,
+    )
+
+
+def get_leaderboard_school_ids(book_id, game_type):
+    """Schools whose readers share one ranking for this book/game.
+
+    A global-mode school plays the master schedule in real time, so its readers
+    face the same words on the same day as every other global-mode school and
+    all of them belong in one list. Everyone else -- own-calendar schools and
+    from-the-start replays alike -- is on their own day sequence and can only
+    be ranked internally.
+    """
+    global_school_ids = set()
+    instances = (
+        SchoolPackInstance.query
+        .join(Pack, SchoolPackInstance.pack_id == Pack.id)
+        .join(Book_pack, Book_pack.pack_id == Pack.id)
+        .filter(
+            SchoolPackInstance.active.is_(True),
+            Pack.is_global_pack.is_(True),
+            Pack.active.is_(True),
+            Book_pack.book_id == book_id,
+        )
+        .order_by(SchoolPackInstance.shcool_id.asc(), SchoolPackInstance.id.asc())
+        .all()
+    )
+    opted_out_school_ids = set()
+    seen = set()
+    for instance in instances:
+        if instance.shcool_id in seen:
+            continue
+        seen.add(instance.shcool_id)
+        if normalize_games_mode(instance.games_mode) != GAMES_MODE_GLOBAL:
+            continue
+        global_school_ids.add(instance.shcool_id)
+        if not instance.global_leaderboard_opt_in:
+            opted_out_school_ids.add(instance.shcool_id)
+    return global_school_ids, opted_out_school_ids
+
+
 @reader.route('/game-leaderboard', methods=['GET'])
 def get_daily_game_leaderboard():
     try:
@@ -4931,7 +4986,8 @@ def get_daily_game_leaderboard():
 
         try:
             game_enum = normalize_game_result_enum(game)
-        except ValueError:
+            game_type = normalize_game_type(game)
+        except (ValueError, GameCalendarError):
             return jsonify({'error': 'Invalid game type'}), 400
 
         current_user_id = request.args.get('user_id') or (current_user.id if current_user.is_authenticated else None)
@@ -4940,6 +4996,25 @@ def get_daily_game_leaderboard():
                 current_user_id = int(current_user_id)
             except (TypeError, ValueError):
                 current_user_id = None
+
+        # Which school the viewer is looking from decides the scope. Without a
+        # school there is nothing to scope to, so the safe answer is the
+        # viewer's own school-less results rather than everyone's.
+        viewer_school_id = None
+        if current_user.is_authenticated:
+            viewer_school_id, school_error, _ = resolve_game_school_id_from_session()
+            if school_error:
+                viewer_school_id = None
+
+        scope = 'school'
+        ranked_school_ids = {viewer_school_id} if viewer_school_id else set()
+        opted_out_school_ids = set()
+        if viewer_school_id:
+            scope, _ = get_book_leaderboard_scope(viewer_school_id, book_id, game_type)
+            if scope == 'global':
+                ranked_school_ids, opted_out_school_ids = get_leaderboard_school_ids(book_id, game_type)
+                ranked_school_ids.add(viewer_school_id)
+
         query = (
             Game_result.query
             .filter(
@@ -4952,37 +5027,96 @@ def get_daily_game_leaderboard():
                     Game_result.time_spent_seconds > 0,
                 )
             )
-            .order_by(Game_result.id.asc())
         )
-        all_results = sorted(
-            query.all(),
-            key=lambda result: (
-                not bool(result.time_spent_seconds and result.time_spent_seconds > 0),
-                result.time_spent_seconds or 0,
-                result.id
+        if ranked_school_ids:
+            query = query.filter(
+                Game_result.user_id.in_(
+                    db.session.query(User_shcool.user_id)
+                    .filter(User_shcool.shcool_id.in_(list(ranked_school_ids)))
+                    .scalar_subquery()
+                )
             )
-        )
+        elif current_user_id:
+            query = query.filter(Game_result.user_id == current_user_id)
+        else:
+            # No school and no signed-in reader means no scope to rank inside.
+            # Returning every result on the platform would expose one school's
+            # children to anyone who guessed a book id.
+            return jsonify({
+                'book_id': book_id,
+                'game': game_enum.value,
+                'day': day.isoformat(),
+                'scope': 'school',
+                'is_global_game': False,
+                'school_id': None,
+                'schools_ranked': 0,
+                'total_players': 0,
+                'hidden_players': 0,
+                'entries': [],
+                'current_user_entry': None
+            }), 200
+
+        all_results = sorted(query.all(), key=leaderboard_sort_key)
+
+        # One lookup for every player's school instead of one per row.
+        result_user_ids = [result.user_id for result in all_results if result.user_id]
+        school_by_user = {}
+        if result_user_ids and scope == 'global' and ranked_school_ids:
+            for user_id, school_id, school_name in (
+                db.session.query(User_shcool.user_id, Shcool.id, Shcool.name)
+                .join(Shcool, Shcool.id == User_shcool.shcool_id)
+                .filter(
+                    User_shcool.user_id.in_(result_user_ids),
+                    User_shcool.shcool_id.in_(list(ranked_school_ids))
+                )
+                .all()
+            ):
+                school_by_user.setdefault(user_id, (school_id, school_name))
+
         entries = []
         current_user_entry = None
+        hidden_players = 0
 
         for index, result in enumerate(all_results, start=1):
             serialized = serialize_game_result(result, rank=index, current_user_id=current_user_id)
-            if index <= limit:
+            school_id, school_name = school_by_user.get(result.user_id, (None, None))
+            if scope == 'global':
+                serialized['school_id'] = school_id
+                serialized['school_name'] = school_name
+
+            is_current_user = bool(current_user_id and result.user_id == current_user_id)
+            # An opted-out school stays out of everyone else's list, but its
+            # own readers still see exactly where they placed globally.
+            hidden = (
+                scope == 'global'
+                and school_id in opted_out_school_ids
+                and not is_current_user
+                and school_id != viewer_school_id
+            )
+            if hidden:
+                hidden_players += 1
+            elif len(entries) < limit:
                 entries.append(serialized)
-            if current_user_id and result.user_id == current_user_id:
+
+            if is_current_user:
                 current_user_entry = serialized
 
         return jsonify({
             'book_id': book_id,
             'game': game_enum.value,
             'day': day.isoformat(),
+            'scope': scope,
+            'is_global_game': scope == 'global',
+            'school_id': viewer_school_id,
+            'schools_ranked': len(ranked_school_ids) if scope == 'global' else (1 if viewer_school_id else 0),
             'total_players': len(all_results),
+            'hidden_players': hidden_players,
             'entries': entries,
             'current_user_entry': current_user_entry
         }), 200
     except Exception as e:
         logging.error('Get game leaderboard failed: %s', e, exc_info=True)
-        return jsonify({'error': str(e)}), 500   
+        return jsonify({'error': str(e)}), 500
 '''
 
 

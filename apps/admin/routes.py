@@ -108,18 +108,27 @@ from apps.main.email import admin_confirm_token, reader_confirm_token
 from apps.jitsi import ensure_jitsi_room, is_online_session, serialize_jitsi_call
 from apps.game_calendar import (
     GameCalendarError,
+    GAMES_MODE_FROM_START,
+    GAMES_MODE_GLOBAL,
     SUPPORTED_GAME_TYPES,
+    SUPPORTED_GAMES_MODES,
     build_calendar_export_payload,
     build_calendar_template_payload,
     delete_calendar_entry,
     game_error_response,
     generate_calendar_entries,
     get_calendar_entries_query,
+    get_global_calendar_bounds,
+    get_global_game_settings,
     get_import_setting_values,
+    get_instance_anchor_date,
     get_or_create_game_setting,
+    get_or_create_global_game_setting,
     get_school_game_settings,
+    get_school_local_date,
     import_calendar_payload,
     normalize_game_type,
+    normalize_games_mode,
     parse_bool_value,
     parse_optional_play_date,
     parse_play_date,
@@ -128,6 +137,8 @@ from apps.game_calendar import (
     serialize_game_setting,
     upsert_calendar_entry,
 )
+from models.global_game_calendar_entry import GlobalGameCalendarEntry
+from models.global_game_setting import GlobalGameSetting
 from apps.account_email import (
     get_parent_for_reader,
     send_removed_from_school_emails,
@@ -1379,8 +1390,34 @@ def serialize_global_teacher(global_teacher):
         'created_at': global_teacher.created_at.isoformat() if global_teacher.created_at else None
     }
 
+def school_pack_games_started(school_id, pack_id):
+    """True once any reader in this school has finished a game on a pack book.
+
+    Switching modes after that point would silently rewrite which words a
+    child already played on a given day, so the choice freezes here.
+    """
+    book_ids = [
+        book_id for (book_id,) in
+        db.session.query(Book_pack.book_id).filter(Book_pack.pack_id == pack_id).all()
+    ]
+    if not book_ids:
+        return False
+    return (
+        db.session.query(Game_result.id)
+        .join(User_shcool, User_shcool.user_id == Game_result.user_id)
+        .filter(
+            User_shcool.shcool_id == school_id,
+            Game_result.book_id.in_(book_ids)
+        )
+        .first()
+        is not None
+    )
+
+
 def serialize_school_pack_instance(instance):
     pack = Pack.query.get(instance.pack_id)
+    games_mode = normalize_games_mode(instance.games_mode)
+    anchor = get_instance_anchor_date(instance)
     return {
         'id': instance.id,
         'school_id': instance.shcool_id,
@@ -1389,6 +1426,14 @@ def serialize_school_pack_instance(instance):
         'active': instance.active,
         'public': instance.public,
         'display_name': instance.display_name,
+        'games_mode': games_mode,
+        'games_anchor_date': anchor.isoformat() if anchor else None,
+        # The lock check is a two-query join and this serializer runs once per
+        # row on pack lists, so it lives on /global-packs/<id>/games-mode
+        # instead -- the only screen that offers the choice.
+        'global_leaderboard_opt_in': bool(instance.global_leaderboard_opt_in),
+        'leaderboard_scope': 'global' if games_mode == GAMES_MODE_GLOBAL else 'school',
+        'supported_games_modes': list(SUPPORTED_GAMES_MODES),
         'created_at': instance.created_at.isoformat() if instance.created_at else None,
         'updated_at': instance.updated_at.isoformat() if instance.updated_at else None,
         'pack': serialize_super_pack(pack, instance.shcool_id) if pack else None
@@ -4652,6 +4697,41 @@ def update_school_global_pack_instance(pack_id):
         if 'display_name' in data:
             display_name = str(data.get('display_name') or '').strip()
             instance.display_name = display_name or None
+
+        if 'games_mode' in data:
+            requested_mode = normalize_games_mode(data.get('games_mode'))
+            if requested_mode != normalize_games_mode(instance.games_mode):
+                if school_pack_games_started(school_id, pack.id):
+                    return jsonify({
+                        'message': (
+                            'Readers have already played games from this pack, so the '
+                            'schedule mode is locked. Changing it now would move which '
+                            'words they played on days already recorded.'
+                        ),
+                        'code': 'GAMES_MODE_LOCKED'
+                    }), 409
+                instance.games_mode = requested_mode
+
+        if 'global_leaderboard_opt_in' in data:
+            instance.global_leaderboard_opt_in = parse_bool_value(
+                data.get('global_leaderboard_opt_in'),
+                'global_leaderboard_opt_in',
+                default=True
+            )
+
+        if 'games_anchor_date' in data:
+            # Only meaningful before day 1: moving it afterwards would shift a
+            # running replay under readers who already have results.
+            if school_pack_games_started(school_id, pack.id):
+                return jsonify({
+                    'message': 'The games start date is locked once readers have started playing.',
+                    'code': 'GAMES_ANCHOR_LOCKED'
+                }), 409
+            instance.games_anchor_date = parse_optional_play_date(
+                data.get('games_anchor_date'),
+                'games_anchor_date'
+            )
+
         db.session.add(instance)
         db.session.commit()
         return jsonify({
@@ -4659,9 +4739,75 @@ def update_school_global_pack_instance(pack_id):
             'instance': serialize_school_pack_instance(instance),
             'pack': serialize_global_pack(pack, school_id=school_id)
         }), 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
     except Exception as error:
         db.session.rollback()
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
+@admin.route('/global-packs/<int:pack_id>/games-mode', methods=['GET'])
+def get_school_global_pack_games_mode(pack_id):
+    """How this school runs the platform's game schedule for a pack's books.
+
+    Its own endpoint rather than extra fields on the pack serializers: the
+    lock check and the schedule bounds are joins, and the pack list pages
+    render dozens of rows that would each pay for them.
+    """
+    try:
+        school_id = get_current_school_id()
+        if not school_id:
+            return jsonify({'message': 'Current admin has no school assigned'}), 403
+        pack = get_global_pack_or_404(pack_id)
+        if not pack:
+            return jsonify({'message': 'Global pack not found'}), 404
+        instance = get_school_global_pack_instance(school_id, pack.id)
+        if not instance:
+            return jsonify({'message': 'Global pack is not added to this school'}), 404
+
+        book_ids = [
+            book_id for (book_id,) in
+            db.session.query(Book_pack.book_id).filter(Book_pack.pack_id == pack.id).all()
+        ]
+        scheduled_books = []
+        for book_id in book_ids:
+            start_date, end_date, total_days = get_global_calendar_bounds(book_id)
+            if not total_days:
+                continue
+            book = Book.query.get(book_id)
+            scheduled_books.append({
+                'book_id': book_id,
+                'title': book.title if book else None,
+                'start_date': start_date.isoformat() if start_date else None,
+                'end_date': end_date.isoformat() if end_date else None,
+                'total_days': total_days,
+            })
+
+        mode = normalize_games_mode(instance.games_mode)
+        anchor = get_instance_anchor_date(instance)
+        return jsonify({
+            'pack_id': pack.id,
+            'instance_id': instance.id,
+            'games_mode': mode,
+            'games_anchor_date': anchor.isoformat() if anchor else None,
+            'games_mode_locked': school_pack_games_started(school_id, pack.id),
+            'global_leaderboard_opt_in': bool(instance.global_leaderboard_opt_in),
+            'leaderboard_scope': 'global' if mode == GAMES_MODE_GLOBAL else 'school',
+            'published': bool(instance.public),
+            'supported_games_modes': list(SUPPORTED_GAMES_MODES),
+            'has_global_schedule': bool(scheduled_books),
+            'scheduled_books': scheduled_books,
+        }), 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Get school global pack games mode failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
+
 
 @admin.route('/global-packs/<int:pack_id>/publish', methods=['POST'])
 def publish_school_global_pack(pack_id):
@@ -4691,6 +4837,13 @@ def publish_school_global_pack(pack_id):
             display_name = str(data.get('display_name') or '').strip()
             instance.display_name = display_name or None
         instance.public = True
+        # Publishing is what "the book goes live here" means, so it fixes day 1
+        # of a from-the-start replay. Stamped once and never moved -- a later
+        # unpublish/republish must not restart the schedule under readers who
+        # are already partway through it.
+        if instance.games_anchor_date is None:
+            school = Shcool.query.get(school_id)
+            instance.games_anchor_date = get_school_local_date(school)
         db.session.add(instance)
         db.session.commit()
         return jsonify({
@@ -7319,6 +7472,564 @@ def import_admin_book_game_calendar_json(book_id, game_type):
         db.session.rollback()
         logging.error('Import game calendar failed: %s', error, exc_info=True)
         return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+# --- Platform-level (super admin) game calendar -------------------------
+#
+# Same authoring tools as the school calendar above, but the rows land in
+# `global_game_calendar_entry`, which every school that adopted the book's
+# global pack reads through. The service helpers take `school_id=None` to mean
+# "platform scope", so both scopes share one code path.
+#
+# Deliberately silent on notifications: `notify_daily_game_created` announces
+# "today's game is ready" to one school's readers, but a master schedule is
+# authored months ahead and read by every school on its own offset, so firing
+# it here would notify the wrong people about the wrong day. Readers still get
+# the notification from their own school's daily flow.
+
+def global_schedulable_book_query():
+    """Books a super admin may schedule games for.
+
+    A book qualifies once it can actually reach schools platform-wide: either
+    it sits in an active global pack, or it is a platform book schools install
+    directly. Anything else is one school's private book and belongs to that
+    school's own calendar.
+    """
+    return (
+        db.session.query(Book)
+        .outerjoin(Book_pack, Book_pack.book_id == Book.id)
+        .outerjoin(
+            Pack,
+            and_(
+                Pack.id == Book_pack.pack_id,
+                Pack.is_global_pack.is_(True),
+                Pack.active.is_(True)
+            )
+        )
+        .filter(
+            Book.active.is_(True),
+            or_(Book.is_platform_book.is_(True), Pack.id.isnot(None))
+        )
+        .distinct()
+    )
+
+
+def get_global_game_context(book_id=None):
+    if not is_super_admin():
+        return None, jsonify({
+            'message': 'Super admin access required',
+            'code': 'SUPER_ADMIN_ACCESS_REQUIRED'
+        }), 403
+    if book_id is None:
+        return None, None, None
+
+    book = global_schedulable_book_query().filter(Book.id == book_id).first()
+    if not book:
+        return None, jsonify({
+            'message': 'Book is not available for platform-wide scheduling',
+            'code': 'GLOBAL_BOOK_NOT_FOUND'
+        }), 404
+    return book, None, None
+
+
+def serialize_global_schedulable_book(book):
+    global_pack_titles = [
+        title for (title,) in (
+            db.session.query(Pack.title)
+            .join(Book_pack, Book_pack.pack_id == Pack.id)
+            .filter(
+                Book_pack.book_id == book.id,
+                Pack.is_global_pack.is_(True),
+                Pack.active.is_(True)
+            )
+            .all()
+        )
+    ]
+    start_date, end_date, total_days = get_global_calendar_bounds(book.id)
+    scheduled_games = [
+        game_type for (game_type,) in (
+            db.session.query(GlobalGameCalendarEntry.game_type)
+            .filter(GlobalGameCalendarEntry.book_id == book.id)
+            .distinct()
+            .all()
+        )
+    ]
+    return {
+        'id': book.id,
+        'title': book.title,
+        'author': book.author,
+        'img': book.img,
+        'is_platform_book': bool(getattr(book, 'is_platform_book', False)),
+        'global_packs': global_pack_titles,
+        'has_text': Book_text.query.filter_by(book_id=book.id).first() is not None,
+        'schedule': {
+            'start_date': start_date.isoformat() if start_date else None,
+            'end_date': end_date.isoformat() if end_date else None,
+            'total_days': total_days,
+            'scheduled_games': sorted(scheduled_games),
+        }
+    }
+
+
+@admin.route('/global-game-settings', methods=['GET'])
+@login_required
+def get_global_game_settings_route():
+    try:
+        _, error_response, error_status = get_global_game_context()
+        if error_response:
+            return error_response, error_status
+
+        settings = get_global_game_settings()
+        return jsonify({
+            'scope': 'global',
+            'settings': [
+                serialize_game_setting(settings.get(game_type), game_type=game_type)
+                for game_type in SUPPORTED_GAME_TYPES
+            ]
+        }), 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Get global game settings failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-game-settings/<game_type>', methods=['PUT', 'POST'])
+@login_required
+def upsert_global_game_setting_route(game_type):
+    try:
+        _, error_response, error_status = get_global_game_context()
+        if error_response:
+            return error_response, error_status
+
+        data = request.get_json(silent=True) or {}
+        setting, created = get_or_create_global_game_setting(
+            game_type,
+            data.get('timer_seconds'),
+            data.get('max_hints'),
+            data.get('timer_enabled')
+        )
+        db.session.commit()
+        return jsonify({
+            'message': 'Platform game setting created' if created else 'Platform game setting updated',
+            'setting': serialize_game_setting(setting)
+        }), 201 if created else 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Upsert global game setting failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books', methods=['GET'])
+@login_required
+def get_global_schedulable_books():
+    try:
+        _, error_response, error_status = get_global_game_context()
+        if error_response:
+            return error_response, error_status
+
+        query = global_schedulable_book_query()
+        search = request.args.get('search') or request.args.get('title')
+        if search:
+            query = query.filter(Book.title.ilike(f'%{search}%'))
+        query = query.order_by(Book.id.desc())
+        return jsonify(
+            paginate_super_admin_query(query, serialize_global_schedulable_book, 'books')
+        ), 200
+    except ValueError as error:
+        return jsonify({'message': str(error), 'code': 'INVALID_PAGINATION'}), 400
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Get global schedulable books failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/<game_type>/calendar', methods=['GET'])
+@login_required
+def get_global_book_game_calendar(book_id, game_type):
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        game_type = normalize_game_type(game_type)
+        start_date = parse_optional_play_date(request.args.get('start_date'), 'start_date')
+        end_date = parse_optional_play_date(request.args.get('end_date'), 'end_date')
+        if start_date and end_date and end_date < start_date:
+            raise GameCalendarError('end_date must be after or equal to start_date', 'INVALID_DATE_RANGE', 400)
+
+        query = get_calendar_entries_query(None, book.id, game_type, start_date, end_date)
+        page, per_page = get_super_admin_pagination_params()
+        total = query.order_by(None).count()
+        entries = query.offset((page - 1) * per_page).limit(per_page).all()
+        total_pages = (total + per_page - 1) // per_page if total else 0
+        schedule_start, schedule_end, schedule_total = get_global_calendar_bounds(book.id, game_type)
+        book_start, _, _ = get_global_calendar_bounds(book.id)
+
+        return jsonify({
+            'scope': 'global',
+            'book_id': book.id,
+            'game_type': game_type,
+            'entries': [serialize_calendar_entry(entry) for entry in entries],
+            'schedule': {
+                'start_date': schedule_start.isoformat() if schedule_start else None,
+                'end_date': schedule_end.isoformat() if schedule_end else None,
+                'total_days': schedule_total,
+                # Day 1 for schools replaying from the start is the book's
+                # earliest day across all four games, not this game's.
+                'book_start_date': book_start.isoformat() if book_start else None,
+            },
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': total,
+                'pages': total_pages,
+                'has_next': page < total_pages,
+                'has_prev': page > 1,
+                'max_per_page': MAX_SUPER_ADMIN_PER_PAGE
+            }
+        }), 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'message': str(error), 'code': 'INVALID_PAGINATION'}), 400
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Get global game calendar failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/<play_date>', methods=['PUT'])
+@login_required
+def upsert_global_book_game_calendar_day(book_id, game_type, play_date):
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        data = request.get_json(silent=True) or {}
+        entry, created = upsert_calendar_entry(
+            None,
+            book.id,
+            normalize_game_type(game_type),
+            play_date,
+            data.get('words')
+        )
+        db.session.commit()
+        return jsonify({
+            'message': 'Calendar entry created' if created else 'Calendar entry updated',
+            'entry': serialize_calendar_entry(entry)
+        }), 201 if created else 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Upsert global calendar entry failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/<play_date>', methods=['DELETE'])
+@login_required
+def delete_global_book_game_calendar_day(book_id, game_type, play_date):
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        deleted = delete_calendar_entry(None, book.id, game_type, play_date)
+        if not deleted:
+            return jsonify({
+                'message': 'Calendar entry not found',
+                'code': 'GAME_CALENDAR_ENTRY_NOT_FOUND'
+            }), 404
+        db.session.commit()
+        return jsonify({'message': 'Calendar entry deleted'}), 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Delete global calendar entry failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/generate', methods=['POST'])
+@login_required
+def generate_global_book_game_calendar(book_id, game_type):
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        data = request.get_json(silent=True) or {}
+        start_date = data.get('start_date') or request.args.get('start_date')
+        if start_date is None:
+            raise GameCalendarError('start_date is required', 'START_DATE_REQUIRED', 400)
+        overwrite = parse_bool_value(
+            data.get('overwrite', request.args.get('overwrite', False)),
+            'overwrite',
+            default=False
+        )
+
+        result = generate_calendar_entries(
+            None,
+            book.id,
+            normalize_game_type(game_type),
+            start_date,
+            overwrite=overwrite
+        )
+        db.session.commit()
+        return jsonify({
+            'message': 'Global game calendar generated',
+            'result': result
+        }), 201 if result['created'] else 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Generate global game calendar failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/template', methods=['GET'])
+@login_required
+def download_global_book_game_calendar_template(book_id, game_type):
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        game_type = normalize_game_type(game_type)
+        settings = get_global_game_settings()
+        payload = build_calendar_template_payload(
+            None,
+            book.id,
+            game_type,
+            setting=settings.get(game_type),
+            start_date=request.args.get('start_date')
+        )
+        return json_download_response(payload, f'global-{game_type}-calendar-book-{book.id}-template.json')
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Download global calendar template failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/export', methods=['GET'])
+@login_required
+def export_global_book_game_calendar_json(book_id, game_type):
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        game_type = normalize_game_type(game_type)
+        start_date = parse_optional_play_date(request.args.get('start_date'), 'start_date')
+        end_date = parse_optional_play_date(request.args.get('end_date'), 'end_date')
+        if start_date and end_date and end_date < start_date:
+            raise GameCalendarError('end_date must be after or equal to start_date', 'INVALID_DATE_RANGE', 400)
+
+        entries = get_calendar_entries_query(None, book.id, game_type, start_date, end_date).all()
+        settings = get_global_game_settings()
+        payload = build_calendar_export_payload(
+            None,
+            book.id,
+            game_type,
+            entries,
+            setting=settings.get(game_type)
+        )
+        return json_download_response(payload, f'global-{game_type}-calendar-book-{book.id}.json')
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Export global game calendar failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/import', methods=['POST'])
+@login_required
+def import_global_book_game_calendar_json(book_id, game_type):
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        game_type = normalize_game_type(game_type)
+        payload = get_game_calendar_import_json()
+        overwrite = get_import_request_bool('overwrite', default=False)
+        dry_run = get_import_request_bool('dry_run', default=True)
+        apply_settings = get_import_request_bool('apply_settings', default=False)
+
+        if dry_run:
+            preview = preview_calendar_import_payload(
+                None,
+                book.id,
+                game_type,
+                payload,
+                overwrite=overwrite,
+                validate_settings=apply_settings
+            )
+            return jsonify({
+                'message': 'Global game calendar import preview generated',
+                'preview': public_game_calendar_import_result(preview)
+            }), 200
+
+        result = import_calendar_payload(
+            None,
+            book.id,
+            game_type,
+            payload,
+            overwrite=overwrite,
+            validate_settings=apply_settings
+        )
+        setting_payload = None
+        if apply_settings:
+            setting_values = get_import_setting_values(game_type, payload)
+            if setting_values:
+                setting, _ = get_or_create_global_game_setting(
+                    game_type,
+                    setting_values.get('timer_seconds'),
+                    setting_values.get('max_hints'),
+                    setting_values.get('timer_enabled')
+                )
+                setting_payload = serialize_game_setting(setting)
+
+        db.session.commit()
+        response_payload = {
+            'message': 'Global game calendar imported',
+            'result': public_game_calendar_import_result(result)
+        }
+        if setting_payload:
+            response_payload['setting'] = setting_payload
+        return jsonify(response_payload), 201 if result.get('created') else 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Import global game calendar failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
+
+@admin.route('/global-books/<int:book_id>/games/adoption', methods=['GET'])
+@login_required
+def get_global_book_game_adoption(book_id):
+    """Which schools are playing this book's schedule, and on which day.
+
+    The super admin needs this to answer the only two questions that matter
+    once a schedule is live: who is actually running a global competition, and
+    where everyone else has drifted to on their own replay.
+    """
+    try:
+        book, error_response, error_status = get_global_game_context(book_id)
+        if error_response:
+            return error_response, error_status
+
+        master_start, master_end, master_days = get_global_calendar_bounds(book.id)
+        instances = (
+            SchoolPackInstance.query
+            .join(Pack, SchoolPackInstance.pack_id == Pack.id)
+            .join(Book_pack, Book_pack.pack_id == Pack.id)
+            .filter(
+                SchoolPackInstance.active.is_(True),
+                Pack.is_global_pack.is_(True),
+                Pack.active.is_(True),
+                Book_pack.book_id == book.id,
+            )
+            .order_by(SchoolPackInstance.shcool_id.asc(), SchoolPackInstance.id.asc())
+            .all()
+        )
+
+        seen_school_ids = set()
+        schools = []
+        for instance in instances:
+            # One school reads the schedule through its earliest instance, so
+            # later duplicates would misreport the mode actually in force.
+            if instance.shcool_id in seen_school_ids:
+                continue
+            seen_school_ids.add(instance.shcool_id)
+
+            school = Shcool.query.get(instance.shcool_id)
+            mode = normalize_games_mode(instance.games_mode)
+            local_date = get_school_local_date(school)
+            anchor = get_instance_anchor_date(instance)
+            if mode == GAMES_MODE_GLOBAL:
+                current_master_date = local_date
+            elif master_start:
+                current_master_date = local_date + timedelta(days=(master_start - anchor).days)
+            else:
+                current_master_date = None
+
+            in_range = bool(
+                current_master_date
+                and master_start
+                and master_end
+                and master_start <= current_master_date <= master_end
+            )
+            schools.append({
+                'school_id': instance.shcool_id,
+                'school_name': school.name if school else None,
+                'pack_id': instance.pack_id,
+                'instance_id': instance.id,
+                'games_mode': mode,
+                'published': bool(instance.public),
+                'anchor_date': anchor.isoformat() if anchor else None,
+                'global_leaderboard_opt_in': bool(instance.global_leaderboard_opt_in),
+                'local_date': local_date.isoformat(),
+                'current_master_date': current_master_date.isoformat() if current_master_date else None,
+                'current_day_number': (
+                    (current_master_date - master_start).days + 1
+                    if in_range else None
+                ),
+                'in_schedule_range': in_range,
+            })
+
+        return jsonify({
+            'book_id': book.id,
+            'book_title': book.title,
+            'schedule': {
+                'start_date': master_start.isoformat() if master_start else None,
+                'end_date': master_end.isoformat() if master_end else None,
+                'total_days': master_days,
+            },
+            'totals': {
+                'schools': len(schools),
+                'global_mode': len([s for s in schools if s['games_mode'] == GAMES_MODE_GLOBAL]),
+                'from_start_mode': len([s for s in schools if s['games_mode'] == GAMES_MODE_FROM_START]),
+            },
+            'schools': schools,
+        }), 200
+    except GameCalendarError as error:
+        db.session.rollback()
+        payload, status = game_error_response(error)
+        return jsonify(payload), status
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Get global book game adoption failed: %s', error, exc_info=True)
+        return jsonify({'message': 'Internal server error', 'code': 'INTERNAL_SERVER_ERROR'}), 500
+
 
 @admin.route('/books/<int:book_id>/stories', methods=['GET'])
 def get_admin_book_stories(book_id):

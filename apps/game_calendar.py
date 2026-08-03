@@ -2,11 +2,22 @@ import re
 from datetime import date, datetime, timedelta
 
 import pytz
+from sqlalchemy import func
 
 from extensions import db
+from models.book_pack import Book_pack
 from models.book_text import Book_text
 from models.game_calendar_entry import GameCalendarEntry
+from models.global_game_calendar_entry import GlobalGameCalendarEntry
+from models.global_game_setting import GlobalGameSetting
+from models.pack import Pack
+# Pack declares `codes = relationship('Code')` by name, and models/code.py
+# imports Pack back, so Pack cannot import it itself. Anything that pulls Pack
+# into the mapper registry has to pull Code in too, or configuring the mappers
+# fails with "expression 'Code' failed to locate a name".
+from models.code import Code  # noqa: F401
 from models.school_game_setting import SchoolGameSetting
+from models.school_pack_instance import SchoolPackInstance
 
 
 GAME_BEE_GENIUS = 'bee-genius'
@@ -47,6 +58,19 @@ GAME_RULES = {
 
 DEFAULT_GAME_TIMEZONE = 'Africa/Tunis'
 WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
+
+# How a school reads the platform-level master schedule for a global pack.
+GAMES_MODE_FROM_START = 'from_start'
+GAMES_MODE_GLOBAL = 'global'
+SUPPORTED_GAMES_MODES = (GAMES_MODE_FROM_START, GAMES_MODE_GLOBAL)
+
+# The calendar helpers below serve both the per-school schedule and the
+# platform-level master schedule. `school_id is None` selects the master one:
+# there is exactly one row per book/game/day for the whole platform, so there
+# is no school to key it by. Every school-facing caller reaches these through
+# `get_school_game_context`, which 403s before the school id can be None.
+def is_global_scope(school_id):
+    return school_id is None
 
 
 class GameCalendarError(ValueError):
@@ -248,15 +272,42 @@ def get_school_game_settings(school_id):
     return {setting.game_type: setting for setting in settings}
 
 
+def get_or_create_global_game_setting(game_type, timer_seconds=None, max_hints=None, timer_enabled=True):
+    game_type = normalize_game_type(game_type)
+    timer_seconds, max_hints, timer_enabled = validate_setting_values(
+        game_type,
+        timer_seconds,
+        max_hints,
+        timer_enabled
+    )
+    setting = GlobalGameSetting.query.filter_by(game_type=game_type).first()
+    created = False
+    if not setting:
+        setting = GlobalGameSetting(game_type=game_type)
+        db.session.add(setting)
+        created = True
+
+    setting.timer_seconds = timer_seconds
+    setting.timer_enabled = timer_enabled
+    setting.max_hints = max_hints
+    setting.updated_at = datetime.now()
+    return setting, created
+
+
+def get_global_game_settings():
+    return {setting.game_type: setting for setting in GlobalGameSetting.query.all()}
+
+
 def serialize_game_setting(setting=None, game_type=None, school_id=None):
     if setting:
         game_type = setting.game_type
-        school_id = setting.shcool_id
+        school_id = getattr(setting, 'shcool_id', None)
     game_type = normalize_game_type(game_type)
     rule = GAME_RULES[game_type]
 
     data = {
         'game_type': game_type,
+        'scope': 'school' if school_id is not None else 'global',
         'school_id': school_id,
         'shcool_id': school_id,
         'configured': setting is not None,
@@ -275,10 +326,14 @@ def serialize_game_setting(setting=None, game_type=None, school_id=None):
 
 
 def serialize_calendar_entry(entry):
+    # Master-schedule rows have no owning school; the keys stay in the payload
+    # as nulls so the dashboard can render both scopes with one component.
+    school_id = getattr(entry, 'shcool_id', None)
     return {
         'id': entry.id,
-        'school_id': entry.shcool_id,
-        'shcool_id': entry.shcool_id,
+        'scope': 'school' if school_id is not None else 'global',
+        'school_id': school_id,
+        'shcool_id': school_id,
         'book_id': entry.book_id,
         'game_type': entry.game_type,
         'play_date': entry.play_date.isoformat() if entry.play_date else None,
@@ -335,6 +390,7 @@ def build_calendar_template_payload(school_id, book_id, game_type, setting=None,
     return {
         'version': 1,
         'description': 'Edit the days array, then import this JSON from the game calendar dashboard.',
+        'scope': 'school' if school_id is not None else 'global',
         'school_id': school_id,
         'shcool_id': school_id,
         'book_id': book_id,
@@ -366,6 +422,7 @@ def build_calendar_export_payload(school_id, book_id, game_type, entries, settin
 
     return {
         'version': 1,
+        'scope': 'school' if school_id is not None else 'global',
         'school_id': school_id,
         'shcool_id': school_id,
         'book_id': book_id,
@@ -434,15 +491,12 @@ def get_import_setting_values(game_type, payload):
 def get_existing_calendar_dates(school_id, book_id, game_type, play_dates):
     if not play_dates:
         return set()
+    model = calendar_model_for_scope(school_id)
     rows = (
-        GameCalendarEntry.query
-        .with_entities(GameCalendarEntry.play_date)
-        .filter(
-            GameCalendarEntry.shcool_id == school_id,
-            GameCalendarEntry.book_id == book_id,
-            GameCalendarEntry.game_type == normalize_game_type(game_type),
-            GameCalendarEntry.play_date.in_(list(play_dates)),
-        )
+        model.query
+        .with_entities(model.play_date)
+        .filter_by(**calendar_filters_for_scope(school_id, book_id, game_type))
+        .filter(model.play_date.in_(list(play_dates)))
         .all()
     )
     return {row[0] for row in rows}
@@ -612,39 +666,37 @@ def import_calendar_payload(school_id, book_id, game_type, payload, overwrite=Fa
     return result
 
 
+def calendar_model_for_scope(school_id):
+    return GlobalGameCalendarEntry if is_global_scope(school_id) else GameCalendarEntry
+
+
+def calendar_filters_for_scope(school_id, book_id, game_type):
+    filters = {'book_id': book_id, 'game_type': normalize_game_type(game_type)}
+    if not is_global_scope(school_id):
+        filters['shcool_id'] = school_id
+    return filters
+
+
 def get_calendar_entries_query(school_id, book_id, game_type, start_date=None, end_date=None):
-    game_type = normalize_game_type(game_type)
-    query = GameCalendarEntry.query.filter_by(
-        shcool_id=school_id,
-        book_id=book_id,
-        game_type=game_type
-    )
+    model = calendar_model_for_scope(school_id)
+    query = model.query.filter_by(**calendar_filters_for_scope(school_id, book_id, game_type))
     if start_date:
-        query = query.filter(GameCalendarEntry.play_date >= start_date)
+        query = query.filter(model.play_date >= start_date)
     if end_date:
-        query = query.filter(GameCalendarEntry.play_date <= end_date)
-    return query.order_by(GameCalendarEntry.play_date.asc())
+        query = query.filter(model.play_date <= end_date)
+    return query.order_by(model.play_date.asc())
 
 
 def upsert_calendar_entry(school_id, book_id, game_type, play_date, words):
     game_type = normalize_game_type(game_type)
     play_date = parse_play_date(play_date, 'play_date')
     words = validate_words_for_game(game_type, words)
-    entry = GameCalendarEntry.query.filter_by(
-        shcool_id=school_id,
-        book_id=book_id,
-        game_type=game_type,
-        play_date=play_date
-    ).first()
+    model = calendar_model_for_scope(school_id)
+    filters = calendar_filters_for_scope(school_id, book_id, game_type)
+    entry = model.query.filter_by(play_date=play_date, **filters).first()
     created = False
     if not entry:
-        entry = GameCalendarEntry(
-            shcool_id=school_id,
-            book_id=book_id,
-            game_type=game_type,
-            play_date=play_date,
-            words=words
-        )
+        entry = model(play_date=play_date, words=words, **filters)
         db.session.add(entry)
         created = True
     else:
@@ -654,14 +706,10 @@ def upsert_calendar_entry(school_id, book_id, game_type, play_date, words):
 
 
 def delete_calendar_entry(school_id, book_id, game_type, play_date):
-    game_type = normalize_game_type(game_type)
     play_date = parse_play_date(play_date, 'play_date')
-    entry = GameCalendarEntry.query.filter_by(
-        shcool_id=school_id,
-        book_id=book_id,
-        game_type=game_type,
-        play_date=play_date
-    ).first()
+    model = calendar_model_for_scope(school_id)
+    filters = calendar_filters_for_scope(school_id, book_id, game_type)
+    entry = model.query.filter_by(play_date=play_date, **filters).first()
     if not entry:
         return False
     db.session.delete(entry)
@@ -688,18 +736,16 @@ def generate_calendar_entries(school_id, book_id, game_type, start_date, overwri
     groups = group_words(words, words_per_day)
     used_words = len(groups) * words_per_day
 
+    model = calendar_model_for_scope(school_id)
+    filters = calendar_filters_for_scope(school_id, book_id, game_type)
+
     created = 0
     skipped = 0
     updated = 0
 
     for index, word_group in enumerate(groups):
         play_date = start_date + timedelta(days=index)
-        entry = GameCalendarEntry.query.filter_by(
-            shcool_id=school_id,
-            book_id=book_id,
-            game_type=game_type,
-            play_date=play_date
-        ).first()
+        entry = model.query.filter_by(play_date=play_date, **filters).first()
 
         if entry:
             if overwrite:
@@ -710,13 +756,7 @@ def generate_calendar_entries(school_id, book_id, game_type, start_date, overwri
                 skipped += 1
             continue
 
-        db.session.add(GameCalendarEntry(
-            shcool_id=school_id,
-            book_id=book_id,
-            game_type=game_type,
-            play_date=play_date,
-            words=list(word_group)
-        ))
+        db.session.add(model(play_date=play_date, words=list(word_group), **filters))
         created += 1
 
     return {
@@ -735,12 +775,216 @@ def generate_calendar_entries(school_id, book_id, game_type, start_date, overwri
     }
 
 
+def normalize_games_mode(value, default=GAMES_MODE_FROM_START):
+    if value in (None, ''):
+        return default
+    normalized = str(value).strip().lower().replace('-', '_')
+    if normalized not in SUPPORTED_GAMES_MODES:
+        raise GameCalendarError(
+            'games_mode must be one of: %s' % ', '.join(SUPPORTED_GAMES_MODES),
+            'INVALID_GAMES_MODE',
+            400
+        )
+    return normalized
+
+
+def get_school_global_pack_instance_for_book(school_id, book_id):
+    """The school's live subscription to a global pack that contains this book.
+
+    A book can sit in several global packs; the earliest instance the school
+    joined wins so the mapping stays stable when a school later adopts another
+    pack carrying the same book.
+    """
+    if not school_id or not book_id:
+        return None
+    return (
+        SchoolPackInstance.query
+        .join(Pack, SchoolPackInstance.pack_id == Pack.id)
+        .join(Book_pack, Book_pack.pack_id == Pack.id)
+        .filter(
+            SchoolPackInstance.shcool_id == school_id,
+            SchoolPackInstance.active.is_(True),
+            Pack.is_global_pack.is_(True),
+            Pack.active.is_(True),
+            Book_pack.book_id == book_id,
+        )
+        .order_by(SchoolPackInstance.id.asc())
+        .first()
+    )
+
+
+def get_global_calendar_start_date(book_id):
+    """Day 1 of a book's master schedule, across every game type.
+
+    Anchoring on the book rather than one game keeps the games in the same
+    relative rhythm the super admin authored -- if Intellect Link starts three
+    days after Bee Genius on the master calendar, it still does for a school
+    replaying from the start.
+    """
+    return (
+        db.session.query(func.min(GlobalGameCalendarEntry.play_date))
+        .filter(GlobalGameCalendarEntry.book_id == book_id)
+        .scalar()
+    )
+
+
+def get_global_calendar_bounds(book_id, game_type=None):
+    query = db.session.query(
+        func.min(GlobalGameCalendarEntry.play_date),
+        func.max(GlobalGameCalendarEntry.play_date),
+        func.count(GlobalGameCalendarEntry.id),
+    ).filter(GlobalGameCalendarEntry.book_id == book_id)
+    if game_type:
+        query = query.filter(GlobalGameCalendarEntry.game_type == normalize_game_type(game_type))
+    start_date, end_date, total = query.one()
+    return start_date, end_date, total or 0
+
+
+def get_instance_anchor_date(instance):
+    if getattr(instance, 'games_anchor_date', None):
+        return instance.games_anchor_date
+    created_at = getattr(instance, 'created_at', None)
+    return created_at.date() if created_at else date.today()
+
+
+def global_schedule_exists(book_id, game_type):
+    return (
+        GlobalGameCalendarEntry.query
+        .filter_by(book_id=book_id, game_type=normalize_game_type(game_type))
+        .first()
+        is not None
+    )
+
+
+def resolve_global_play_date(instance, master_start, local_date):
+    """Map a school's own calendar day onto the master schedule's day.
+
+    In `global` mode the two are the same date, which is precisely why every
+    school sees the same words on the same day and can be ranked together. In
+    `from_start` mode the school's anchor day is pulled back onto master day 1
+    and every later day follows the same fixed shift.
+
+    Takes `master_start` rather than looking it up so the mapping stays a
+    pure function of (mode, anchor, day).
+    """
+    mode = normalize_games_mode(getattr(instance, 'games_mode', None))
+    if mode == GAMES_MODE_GLOBAL:
+        return local_date, mode, 0
+
+    if master_start is None:
+        return None, mode, 0
+
+    anchor = get_instance_anchor_date(instance)
+    if local_date < anchor:
+        raise GameCalendarError(
+            'This book\'s games have not started yet for your school',
+            'GAME_SCHEDULE_NOT_STARTED',
+            404
+        )
+    shift_days = (master_start - anchor).days
+    return local_date + timedelta(days=shift_days), mode, shift_days
+
+
+def resolve_global_game_setting(school_id, game_type, mode):
+    """Which timer/hint rules a global book plays under.
+
+    `global` mode is a cross-school competition, so the platform's rules apply
+    and the school's own setting is ignored -- otherwise a school could hand
+    its readers a longer clock than everyone they are ranked against.
+    """
+    game_type = normalize_game_type(game_type)
+    global_setting = GlobalGameSetting.query.filter_by(game_type=game_type).first()
+    if mode == GAMES_MODE_GLOBAL:
+        if not global_setting:
+            raise GameCalendarError(
+                'Platform game settings are missing for this game',
+                'MISSING_GLOBAL_GAME_SETTINGS',
+                409
+            )
+        return global_setting, True
+
+    school_setting = SchoolGameSetting.query.filter_by(shcool_id=school_id, game_type=game_type).first()
+    setting = school_setting or global_setting
+    if not setting:
+        raise GameCalendarError('Game settings are missing for this school', 'MISSING_GAME_SETTINGS', 409)
+    return setting, school_setting is None
+
+
+def get_global_player_game_payload(school_id, book_id, game_type, play_date, instance):
+    game_type = normalize_game_type(game_type)
+    master_date, mode, shift_days = resolve_global_play_date(
+        instance,
+        get_global_calendar_start_date(book_id),
+        play_date
+    )
+    if master_date is None:
+        return None
+
+    entry = GlobalGameCalendarEntry.query.filter_by(
+        book_id=book_id,
+        game_type=game_type,
+        play_date=master_date
+    ).first()
+    if not entry:
+        raise GameCalendarError(
+            'Game calendar entry not found for this date',
+            'GAME_CALENDAR_ENTRY_NOT_FOUND',
+            404
+        )
+
+    setting, from_platform = resolve_global_game_setting(school_id, game_type, mode)
+    words = validate_words_for_game(game_type, entry.words or [], status_code=409)
+    payload = {
+        'book_id': book_id,
+        'school_id': school_id,
+        'shcool_id': school_id,
+        'game_type': game_type,
+        # `date` stays the reader's own calendar day so results, streaks and
+        # the daily-run screens keep keying off the day the child played.
+        'date': play_date.isoformat(),
+        'master_date': master_date.isoformat(),
+        'words': words,
+        'timer_seconds': setting.timer_seconds,
+        'timer_enabled': setting.timer_enabled,
+        'scope': 'global',
+        'games_mode': mode,
+        'is_global_game': mode == GAMES_MODE_GLOBAL,
+        'leaderboard_scope': 'global' if mode == GAMES_MODE_GLOBAL else 'school',
+        'settings_source': 'platform' if from_platform else 'school',
+        'schedule_shift_days': shift_days,
+    }
+    if game_type == GAME_INTELLECT_LINK:
+        if setting.max_hints is None:
+            raise GameCalendarError('max_hints is missing for intellect-link', 'MAX_HINTS_REQUIRED', 409)
+        payload['max_hints'] = setting.max_hints
+    return payload
+
+
+def get_book_game_scope(school_id, book_id, game_type):
+    """Whether this school reads the master schedule for this book/game.
+
+    Returns the pack instance driving it, or None when the school falls back
+    to the calendar it authored itself. A global pack whose book has no master
+    days for this particular game still falls back, so a super admin can ship
+    only some of the four games without dark-holing the rest.
+    """
+    if not global_schedule_exists(book_id, game_type):
+        return None
+    return get_school_global_pack_instance_for_book(school_id, book_id)
+
+
 def get_player_game_payload(school_id, book_id, game_type, play_date=None, school=None):
     game_type = normalize_game_type(game_type)
     if play_date is None:
         play_date = get_school_local_date(school)
     else:
         play_date = parse_play_date(play_date)
+
+    instance = get_book_game_scope(school_id, book_id, game_type)
+    if instance is not None:
+        payload = get_global_player_game_payload(school_id, book_id, game_type, play_date, instance)
+        if payload is not None:
+            return payload
 
     setting = SchoolGameSetting.query.filter_by(shcool_id=school_id, game_type=game_type).first()
     if not setting:
@@ -765,9 +1009,27 @@ def get_player_game_payload(school_id, book_id, game_type, play_date=None, schoo
         'words': words,
         'timer_seconds': setting.timer_seconds,
         'timer_enabled': setting.timer_enabled,
+        'scope': 'school',
+        'games_mode': None,
+        'is_global_game': False,
+        'leaderboard_scope': 'school',
+        'settings_source': 'school',
     }
     if game_type == GAME_INTELLECT_LINK:
         if setting.max_hints is None:
             raise GameCalendarError('max_hints is missing for intellect-link', 'MAX_HINTS_REQUIRED', 409)
         payload['max_hints'] = setting.max_hints
     return payload
+
+
+def get_book_leaderboard_scope(school_id, book_id, game_type):
+    """Where a finished round should be ranked: inside the school, or platform-wide.
+
+    Kept separate from `get_player_game_payload` so the leaderboard endpoint
+    can answer for any past day without re-validating word counts or settings.
+    """
+    instance = get_book_game_scope(school_id, book_id, game_type)
+    if instance is None:
+        return 'school', None
+    mode = normalize_games_mode(getattr(instance, 'games_mode', None))
+    return ('global' if mode == GAMES_MODE_GLOBAL else 'school'), instance
