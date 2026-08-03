@@ -10,7 +10,7 @@ from flask_login import logout_user,login_required,current_user
 from extensions import login_manager,mail,db
 from flask_bcrypt import Bcrypt
 from werkzeug.utils import secure_filename
-from models.user import User,Reader,Teacher,Admin,Assistant,SuperAdmin
+from models.user import User,Reader,Teacher,Admin,Assistant,SuperAdmin,ContentManager
 from models.book_pack import Book_pack
 from models.book_story import BookStory
 from models.audio_book import AudioBook
@@ -197,6 +197,8 @@ from googletrans import Translator
 translator = Translator()
 ADMIN_ROLES = {'admin', 'super_admin'}
 GAME_MANAGER_ROLES = ADMIN_ROLES | {'teacher'}
+# Roles that exist above the tenant line and so hold no school membership.
+PLATFORM_WIDE_ROLES = {'super_admin', 'content_manager'}
 DEFAULT_SUPER_ADMIN_PER_PAGE = 20
 MAX_SUPER_ADMIN_PER_PAGE = 100
 
@@ -223,6 +225,59 @@ def is_super_admin():
         current_user.confirmed and
         current_user.approved
     )
+
+def is_content_manager():
+    return (
+        current_user.is_authenticated and
+        current_user.type == 'content_manager' and
+        current_user.confirmed and
+        current_user.approved
+    )
+
+## @brief Whether the caller may create and edit platform catalogue content.
+#
+# True for super admins and for the platform-wide ContentManager role. This is
+# deliberately a *separate* predicate from is_super_admin() rather than a wider
+# role set swapped into it: only the routes explicitly switched over to this
+# check are opened up, so every route left on is_super_admin() -- tenants,
+# users, revenue, storage, migrations, audit log -- stays closed by default.
+#
+# Content managers get create/edit, not top-level catalogue deletion; deleting
+# a platform book or global pack cascades into every school that uses it, so
+# those routes stay on is_super_admin(). Sub-entity edits (pack composition,
+# units, sessions, calendar days) are reversible and count as editing.
+def can_manage_content():
+    return is_super_admin() or is_content_manager()
+
+## @brief Whether the caller reads platform data unscoped by school membership.
+#
+# Content managers belong to no school, so the school/book scoping helpers must
+# treat them like super admins. Without this they would silently see empty
+# lists on the read-only Insights pages instead of an honest 403.
+def can_read_platform():
+    return is_super_admin() or is_content_manager()
+
+## Endpoint names a content manager is allowed to reach at all.
+#
+# This exists because require_admin_access() below is the *only* protection on
+# 88 of this blueprint's 237 routes -- they carry no per-route check and rely
+# entirely on the gate having already established that the caller is an admin.
+# Widening that gate by role would therefore hand content managers every school
+# -admin route in the file. Instead the gate stays fail-closed and admits them
+# for exactly the endpoints tagged @content_endpoint.
+#
+# The tag grants *reachability*, not authority: every tagged route still runs
+# its own can_manage_content() / can_read_platform() check. Both have to agree.
+CONTENT_MANAGER_ENDPOINTS = set()
+
+def content_endpoint(f):
+    CONTENT_MANAGER_ENDPOINTS.add(f.__name__)
+    return f
+
+## Same idea for the pre-existing school-scoped assistant role: the endpoints
+# an assistant may reach are already declared by @admin_or_assistant_required,
+# so that decorator registers them here rather than duplicating the list.
+ASSISTANT_ENDPOINTS = set()
 
 def get_positive_int_arg(name, default_value):
     value = request.args.get(name, default_value)
@@ -589,9 +644,16 @@ def is_admin_or_assistant_role():
 # admins (see Dashboard-iread-last-version's DashboardAssistant nav), so these routes
 # need to allow both roles rather than admin_required's admin/super_admin-only check.
 #
+# Applying it also registers the endpoint in ASSISTANT_ENDPOINTS, which is what
+# lets require_admin_access() admit assistants past the blueprint gate for these
+# routes and only these -- before that, this decorator could never fire for an
+# assistant because the gate had already returned 401.
+#
 # @param f: The view function to be decorated.
 # @return: The decorated function that enforces admin-or-assistant access.
 def admin_or_assistant_required(f):
+    ASSISTANT_ENDPOINTS.add(f.__name__)
+
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not is_admin_or_assistant_role():
@@ -1790,15 +1852,32 @@ admin=Blueprint('admin',__name__,url_prefix='/admin')
 bcrypt=Bcrypt()
 login_manager.init_app(admin)
 
+## @brief Blueprint-wide gate for every /admin route.
+#
+# Fail-closed by design: 88 of this blueprint's routes carry no per-route check
+# and trust this function to have established the caller's role, so anything not
+# explicitly admitted here must 401.
+#
+# Non-admin roles are admitted per endpoint, never per role:
+#   - content managers  -> endpoints tagged @content_endpoint
+#   - assistants        -> endpoints tagged @admin_or_assistant_required
+# Both still run their own authorization check inside the route.
 @admin.before_request
 def require_admin_access():
     if request.method == 'OPTIONS' or request.endpoint in (
         'admin.confirm', 'admin.forget_password', 'admin.reset_password'
     ):
         return None
-    if not is_admin_role():
-        return abort(401)
-    return None
+    if is_admin_role():
+        return None
+    # request.endpoint is 'admin.<function name>'; every endpoint reaching this
+    # before_request belongs to the admin blueprint, so the prefix is constant.
+    endpoint_name = (request.endpoint or '').rpartition('.')[2]
+    if is_content_manager() and endpoint_name in CONTENT_MANAGER_ENDPOINTS:
+        return None
+    if is_admin_or_assistant_role() and endpoint_name in ASSISTANT_ENDPOINTS:
+        return None
+    return abort(401)
 
 ## @brief User loader function for login manager.
 #
@@ -2124,7 +2203,7 @@ def super_create_user():
     try:
         data = request.get_json(silent=True) or {}
         role = str(data.get('role') or data.get('type') or 'reader').strip().lower()
-        allowed_roles = ['reader', 'teacher', 'assistant', 'admin', 'super_admin']
+        allowed_roles = ['reader', 'teacher', 'assistant', 'admin', 'super_admin', 'content_manager']
         if role not in allowed_roles:
             return jsonify({'message': 'Invalid user role'}), 400
 
@@ -2149,7 +2228,8 @@ def super_create_user():
             return jsonify({'message': 'A user with this email and username already exists'}), 409
 
         school_ids = None
-        if role != 'super_admin':
+        # Platform-wide roles belong to no school; everyone else must name one.
+        if role not in PLATFORM_WIDE_ROLES:
             school_ids = normalize_school_ids(
                 data.get('school_ids') or
                 data.get('schools') or
@@ -2197,6 +2277,8 @@ def super_create_user():
             new_user = Admin(**user_data)
             if data.get('user_id_invoicing_api') is not None:
                 new_user.user_id_invoicing_api = data.get('user_id_invoicing_api')
+        elif role == 'content_manager':
+            new_user = ContentManager(**user_data)
         else:
             new_user = SuperAdmin(**user_data)
 
@@ -2303,8 +2385,8 @@ def super_update_user(user_id):
 
         school_ids = normalize_school_ids(data.get('school_ids') or data.get('schools')) if ('school_ids' in data or 'schools' in data) else None
         if school_ids is not None:
-            if user.type == 'super_admin':
-                return jsonify({'message': 'Super admins are not assigned to schools'}), 400
+            if user.type in PLATFORM_WIDE_ROLES:
+                return jsonify({'message': 'Platform-wide roles are not assigned to schools'}), 400
             replace_user_school_memberships(user.id, school_ids)
 
         db.session.commit()
@@ -2481,9 +2563,10 @@ def super_activate_user(user_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/books', methods=['GET'])
+@content_endpoint
 def super_get_books():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_read_platform():
+        return jsonify({'message': 'Platform read access required'}), 403
     try:
         school_id = get_optional_school_filter_arg()
         search = request.args.get('search')
@@ -2518,9 +2601,10 @@ def super_get_books():
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/platform-books', methods=['GET'])
+@content_endpoint
 def super_get_platform_books():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         search = request.args.get('search')
         books_query = Book.query.filter(Book.is_platform_book.is_(True), Book.active.is_(True))
@@ -2538,9 +2622,10 @@ def super_get_platform_books():
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/platform-books', methods=['POST'])
+@content_endpoint
 def super_create_platform_book():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         data = get_book_request_data()
 
@@ -2581,9 +2666,10 @@ def super_create_platform_book():
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/platform-books/<int:book_id>', methods=['GET'])
+@content_endpoint
 def super_get_platform_book(book_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         book = Book.query.filter_by(id=book_id, is_platform_book=True).first()
         if not book:
@@ -2593,9 +2679,10 @@ def super_get_platform_book(book_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/platform-books/<int:book_id>', methods=['PUT', 'PATCH'])
+@content_endpoint
 def super_update_platform_book(book_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         book = Book.query.filter_by(id=book_id, is_platform_book=True).first()
         if not book:
@@ -2623,9 +2710,10 @@ def super_update_platform_book(book_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/platform-books/<int:book_id>/headwords', methods=['PUT', 'PATCH'])
+@content_endpoint
 def super_update_platform_book_headwords(book_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         book = Book.query.filter_by(id=book_id, is_platform_book=True).first()
         if not book:
@@ -2687,9 +2775,10 @@ def super_delete_platform_book(book_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/packs', methods=['GET'])
+@content_endpoint
 def super_get_packs():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_read_platform():
+        return jsonify({'message': 'Platform read access required'}), 403
     try:
         school_id = get_optional_school_filter_arg()
         title_search = request.args.get('title') or request.args.get('search')
@@ -2708,9 +2797,10 @@ def super_get_packs():
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs', methods=['GET'])
+@content_endpoint
 def super_get_global_packs():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         search = request.args.get('search') or request.args.get('title')
         packs_query = Pack.query.filter(Pack.is_global_pack.is_(True), Pack.active.is_(True))
@@ -2725,9 +2815,10 @@ def super_get_global_packs():
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs', methods=['POST'])
+@content_endpoint
 def super_create_global_pack():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         data = request.get_json(silent=True) or {}
         if not str(data.get('title') or '').strip():
@@ -2763,9 +2854,10 @@ def super_create_global_pack():
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>', methods=['GET'])
+@content_endpoint
 def super_get_global_pack(pack_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = Pack.query.filter_by(id=pack_id, is_global_pack=True).first()
         if not pack:
@@ -2775,9 +2867,10 @@ def super_get_global_pack(pack_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>', methods=['PUT', 'PATCH'])
+@content_endpoint
 def super_update_global_pack(pack_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = Pack.query.filter_by(id=pack_id, is_global_pack=True).first()
         if not pack:
@@ -2821,9 +2914,10 @@ def super_delete_global_pack(pack_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/books', methods=['GET'])
+@content_endpoint
 def super_get_global_pack_books(pack_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -2841,9 +2935,10 @@ def super_get_global_pack_books(pack_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/books/<int:book_id>', methods=['POST'])
+@content_endpoint
 def super_add_book_to_global_pack(pack_id, book_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -2869,9 +2964,10 @@ def super_add_book_to_global_pack(pack_id, book_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/books/<int:book_id>', methods=['DELETE'])
+@content_endpoint
 def super_remove_book_from_global_pack(pack_id, book_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -2893,9 +2989,10 @@ def super_remove_book_from_global_pack(pack_id, book_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/units', methods=['GET'])
+@content_endpoint
 def super_get_global_pack_units(pack_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -2906,9 +3003,10 @@ def super_get_global_pack_units(pack_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/units', methods=['POST'])
+@content_endpoint
 def super_create_global_pack_unit(pack_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -2938,9 +3036,10 @@ def super_create_global_pack_unit(pack_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/units/<int:unit_id>', methods=['PUT', 'PATCH'])
+@content_endpoint
 def super_update_global_pack_unit(pack_id, unit_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         if not get_global_pack_or_404(pack_id):
             return jsonify({'message': 'Global pack not found'}), 404
@@ -2968,9 +3067,10 @@ def super_update_global_pack_unit(pack_id, unit_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/units/<int:unit_id>', methods=['DELETE'])
+@content_endpoint
 def super_delete_global_pack_unit(pack_id, unit_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         if not get_global_pack_or_404(pack_id):
             return jsonify({'message': 'Global pack not found'}), 404
@@ -2987,9 +3087,10 @@ def super_delete_global_pack_unit(pack_id, unit_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/sessions', methods=['GET'])
+@content_endpoint
 def super_get_global_pack_sessions(pack_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -3002,9 +3103,10 @@ def super_get_global_pack_sessions(pack_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/units/<int:unit_id>/sessions', methods=['POST'])
+@content_endpoint
 def super_create_global_pack_session(pack_id, unit_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -3055,9 +3157,10 @@ def super_create_global_pack_session(pack_id, unit_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/sessions/<int:session_id>', methods=['PUT', 'PATCH'])
+@content_endpoint
 def super_update_global_pack_session(pack_id, session_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         pack = get_global_pack_or_404(pack_id)
         if not pack:
@@ -3120,9 +3223,10 @@ def super_update_global_pack_session(pack_id, session_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-packs/<int:pack_id>/sessions/<int:session_id>', methods=['DELETE'])
+@content_endpoint
 def super_delete_global_pack_session(pack_id, session_id):
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_manage_content():
+        return jsonify({'message': 'Content management access required'}), 403
     try:
         if not get_global_pack_or_404(pack_id):
             return jsonify({'message': 'Global pack not found'}), 404
@@ -7514,10 +7618,14 @@ def global_schedulable_book_query():
 
 
 def get_global_game_context(book_id=None):
-    if not is_super_admin():
+    # Single choke point for every /global-* game-calendar route, which is why
+    # none of them carry an inline guard of their own. Content managers own the
+    # master schedule alongside super admins; school admins stay on the
+    # school-scoped /admin/books/<id>/games/* routes instead.
+    if not can_manage_content():
         return None, jsonify({
-            'message': 'Super admin access required',
-            'code': 'SUPER_ADMIN_ACCESS_REQUIRED'
+            'message': 'Content management access required',
+            'code': 'CONTENT_ACCESS_REQUIRED'
         }), 403
     if book_id is None:
         return None, None, None
@@ -7572,6 +7680,7 @@ def serialize_global_schedulable_book(book):
 
 @admin.route('/global-game-settings', methods=['GET'])
 @login_required
+@content_endpoint
 def get_global_game_settings_route():
     try:
         _, error_response, error_status = get_global_game_context()
@@ -7598,6 +7707,7 @@ def get_global_game_settings_route():
 
 @admin.route('/global-game-settings/<game_type>', methods=['PUT', 'POST'])
 @login_required
+@content_endpoint
 def upsert_global_game_setting_route(game_type):
     try:
         _, error_response, error_status = get_global_game_context()
@@ -7628,6 +7738,7 @@ def upsert_global_game_setting_route(game_type):
 
 @admin.route('/global-books', methods=['GET'])
 @login_required
+@content_endpoint
 def get_global_schedulable_books():
     try:
         _, error_response, error_status = get_global_game_context()
@@ -7652,6 +7763,7 @@ def get_global_schedulable_books():
 
 @admin.route('/global-books/<int:book_id>/games/<game_type>/calendar', methods=['GET'])
 @login_required
+@content_endpoint
 def get_global_book_game_calendar(book_id, game_type):
     try:
         book, error_response, error_status = get_global_game_context(book_id)
@@ -7710,6 +7822,7 @@ def get_global_book_game_calendar(book_id, game_type):
 
 @admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/<play_date>', methods=['PUT'])
 @login_required
+@content_endpoint
 def upsert_global_book_game_calendar_day(book_id, game_type, play_date):
     try:
         book, error_response, error_status = get_global_game_context(book_id)
@@ -7741,6 +7854,7 @@ def upsert_global_book_game_calendar_day(book_id, game_type, play_date):
 
 @admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/<play_date>', methods=['DELETE'])
 @login_required
+@content_endpoint
 def delete_global_book_game_calendar_day(book_id, game_type, play_date):
     try:
         book, error_response, error_status = get_global_game_context(book_id)
@@ -7767,6 +7881,7 @@ def delete_global_book_game_calendar_day(book_id, game_type, play_date):
 
 @admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/generate', methods=['POST'])
 @login_required
+@content_endpoint
 def generate_global_book_game_calendar(book_id, game_type):
     try:
         book, error_response, error_status = get_global_game_context(book_id)
@@ -7807,6 +7922,7 @@ def generate_global_book_game_calendar(book_id, game_type):
 
 @admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/template', methods=['GET'])
 @login_required
+@content_endpoint
 def download_global_book_game_calendar_template(book_id, game_type):
     try:
         book, error_response, error_status = get_global_game_context(book_id)
@@ -7835,6 +7951,7 @@ def download_global_book_game_calendar_template(book_id, game_type):
 
 @admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/export', methods=['GET'])
 @login_required
+@content_endpoint
 def export_global_book_game_calendar_json(book_id, game_type):
     try:
         book, error_response, error_status = get_global_game_context(book_id)
@@ -7869,6 +7986,7 @@ def export_global_book_game_calendar_json(book_id, game_type):
 
 @admin.route('/global-books/<int:book_id>/games/<game_type>/calendar/import', methods=['POST'])
 @login_required
+@content_endpoint
 def import_global_book_game_calendar_json(book_id, game_type):
     try:
         book, error_response, error_status = get_global_game_context(book_id)
@@ -7935,6 +8053,7 @@ def import_global_book_game_calendar_json(book_id, game_type):
 
 @admin.route('/global-books/<int:book_id>/games/adoption', methods=['GET'])
 @login_required
+@content_endpoint
 def get_global_book_game_adoption(book_id):
     """Which schools are playing this book's schedule, and on which day.
 
@@ -11140,9 +11259,13 @@ def define_word():
 ##---------word sense / CEFR review queue (Word-Data brief T14-T16)----------
 
 def get_scoped_book_ids(book_id_filter=None):
-    """None means 'no restriction' (super admin, no book filter). Otherwise a
-    concrete, already-authorized list of book ids to scope word senses to."""
-    if is_super_admin():
+    """None means 'no restriction' (platform role, no book filter). Otherwise a
+    concrete, already-authorized list of book ids to scope word senses to.
+
+    Content managers must land in the unrestricted branch: they hold no school
+    memberships, so falling through to school_book_query() would return [] and
+    render the word queues empty rather than denying access outright."""
+    if can_read_platform():
         return [book_id_filter] if book_id_filter else None
 
     allowed = [book.id for book in school_book_query().all()]
@@ -11228,6 +11351,7 @@ def serialize_word_sense(sense, viewer_school_id=None):
 
 
 @admin.route('/word-senses', methods=['GET'])
+@content_endpoint
 def list_word_senses():
     try:
         page, per_page = get_super_admin_pagination_params()
@@ -11283,6 +11407,7 @@ def list_word_senses():
 
 
 @admin.route('/word-senses/quality', methods=['GET'])
+@content_endpoint
 def word_sense_quality():
     """T15 — the unresolved-rate signal: a spike should be visible against
     the normal trickle of proper nouns."""
@@ -11342,6 +11467,7 @@ def upsert_pending_suggestion(word_sense_id, school_id, suggestion_type, **field
 
 
 @admin.route('/word-senses/<int:sense_id>', methods=['PUT'])
+@content_endpoint
 def update_word_sense(sense_id):
     """Super admins edit directly, always. School admins can only suggest a
     CEFR level or proper-noun exclusion (see /word-senses/<id>/suggest) —
@@ -11352,9 +11478,9 @@ def update_word_sense(sense_id):
         if not sense:
             return jsonify({'message': 'Word sense not found'}), 404
 
-        super_admin = is_super_admin()
+        direct_editor = can_manage_content()
 
-        if not super_admin:
+        if not direct_editor:
             allowed_book_ids = set(get_scoped_book_ids())
             sense_book_ids = {
                 occurrence.chapter.book_id for occurrence in sense.occurrences if occurrence.chapter
@@ -11424,12 +11550,13 @@ def update_word_sense(sense_id):
 
 
 @admin.route('/word-senses/<int:sense_id>/suggest', methods=['POST'])
+@content_endpoint
 def suggest_word_sense_change(sense_id):
     """School admins propose a CEFR level or proper-noun exclusion for an
     unresolved word — never applied live; a super admin must approve it via
     POST /admin/word-suggestions/<id>/approve."""
     try:
-        if is_super_admin():
+        if can_manage_content():
             return jsonify({
                 'message': 'Super admins set this directly via PUT /admin/word-senses/<id> — no suggestion needed.',
             }), 400
@@ -11476,12 +11603,13 @@ def suggest_word_sense_change(sense_id):
 
 
 @admin.route('/word-suggestions', methods=['GET'])
+@content_endpoint
 def list_word_suggestions():
     """Super admin's review queue — every pending suggestion, across every
     school, so conflicting suggestions for the same word are visible together."""
     try:
-        if not is_super_admin():
-            return jsonify({'message': 'Super admin access required'}), 403
+        if not can_manage_content():
+            return jsonify({'message': 'Content management access required'}), 403
 
         suggestions = (
             WordSenseSuggestion.query
@@ -11511,10 +11639,11 @@ def list_word_suggestions():
 
 
 @admin.route('/word-suggestions/<int:suggestion_id>/approve', methods=['POST'])
+@content_endpoint
 def approve_word_suggestion(suggestion_id):
     try:
-        if not is_super_admin():
-            return jsonify({'message': 'Super admin access required'}), 403
+        if not can_manage_content():
+            return jsonify({'message': 'Content management access required'}), 403
 
         suggestion = WordSenseSuggestion.query.get(suggestion_id)
         if not suggestion or suggestion.status != STATUS_PENDING:
@@ -11569,10 +11698,11 @@ def approve_word_suggestion(suggestion_id):
 
 
 @admin.route('/word-suggestions/<int:suggestion_id>/reject', methods=['POST'])
+@content_endpoint
 def reject_word_suggestion(suggestion_id):
     try:
-        if not is_super_admin():
-            return jsonify({'message': 'Super admin access required'}), 403
+        if not can_manage_content():
+            return jsonify({'message': 'Content management access required'}), 403
 
         suggestion = WordSenseSuggestion.query.get(suggestion_id)
         if not suggestion or suggestion.status != STATUS_PENDING:
@@ -11646,8 +11776,9 @@ def update_platform_settings():
 
 def get_scoped_school_ids(school_id_filter=None):
     """Mirrors get_scoped_book_ids's shape for schools: None means 'no
-    restriction' (super admin, no filter)."""
-    if is_super_admin():
+    restriction' (platform role, no filter). Content managers belong to no
+    school, so they read across all of them rather than seeing nothing."""
+    if can_read_platform():
         return [school_id_filter] if school_id_filter else None
 
     allowed = [m.shcool_id for m in User_shcool.query.filter_by(user_id=current_user.id).all()]
@@ -11657,6 +11788,7 @@ def get_scoped_school_ids(school_id_filter=None):
 
 
 @admin.route('/reader-progress', methods=['GET'])
+@content_endpoint
 def list_reader_progress():
     try:
         page, per_page = get_super_admin_pagination_params()

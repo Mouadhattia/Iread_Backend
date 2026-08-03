@@ -2154,7 +2154,12 @@ def user_authenticated():
      
             client_id_invoicing_api = getattr(current_user, 'client_id_invoicing_api', None)
             quiz_id = getattr(current_user, 'quiz_id', None)
-            if current_user.type == "super_admin":
+            # Platform-wide roles hold no school membership, so their school list
+            # is every school rather than the ones they belong to. Content
+            # managers need it for the Audiobook Studio's school-scope picker.
+            # is_super_admin stays keyed to the real type -- the dashboard uses
+            # it to decide who sees tenant, revenue and system screens.
+            if current_user.type in ("super_admin", "content_manager"):
                 schools = Shcool.query.order_by(Shcool.name.asc()).all()
                 return jsonify({
                     'is_authenticated': current_user.is_authenticated,
@@ -2164,7 +2169,7 @@ def user_authenticated():
                     'role': current_user.type,
                     'quiz_id': quiz_id,
                     'id': current_user.id,
-                    'is_super_admin': True,
+                    'is_super_admin': current_user.type == "super_admin",
                     'must_change_password': bool(current_user.must_change_password),
                     'schools': [{'id': school.id, 'name': school.name} for school in schools]
                 })

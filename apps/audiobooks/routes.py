@@ -80,11 +80,32 @@ def is_active_role(*roles):
     )
 
 
+## @brief Guards the Audiobook Studio routes.
+#
+# Content managers author audiobooks platform-wide alongside super admins, so
+# they are admitted here. This blueprint is scoped to audiobooks only, so
+# widening the decorator grants nothing outside the studio.
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not is_active_role('admin', 'super_admin'):
+        if not is_active_role('admin', 'super_admin', 'content_manager'):
             return abort(401)
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+## @brief Withholds a route from content managers.
+#
+# Mirrors the platform-book / global-pack rule: content managers create and
+# edit, but destroying a whole published title stays with admins. Page-level
+# deletes are ordinary reversible edits and are not restricted.
+def deny_content_manager(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if is_active_role('content_manager'):
+            return jsonify({
+                'message': 'Deleting an audio book requires an administrator'
+            }), 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -100,6 +121,16 @@ def teacher_required(f):
 
 def is_super_admin():
     return is_active_role('super_admin')
+
+
+## @brief Callers who work across every school rather than inside one.
+#
+# Every scoping branch in this module previously asked is_super_admin(),
+# but the question it was really asking is 'is this caller platform-wide?'.
+# Content managers hold no school membership, so without this they would
+# fall into the school branch and be told 'No school access'.
+def is_platform_role():
+    return is_active_role('super_admin', 'content_manager')
 
 
 def get_positive_int(value, name):
@@ -150,7 +181,7 @@ def get_current_school_id():
 
 
 def resolve_school_scope_for_creator():
-    if is_super_admin():
+    if is_platform_role():
         school_id = get_request_school_id()
         if school_id is not None and not Shcool.query.get(school_id):
             raise ValueError('School not found')
@@ -174,7 +205,7 @@ def resolve_school_scope_for_creator():
 def can_access_source_book(source_book, school_id=None):
     if not source_book or not getattr(source_book, 'active', True):
         return False
-    if is_super_admin():
+    if is_platform_role():
         return True
     accessible_school_ids = get_user_school_ids(current_user.id)
     if school_id is None:
@@ -227,7 +258,7 @@ def create_audio_book_from_source_book(source_book, school_id):
 
 
 def resolve_school_scope_for_source_book(source_book):
-    if is_super_admin():
+    if is_platform_role():
         requested_school_id = get_request_school_id()
         if requested_school_id is not None and not Shcool.query.get(requested_school_id):
             raise ValueError('School not found')
@@ -265,7 +296,7 @@ def serialize_source_book(source_book):
 def can_manage_audio_book(book):
     if not book or not book.active:
         return False
-    if is_super_admin():
+    if is_platform_role():
         return True
     if current_user.type == 'admin':
         school_id = get_current_school_id()
@@ -1201,7 +1232,7 @@ def list_books_query_for_current_admin():
     source_book_id = request.args.get('book_id') or request.args.get('bookId')
     if source_book_id:
         query = query.filter(AudioBook.book_id == get_positive_int(source_book_id, 'book_id'))
-    if is_super_admin():
+    if is_platform_role():
         school_id = get_request_school_id()
         if school_id is not None:
             query = query.filter(AudioBook.shcool_id == school_id)
@@ -1222,7 +1253,7 @@ def list_books_query_for_current_teacher():
     source_book_id = request.args.get('book_id') or request.args.get('bookId')
     if source_book_id:
         query = query.filter(AudioBook.book_id == get_positive_int(source_book_id, 'book_id'))
-    if is_super_admin():
+    if is_platform_role():
         return query
     if current_user.type == 'admin':
         school_id = get_current_school_id()
@@ -1714,6 +1745,7 @@ def admin_update_audio_book(book_id):
 @admin_audiobooks.route('/audio-books/<int:book_id>', methods=['DELETE'])
 @login_required
 @admin_required
+@deny_content_manager
 def admin_delete_audio_book(book_id):
     return handle_delete_book(book_id)
 

@@ -145,3 +145,22 @@ class Assistant(User):
    
     def __repr__(self):
         return '<Assistant %s>' % self.username
+
+
+##
+# @brief Platform-wide catalogue operator working alongside the super admin.
+#
+# Not to be confused with Assistant above, which is scoped to one school and
+# helps that school's Admin. A ContentManager belongs to no school at all: they
+# curate the Shared Library, Ready-made Packs, the Audiobook Studio, the global
+# game calendar and the vocabulary queues across the whole platform, and are
+# blocked from tenants, users, revenue and system administration.
+#
+# Deliberately declared with no __tablename__ and no extra columns, so this is
+# single-table inheritance on `user` -- adding the role needs no DDL and no
+# Alembic revision, only a new value in the existing user.type string column.
+class ContentManager(User):
+    __mapper_args__ = {'polymorphic_identity': 'content_manager'}
+
+    def __repr__(self):
+        return '<ContentManager %s>' % self.username
