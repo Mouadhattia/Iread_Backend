@@ -11762,10 +11762,14 @@ def reject_word_suggestion(suggestion_id):
 
 
 @admin.route('/settings', methods=['GET'])
+@content_endpoint
 def get_platform_settings():
     try:
-        if not is_super_admin():
-            return jsonify({'message': 'Super admin access required'}), 403
+        # Read-only. The Word Suggestions page loads this alongside the queue in
+        # one Promise.all, so refusing it here would fail the whole page, not
+        # just the setting. Changing it stays super-admin-only (PUT below).
+        if not can_read_platform():
+            return jsonify({'message': 'Platform read access required'}), 403
 
         settings = PlatformSettings.get()
         return jsonify({
