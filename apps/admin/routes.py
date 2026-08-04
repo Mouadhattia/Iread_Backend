@@ -661,6 +661,27 @@ def admin_or_assistant_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+## @brief As admin_or_assistant_required, but content managers pass too.
+#
+# For the handful of session/quiz helpers that both a school assistant and a
+# platform content manager legitimately call -- attaching a quiz to a session is
+# part of authoring a Ready-made Pack, which content managers own. Kept as its
+# own decorator rather than widening is_admin_or_assistant_role(), which would
+# hand content managers all ~50 school user-management endpoints.
+def admin_assistant_or_content_required(f):
+    ASSISTANT_ENDPOINTS.add(f.__name__)
+    CONTENT_MANAGER_ENDPOINTS.add(f.__name__)
+
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not (is_admin_or_assistant_role() or is_content_manager()):
+            return jsonify({
+                'message': 'Your role does not have permission to use this feature',
+                'code': 'ROLE_NOT_PERMITTED'
+            }), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
 ## @brief Records an admin/assistant/super-admin action for accountability.
 #
 # Best-effort: a logging failure must never break the action it is recording,
@@ -1856,7 +1877,7 @@ login_manager.init_app(admin)
 #
 # Fail-closed by design: 88 of this blueprint's routes carry no per-route check
 # and trust this function to have established the caller's role, so anything not
-# explicitly admitted here must 401.
+# explicitly admitted here must be refused.
 #
 # Non-admin roles are admitted per endpoint, never per role:
 #   - content managers  -> endpoints tagged @content_endpoint
@@ -1877,7 +1898,19 @@ def require_admin_access():
         return None
     if is_admin_or_assistant_role() and endpoint_name in ASSISTANT_ENDPOINTS:
         return None
-    return abort(401)
+    if not current_user.is_authenticated:
+        return abort(401)
+    # Authenticated but not permitted must be 403, never 401. The dashboard
+    # treats 401 as "your session died": handleSuperAdminError() does a hard
+    # window.location.href = '/', so a single un-permitted call on a page would
+    # bounce the user to their home screen with no explanation instead of
+    # showing an error. A JSON body is required too -- bare abort(403) returns
+    # HTML, and getApiErrorMessage() would then fall back to its misleading
+    # default ("You do not have access to this school").
+    return jsonify({
+        'message': 'Your role does not have permission to use this feature',
+        'code': 'ROLE_NOT_PERMITTED'
+    }), 403
 
 ## @brief User loader function for login manager.
 #
@@ -3251,9 +3284,14 @@ def super_delete_global_pack_session(pack_id, session_id):
         return jsonify({'message': 'Internal server error', 'error': str(error)}), 500
 
 @admin.route('/super/global-teachers', methods=['GET'])
+# Reading the global-teacher list is a dependency of a granted area, not a
+# grant of teacher management: the Ready-made Packs detail page needs it to
+# assign a teacher to a pack session. Creating and removing global teachers is
+# account administration and stays super-admin-only below.
+@content_endpoint
 def super_get_global_teachers():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_read_platform():
+        return jsonify({'message': 'Platform read access required'}), 403
     try:
         search = request.args.get('search')
         teachers_query = (
@@ -9283,7 +9321,7 @@ def get_one_session_follow_requests():
 
 @admin.route('/add_quiz_to_session', methods=['POST'])
 @login_required
-@admin_or_assistant_required
+@admin_assistant_or_content_required
 def add_quiz_to_session():
     try:
         # Get data from the request
@@ -9325,7 +9363,7 @@ def add_quiz_to_session():
 
 @admin.route('/delete_quiz_from_session',methods=['POST'])
 @login_required
-@admin_or_assistant_required
+@admin_assistant_or_content_required
 def delete_quiz_from_session():
     try:
         session_id = request.json['session_id']
@@ -9350,7 +9388,7 @@ def delete_quiz_from_session():
 
 @admin.route('/get_quiz_in_session',methods=['POST'])
 @login_required
-@admin_or_assistant_required
+@admin_assistant_or_content_required
 def get_quiz_in_session():
     try:
         session_id = request.json['session_id']
