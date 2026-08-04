@@ -18,8 +18,10 @@ from flask_login import current_user, login_required
 from sqlalchemy import or_
 
 from apps.admin.routes import (
+    admin_assistant_or_content_required,
     admin_or_assistant_required,
     admin_required,
+    can_manage_content,
     get_current_school_id,
     is_super_admin,
     log_admin_action,
@@ -50,25 +52,26 @@ MAX_PER_PAGE = 100
 
 ## @brief Which storage folder the caller is acting on.
 #
-# A school admin always gets their own school. A super-admin may pass
-# `?scope=platform` to work in the platform folder, which is where covers for
-# platform-wide books belong -- without it they would have no way to upload an
-# asset that is not owned by one particular school.
+# A school admin always gets their own school. Platform-wide roles (super admin,
+# content manager) may pass `?scope=platform` to work in the platform folder,
+# which is where covers for platform-wide books and ready-made packs belong --
+# without it they would have no way to upload an asset that is not owned by one
+# particular school.
 #
 # @return the school id, or None for the platform folder.
-# @raises StorageError when a non-super-admin asks for the platform scope, or
+# @raises StorageError when a school-scoped role asks for the platform scope, or
 #         when an admin has no school membership at all.
 def resolve_scope():
     scope = (request.args.get('scope') or request.form.get('scope') or '').strip().lower()
     if scope == 'platform':
-        if not is_super_admin():
+        if not can_manage_content():
             raise StorageError('Only a platform administrator can manage platform storage.')
         return None
 
     school_id = get_current_school_id()
     if school_id is None:
-        if is_super_admin():
-            # A super-admin usually has no school membership, so the platform
+        if can_manage_content():
+            # Platform roles usually have no school membership, so the platform
             # folder is the sensible default rather than an error.
             return None
         raise StorageError('Your account is not linked to a school.')
@@ -100,7 +103,7 @@ def storage_error_response(error):
 # enforces, instead of a duplicated copy in JavaScript.
 @storage_api.route('/usage', methods=['GET'])
 @login_required
-@admin_or_assistant_required
+@admin_assistant_or_content_required
 def get_storage_usage():
     try:
         school_id = resolve_scope()
@@ -128,7 +131,7 @@ def get_storage_usage():
 # Query: category, q (search), page, per_page, kind (image|audio|document).
 @storage_api.route('/files', methods=['GET'])
 @login_required
-@admin_or_assistant_required
+@admin_assistant_or_content_required
 def list_storage_files():
     try:
         school_id = resolve_scope()
@@ -227,7 +230,7 @@ def list_storage_files():
 # the dashboard's image pickers write into the entity being edited.
 @storage_api.route('/files', methods=['POST'])
 @login_required
-@admin_or_assistant_required
+@admin_assistant_or_content_required
 def upload_storage_file():
     try:
         school_id = resolve_scope()

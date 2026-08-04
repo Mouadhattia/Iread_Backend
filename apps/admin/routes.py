@@ -257,6 +257,22 @@ def can_manage_content():
 def can_read_platform():
     return is_super_admin() or is_content_manager()
 
+## @brief Standard refusal for a signed-in caller whose role is not permitted.
+#
+# 401 is reserved for "not signed in". The dashboard treats 401 as a dead
+# session -- handleSuperAdminError() does a hard window.location.href = '/' --
+# so returning it for a permission failure bounces the user to their home page
+# with nothing explained. A JSON body is required as well: bare abort(403)
+# returns HTML, and the frontend's getApiErrorMessage() would then fall back to
+# its misleading "You do not have access to this school" default.
+def role_denied_response():
+    if not current_user.is_authenticated:
+        return abort(401)
+    return jsonify({
+        'message': 'Your role does not have permission to use this feature',
+        'code': 'ROLE_NOT_PERMITTED'
+    }), 403
+
 ## Endpoint names a content manager is allowed to reach at all.
 #
 # This exists because require_admin_access() below is the *only* protection on
@@ -626,7 +642,7 @@ def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not is_admin_role():
-            return abort(401)
+            return role_denied_response()
         return f(*args, **kwargs)
     return decorated_function
 
@@ -657,7 +673,7 @@ def admin_or_assistant_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not is_admin_or_assistant_role():
-            return abort(401)
+            return role_denied_response()
         return f(*args, **kwargs)
     return decorated_function
 
@@ -675,10 +691,7 @@ def admin_assistant_or_content_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not (is_admin_or_assistant_role() or is_content_manager()):
-            return jsonify({
-                'message': 'Your role does not have permission to use this feature',
-                'code': 'ROLE_NOT_PERMITTED'
-            }), 403
+            return role_denied_response()
         return f(*args, **kwargs)
     return decorated_function
 
@@ -1821,6 +1834,17 @@ def serialize_super_school(school):
         'suspended_reason': school.suspended_reason
     }
 
+## @brief Minimal school payload for pickers and filters.
+#
+# serialize_super_school above carries seat/licensing counts, suspension
+# reasons and admin-approval state -- tenant governance data. Roles that only
+# need to resolve a school id to a name get this instead.
+def serialize_school_option(school):
+    return {
+        'id': school.id,
+        'name': school.name
+    }
+
 def get_school_invitation_code(invitation_code_id):
     school_id = get_current_school_id()
     if not school_id or not invitation_code_id:
@@ -1898,19 +1922,7 @@ def require_admin_access():
         return None
     if is_admin_or_assistant_role() and endpoint_name in ASSISTANT_ENDPOINTS:
         return None
-    if not current_user.is_authenticated:
-        return abort(401)
-    # Authenticated but not permitted must be 403, never 401. The dashboard
-    # treats 401 as "your session died": handleSuperAdminError() does a hard
-    # window.location.href = '/', so a single un-permitted call on a page would
-    # bounce the user to their home screen with no explanation instead of
-    # showing an error. A JSON body is required too -- bare abort(403) returns
-    # HTML, and getApiErrorMessage() would then fall back to its misleading
-    # default ("You do not have access to this school").
-    return jsonify({
-        'message': 'Your role does not have permission to use this feature',
-        'code': 'ROLE_NOT_PERMITTED'
-    }), 403
+    return role_denied_response()
 
 ## @brief User loader function for login manager.
 #
@@ -4428,9 +4440,13 @@ def serialize_contract_plan(plan):
 
 
 @admin.route('/super/schools', methods=['GET'])
+# Reachable by content managers only as a lookup: the school filter on the
+# read-only Insights pages (All Books / All Packs) renders this list. They get
+# names and ids and nothing else -- see serialize_school_option.
+@content_endpoint
 def super_get_schools():
-    if not is_super_admin():
-        return jsonify({'message': 'Super admin access required'}), 403
+    if not can_read_platform():
+        return jsonify({'message': 'Platform read access required'}), 403
     try:
         search = request.args.get('search')
         schools_query = Shcool.query
@@ -4438,7 +4454,10 @@ def super_get_schools():
             schools_query = schools_query.filter(Shcool.name.ilike(f'%{search}%'))
 
         schools_query = schools_query.order_by(Shcool.id.desc())
-        return jsonify(paginate_super_admin_query(schools_query, serialize_super_school, 'schools')), 200
+        serializer = (
+            serialize_super_school if is_super_admin() else serialize_school_option
+        )
+        return jsonify(paginate_super_admin_query(schools_query, serializer, 'schools')), 200
     except ValueError as error:
         return jsonify({'message': str(error)}), 400
     except Exception as error:
