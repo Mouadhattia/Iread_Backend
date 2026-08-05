@@ -93,6 +93,7 @@ from apps.main.routes import main
 from apps.audiobooks.routes import admin_audiobooks, teacher_audiobooks, reader_audiobooks
 from apps.billing_webhook import billing
 from apps.media import media
+from apps.avatars import avatars
 from apps.school_storage import storage_api
 from apps.account_status import get_account_block_message
 
@@ -142,6 +143,9 @@ app.register_blueprint(billing)
 # the public delivery route the stored media URLs point at.
 app.register_blueprint(storage_api)
 app.register_blueprint(media)
+## @brief The shared profile-avatar library, so every frontend (and the mobile
+# app) resolves a picked avatar from one host instead of the dashboard's origin.
+app.register_blueprint(avatars)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5003)

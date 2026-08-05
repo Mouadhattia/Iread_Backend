@@ -630,10 +630,27 @@ def school_has_platform_book_access(school_id, book_id):
         return False
     if SchoolBookInstance.query.filter_by(shcool_id=school_id, book_id=book_id, active=True).first():
         return True
-    return (
+    if (
         db.session.query(Book_pack)
         .join(Pack, Book_pack.pack_id == Pack.id)
         .filter(Book_pack.book_id == book_id, Pack.shcool_id == school_id)
+        .first()
+        is not None
+    ):
+        return True
+    # A global pack has Pack.shcool_id NULL -- the school's access comes from an
+    # active SchoolPackInstance, not from owning the pack. Without this branch a
+    # book that reaches a school through a global pack is invisible here, which
+    # made /get_book_games/<id>/<type> answer BOOK_NOT_FOUND for every book in
+    # every global pack even though the reader can open its stories fine.
+    return (
+        db.session.query(Book_pack)
+        .join(SchoolPackInstance, SchoolPackInstance.pack_id == Book_pack.pack_id)
+        .filter(
+            Book_pack.book_id == book_id,
+            SchoolPackInstance.shcool_id == school_id,
+            SchoolPackInstance.active.is_(True),
+        )
         .first()
         is not None
     )

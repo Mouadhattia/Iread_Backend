@@ -1,0 +1,38 @@
+{
+	"size": 160,
+	"palettes": {
+		"reader": ["#0EA5E9", "#25c7a9", "#F8C709", "#F0AB3D", "#C271B4"],
+		"account": ["#92A1C6", "#146A7C", "#F0AB3D", "#C271B4", "#C20D90"]
+	},
+	"avatars": [
+		{ "id": "marble-1", "variant": "marble", "seed": "Atlas", "palette": "reader" },
+		{ "id": "marble-2", "variant": "marble", "seed": "Nova", "palette": "account" },
+		{ "id": "marble-3", "variant": "marble", "seed": "Orbit", "palette": "reader" },
+		{ "id": "marble-4", "variant": "marble", "seed": "Willow", "palette": "account" },
+
+		{ "id": "beam-1", "variant": "beam", "seed": "Atlas", "palette": "reader" },
+		{ "id": "beam-2", "variant": "beam", "seed": "Nova", "palette": "account" },
+		{ "id": "beam-3", "variant": "beam", "seed": "Orbit", "palette": "reader" },
+		{ "id": "beam-4", "variant": "beam", "seed": "Willow", "palette": "account" },
+
+		{ "id": "pixel-1", "variant": "pixel", "seed": "Atlas", "palette": "reader" },
+		{ "id": "pixel-2", "variant": "pixel", "seed": "Nova", "palette": "account" },
+		{ "id": "pixel-3", "variant": "pixel", "seed": "Orbit", "palette": "reader" },
+		{ "id": "pixel-4", "variant": "pixel", "seed": "Willow", "palette": "account" },
+
+		{ "id": "sunset-1", "variant": "sunset", "seed": "Atlas", "palette": "reader" },
+		{ "id": "sunset-2", "variant": "sunset", "seed": "Nova", "palette": "account" },
+		{ "id": "sunset-3", "variant": "sunset", "seed": "Orbit", "palette": "reader" },
+		{ "id": "sunset-4", "variant": "sunset", "seed": "Willow", "palette": "account" },
+
+		{ "id": "ring-1", "variant": "ring", "seed": "Atlas", "palette": "reader" },
+		{ "id": "ring-2", "variant": "ring", "seed": "Nova", "palette": "account" },
+		{ "id": "ring-3", "variant": "ring", "seed": "Orbit", "palette": "reader" },
+		{ "id": "ring-4", "variant": "ring", "seed": "Willow", "palette": "account" },
+
+		{ "id": "bauhaus-1", "variant": "bauhaus", "seed": "Atlas", "palette": "reader" },
+		{ "id": "bauhaus-2", "variant": "bauhaus", "seed": "Nova", "palette": "account" },
+		{ "id": "bauhaus-3", "variant": "bauhaus", "seed": "Orbit", "palette": "reader" },
+		{ "id": "bauhaus-4", "variant": "bauhaus", "seed": "Willow", "palette": "account" }
+	]
+}
