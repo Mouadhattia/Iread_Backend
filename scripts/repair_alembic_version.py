@@ -106,6 +106,7 @@ MARKERS = {
     'c9a2e5f81b34': ('table', 'contract_plan'),
     'd1b4f7c3a982': ('column', 'shcool', 'trial_seats'),
     'e2c8b4d1f036': ('table', 'school_file'),
+    'a1c4e7b930d2': ('table', 'global_game_calendar_entry'),
 }
 
 EXIT_OK = 0
