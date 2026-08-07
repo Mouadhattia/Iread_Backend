@@ -6,8 +6,10 @@
 from datetime import date, datetime
 
 from sqlalchemy import func
+from sqlalchemy.orm import joinedload
 
 from extensions import db
+from models.book import Book
 from models.chapter import Chapter
 from models.word_occurrence import WordOccurrence
 from models.word_progress import (
@@ -285,23 +287,40 @@ def get_book_completion(user_id):
     stops being true the moment chapters are split for real."""
     results = {}
 
+    # The mastered set is fetched once rather than counted per chapter. The old
+    # shape ran one COUNT per chapter in the database -- not per chapter the
+    # reader has touched -- so this route got slower as the platform catalogue
+    # grew, for every reader. One query now serves every chapter below.
+    mastered_sense_ids = {
+        row.word_sense_id
+        for row in WordProgress.query.with_entities(WordProgress.word_sense_id).filter(
+            WordProgress.user_id == user_id,
+            WordProgress.stage == STAGE_MASTERED,
+        )
+    }
+
     for chapter in Chapter.query.all():
         leveled_sense_ids = [
             occurrence.word_sense_id for occurrence in chapter.word_occurrences
             if occurrence.word_sense.effective_cefr_level is not None
         ]
+        mastered_count = sum(1 for sense_id in leveled_sense_ids if sense_id in mastered_sense_ids)
+
         if not leveled_sense_ids:
             chapter_complete = False
         else:
-            mastered_count = WordProgress.query.filter(
-                WordProgress.user_id == user_id,
-                WordProgress.word_sense_id.in_(leveled_sense_ids),
-                WordProgress.stage == STAGE_MASTERED,
-            ).count()
             chapter_complete = mastered_count == len(leveled_sense_ids)
 
-        book_entry = results.setdefault(chapter.book_id, {'chapters': {}, 'book_complete': True})
+        book_entry = results.setdefault(
+            chapter.book_id,
+            {'chapters': {}, 'book_complete': True, 'mastered': 0, 'total': 0},
+        )
         book_entry['chapters'][chapter.id] = chapter_complete
+        # Kept rather than discarded: "4 words left in this book" is the whole
+        # reason a reader opens the book again, and the numbers were already
+        # being computed here only to be thrown away.
+        book_entry['mastered'] += mastered_count
+        book_entry['total'] += len(leveled_sense_ids)
         if not chapter_complete:
             book_entry['book_complete'] = False
 
@@ -312,25 +331,88 @@ def get_book_completion(user_id):
 # Near-miss finder (section 13 — "the primary retention lever")
 # ---------------------------------------------------------------------------
 
+REQUIRED_SOURCES = 2
+REQUIRED_DAYS = 2
+MASTERY_REQUIREMENT_COUNT = 3  # distinct sources, distinct days, one unaided clear
+
+
+def _mastery_gap(progress):
+    """What this word still needs before it masters, straight off the rule in
+    _recompute_stage(): 2+ distinct sources, 2+ distinct days, 1+ unaided
+    clear. Reads the counters cached on WordProgress, so no extra queries."""
+    needs_new_game = progress.distinct_sources_count < REQUIRED_SOURCES
+    needs_new_day = progress.distinct_days_count < REQUIRED_DAYS
+    needs_unaided_clear = not progress.has_unaided_clear
+
+    return {
+        'needs_new_game': needs_new_game,
+        'needs_new_day': needs_new_day,
+        'needs_unaided_clear': needs_unaided_clear,
+        'requirements_remaining': sum([needs_new_game, needs_new_day, needs_unaided_clear]),
+    }
+
+
+def _next_step(gap):
+    """The single most useful thing to tell the learner to do. Ordered by what
+    they can act on *right now*: switching game and dropping hints are both
+    doable this minute, coming back tomorrow is not — so 'new_day' is only
+    suggested when it's the only thing left. Clearing the word in a new game
+    without a hint satisfies two requirements at once, hence its priority."""
+    if gap['needs_new_game']:
+        return 'new_game'
+    if gap['needs_unaided_clear']:
+        return 'unaided_clear'
+    if gap['needs_new_day']:
+        return 'new_day'
+    return None
+
+
 def find_nearest_near_miss(user_id):
+    """The word closest to mastery — 'the primary retention lever' (section 13).
+
+    Ranked by how many of the three mastery requirements are still missing, not
+    by pip count: pips only track hint-free clears per game and are not what
+    the mastery rule tests, so ranking on them both mis-ordered the list and
+    hid every word whose clears had all been hinted (pip_count 0), even one
+    unaided clear away from mastering."""
     candidates = (
         WordProgress.query
-        .filter(WordProgress.user_id == user_id, WordProgress.stage != STAGE_MASTERED)
+        .filter(
+            WordProgress.user_id == user_id,
+            WordProgress.stage != STAGE_MASTERED,
+            # No correct clear yet — nothing to be "near". Encountered-only
+            # words have all three counters at zero and would otherwise swamp
+            # the ranking.
+            WordProgress.stage != STAGE_ENCOUNTERED,
+        )
         .all()
     )
     if not candidates:
         return None
 
-    candidates.sort(key=lambda progress: -progress.pip_count)
-    best = candidates[0]
-    if best.pip_count == 0:
-        return None
+    # Fewest requirements left first; among equals, the word the learner has
+    # already put the most hint-free work into.
+    best = min(
+        candidates,
+        key=lambda progress: (_mastery_gap(progress)['requirements_remaining'], -progress.pip_count),
+    )
+    gap = _mastery_gap(best)
 
     return {
         'word_sense_id': best.word_sense_id,
         'lemma': best.word_sense.lemma,
+        'stage': best.stage,
         'pip_count': best.pip_count,
-        'games_remaining': 4 - best.pip_count,
+        'distinct_sources_count': best.distinct_sources_count,
+        'distinct_days_count': best.distinct_days_count,
+        'requirements_total': MASTERY_REQUIREMENT_COUNT,
+        'requirements_met': MASTERY_REQUIREMENT_COUNT - gap['requirements_remaining'],
+        'next_step': _next_step(gap),
+        # Kept so the pre-existing mobile card keeps rendering a number rather
+        # than a blank while it moves onto next_step; it now counts real
+        # requirements left, not the 4-pip fiction it used to.
+        'games_remaining': gap['requirements_remaining'],
+        **gap,
     }
 
 
@@ -622,13 +704,31 @@ def get_achievement_status(user_id):
             'progress': counts['mastered'], 'total': counts['total'],
         })
 
-    for book_id, status in get_book_completion(user_id).items():
+    book_completion = get_book_completion(user_id)
+
+    # One lookup for every book named below. Without the title these entries are
+    # N identical "Book Conqueror" cards a reader cannot tell apart, and without
+    # mastered/total there is no way to show which book is closest to done --
+    # which is the only version of this that makes anyone open a book.
+    book_titles = {}
+    if book_completion:
+        book_titles = {
+            row.id: row.title
+            for row in Book.query.with_entities(Book.id, Book.title).filter(
+                Book.id.in_(list(book_completion.keys()))
+            )
+        }
+
+    for book_id, status in book_completion.items():
         key = 'book_conqueror_%d' % book_id
         earned_at = earned.get((key, None))
         catalog.append({
             'key': key, 'category': 'book', 'title': 'Book Conqueror',
             'description': 'Master every tracked word in this book.',
             'book_id': book_id,
+            'book_title': book_titles.get(book_id),
+            'progress': status.get('mastered', 0),
+            'total': status.get('total', 0),
             'earned': earned_at is not None,
             'earned_at': earned_at.isoformat() if earned_at else None,
         })
@@ -714,9 +814,24 @@ def get_word_collection(user_id):
         .all()
     )
 
+    # One query for every occurrence, not one per word. This loop used to issue
+    # a SELECT per row (plus a lazy load of `occurrence.chapter`), so a reader
+    # with 3,000 collected words cost ~6,000 round trips and the endpoint timed
+    # out long before the client had anything to render.
+    sense_ids = [sense.id for _, sense in rows]
+    occurrence_by_sense = {}
+    if sense_ids:
+        for occurrence in (
+            WordOccurrence.query
+            .options(joinedload(WordOccurrence.chapter))
+            .filter(WordOccurrence.word_sense_id.in_(sense_ids))
+        ):
+            # first() semantics: keep the earliest occurrence per sense.
+            occurrence_by_sense.setdefault(occurrence.word_sense_id, occurrence)
+
     words = []
     for progress, sense in rows:
-        occurrence = WordOccurrence.query.filter_by(word_sense_id=sense.id).first()
+        occurrence = occurrence_by_sense.get(sense.id)
         chapter = occurrence.chapter if occurrence else None
         words.append({
             'word_sense_id': sense.id,
