@@ -129,7 +129,7 @@ from apps.game_calendar import (
     import_calendar_payload,
     normalize_game_type,
     normalize_games_mode,
-    parse_bool_value,
+    parse_bool_value as parse_game_bool_value,  # see parse_bool_value() below
     parse_optional_play_date,
     parse_play_date,
     preview_calendar_import_payload,
@@ -165,12 +165,14 @@ import json
 import webcolors
 import random
 import spacy
+from apps.account_deletion import purge_user_references
 from apps.seats import (
     SOURCE_ADMIN_ASSIGN,
     activate_seat,
     attach_orphan_activations,
     check_capacity,
     get_active_subscription,
+    release_all_seats,
     release_seat,
     resolve_billing_school,
     seat_summary,
@@ -334,6 +336,14 @@ def get_optional_bool_arg(name):
         return False
     raise ValueError(f'{name} must be true or false')
 
+## @brief Strict boolean parser for admin payloads: a missing value is an error.
+#
+# Deliberately not the same function as apps.game_calendar.parse_bool_value(),
+# which returns a caller-supplied default instead and raises GameCalendarError
+# rather than ValueError. Both share this module's namespace and *this* one wins
+# -- a module-level def overrides an import at the top of the file. Game-calendar
+# callers must therefore use the aliased parse_game_bool_value(); calling this
+# one with `default=` raises TypeError, which the routes report as a bare 500.
 def parse_bool_value(value, name):
     if isinstance(value, bool):
         return value
@@ -591,26 +601,22 @@ def send_school_welcome_email(user, school, password):
         logging.error('Unable to send school welcome email: %s', error, exc_info=True)
         return False, str(error)
 
+## @brief Clear everything referencing a user so their row can be deleted.
+#
+# Kept as a name because several routes call it, but the work now happens in
+# apps.account_deletion, which derives the table list from db.metadata instead
+# of repeating it by hand. The list that used to live here covered eleven
+# tables and had already fallen behind the schema -- it never learned about
+# practice_play, certificate or chat, so deleting any reader who had used the
+# app since mid-2026 raised an IntegrityError from MySQL's RESTRICT.
+#
+# Seats are released (not just deleted) first, so the school's used-seat count
+# comes down with them.
 def delete_super_user_dependencies(user_id):
-    Follow_book.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    Follow_session.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    Follow_pack.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    Notification_user.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    ReaderNotification.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    Game_result.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    Profile.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    Teacher_postulate.query.filter_by(id=user_id).delete(synchronize_session=False)
-    User_shcool.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    # Seats held by a deleted account return to their school. Deleted rather
-    # than released because the FK to user.id goes away with the account; the
-    # invoice already raised for the term is the durable billing record.
-    SchoolSeatActivation.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-
-    UserLog.query.filter_by(user_id=user_id).update({'user_id': None}, synchronize_session=False)
-    Code.query.filter_by(user_id=user_id).update({'user_id': None}, synchronize_session=False)
-    SchoolInvitationCode.query.filter_by(created_by=user_id).update({'created_by': None}, synchronize_session=False)
-    Session.query.filter_by(teacher_id=user_id).update({'teacher_id': None}, synchronize_session=False)
-    Session_quiz.query.filter_by(teacher=user_id).update({'teacher': None}, synchronize_session=False)
+    release_all_seats(user_id, reason='account_deleted')
+    db.session.flush()
+    purge_user_references([user_id])
+    db.session.expire_all()
 
 def paginate_super_admin_query(query, serializer, collection_name):
     page, per_page = get_super_admin_pagination_params()
@@ -4874,7 +4880,7 @@ def update_school_global_pack_instance(pack_id):
                 instance.games_mode = requested_mode
 
         if 'global_leaderboard_opt_in' in data:
-            instance.global_leaderboard_opt_in = parse_bool_value(
+            instance.global_leaderboard_opt_in = parse_game_bool_value(
                 data.get('global_leaderboard_opt_in'),
                 'global_leaderboard_opt_in',
                 default=True
@@ -5820,9 +5826,14 @@ def delete_user():
         user = get_school_user(id)
         
         if user:
+            user_id = user.id
             deleted_username = user.username
             deleted_type = user.type
-            db.session.delete(user)
+            # Without this the DELETE is refused by every FK pointing at the
+            # user (all RESTRICT) the moment the account has any history at
+            # all -- which is to say, for every account worth deleting.
+            delete_super_user_dependencies(user_id)
+            db.session.delete(db.session.get(User, user_id))
             db.session.commit()
             log_admin_action(
                 'delete', 'user', id,
@@ -5832,6 +5843,7 @@ def delete_user():
         else:
             return jsonify({'message': 'Invalid ID'}), 404
     except Exception as e:
+        db.session.rollback()
         # Log the error
         logging.error(f"An error occurred: {str(e)}")
         return jsonify({'message': 'Internal server error'}), 500
@@ -7477,13 +7489,13 @@ def get_game_calendar_import_json():
 
 def get_import_request_bool(name, default=False):
     if request.form and name in request.form:
-        return parse_bool_value(request.form.get(name), name, default=default)
+        return parse_game_bool_value(request.form.get(name), name, default=default)
 
     data = request.get_json(silent=True)
     if isinstance(data, dict) and name in data:
-        return parse_bool_value(data.get(name), name, default=default)
+        return parse_game_bool_value(data.get(name), name, default=default)
 
-    return parse_bool_value(request.args.get(name), name, default=default)
+    return parse_game_bool_value(request.args.get(name), name, default=default)
 
 
 def public_game_calendar_import_result(result):
@@ -7949,7 +7961,7 @@ def generate_global_book_game_calendar(book_id, game_type):
         start_date = data.get('start_date') or request.args.get('start_date')
         if start_date is None:
             raise GameCalendarError('start_date is required', 'START_DATE_REQUIRED', 400)
-        overwrite = parse_bool_value(
+        overwrite = parse_game_bool_value(
             data.get('overwrite', request.args.get('overwrite', False)),
             'overwrite',
             default=False

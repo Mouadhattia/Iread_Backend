@@ -1,0 +1,48 @@
+{% extends "email_base.html" %}
+
+{% block email_title %}Your iRead account has been deleted{% endblock %}
+
+{% block content %}
+<h1>Your iRead account has been deleted</h1>
+<p>Hello,</p>
+<p>
+  {% if is_household %}
+  The iRead account registered to this address has been deleted, along with
+  every profile in it. Nothing is left to sign in to.
+  {% else %}
+  The iRead profile below has been deleted at your request. It cannot be
+  restored.
+  {% endif %}
+</p>
+
+<table class="email-info-table">
+  <tr>
+    <td class="label">{% if is_household %}Profiles removed{% else %}Profile{% endif %}</td>
+    <td>{{ profile_names | join(', ') }}</td>
+  </tr>
+  <tr>
+    <td class="label">What was removed</td>
+    <td>Reading history, words learned, streaks, trophies, certificates, pack and session enrolments, and any school place</td>
+  </tr>
+  <tr>
+    <td class="label">Can it be undone</td>
+    <td>No &mdash; the data is deleted, not archived</td>
+  </tr>
+</table>
+
+<p>
+  You will not receive anything further from iRead about this account. If you
+  want to read with us again, you are welcome to sign up from scratch at any
+  time &mdash; it will be a new account, starting fresh.
+</p>
+
+<p style="text-align: center; margin: 28px 0;">
+  <a class="email-button" href="{{ site_url }}">Visit iRead</a>
+</p>
+
+<p>
+  <strong>If you did not ask for this,</strong> someone with your account
+  password did. Please <a href="{{ support_url }}">contact us</a> straight away
+  so we can look into it.
+</p>
+{% endblock %}

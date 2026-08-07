@@ -9,6 +9,12 @@ context and prints the traceback, plus the schema facts that explain it.
 It writes nothing. The generate runs inside a transaction that is always rolled
 back, so it is safe to run against production.
 
+Scope, learned the hard way: this exercises the *service* layer, not the route.
+The first production 500 it was written for turned out to be in the route body
+above `generate_calendar_entries` -- a shadowed `parse_bool_value` -- so this
+script reported everything healthy. If it does that again, the fault is in the
+route, and `pm2 logs iread --err` is the faster answer.
+
 Usage (from the project root, with the venv active). Keep both streams -- the
 report goes to stdout and the tracebacks to stderr:
 

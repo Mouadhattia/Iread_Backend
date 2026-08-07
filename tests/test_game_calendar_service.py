@@ -200,5 +200,26 @@ class GlobalScheduleMappingTest(unittest.TestCase):
         self.assertEqual(context.exception.code, 'INVALID_GAMES_MODE')
 
 
+class AdminRouteHelperBindingTest(unittest.TestCase):
+    """Guards a name collision that took every global calendar write down.
+
+    `apps/admin/routes.py` defines its own stricter `parse_bool_value(value,
+    name)`, and a module-level def beats an import at the top of the same file.
+    The game-calendar routes therefore call the service helper through the
+    `parse_game_bool_value` alias; if someone drops the alias, every call
+    passing `default=` raises TypeError and the routes answer a bare 500 --
+    which is exactly how generate, JSON import and the leaderboard opt-in
+    toggle all failed in production while every read kept working.
+    """
+
+    def test_game_bool_helper_is_the_service_one_and_takes_a_default(self):
+        from apps.admin import routes
+        from apps.game_calendar import parse_bool_value as service_parse_bool_value
+
+        self.assertIs(routes.parse_game_bool_value, service_parse_bool_value)
+        self.assertFalse(routes.parse_game_bool_value(None, 'overwrite', default=False))
+        self.assertTrue(routes.parse_game_bool_value(None, 'opt_in', default=True))
+
+
 if __name__ == '__main__':
     unittest.main()

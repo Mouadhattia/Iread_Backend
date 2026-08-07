@@ -35,6 +35,12 @@ from models.book_text import Book_text
 from models.follow_session import Follow_session
 from models.audio_book import AudioBook, AudioBookPage
 from apps.account_status import get_account_block_message
+from apps.account_deletion import (
+    delete_users,
+    forget_quiz_accounts,
+    household_profiles,
+    send_account_deleted_email,
+)
 from apps.main.email import generate_confirmed_token,reader_confirm_token,generate_email_change_token,confirm_email_change_token
 from apps.jitsi import is_online_session, serialize_jitsi_call
 from apps.notifications import serialize_reader_notification
@@ -68,7 +74,6 @@ from apps.seats import (
     SOURCE_READER_CODE,
     activate_seat,
     check_capacity,
-    release_all_seats,
     release_seat_if_no_packs_remain,
     resolve_billing_school,
 )
@@ -3015,44 +3020,113 @@ def set_image():
         print(error)
         return jsonify({'message':'something wrong please try  later'}), 500        
 
-## @brief Route for deleting a reader's account.
+## @brief Describe what deleting this account would remove, before it happens.
 #
-# This route allows readers to delete their own accounts. The function accepts a POST request with JSON data containing the user's email and password to confirm their identity.
-# The function checks if the provided email and password match the current user's email and password using the 'current_user.email' and 'bcrypt.check_password_hash' functions.
-# If the email and password are valid and match the current user's email and password, the function deletes the user's account from the database using the 'db.session.delete' function and commits the changes using the 'db.session.commit' function.
-# A success message is returned to the user indicating that their account has been successfully deleted.
-# If the email and password are invalid or do not match the current user's email and password, an error message is returned.
+# The confirmation screen has to name the actual consequence, not a generic
+# warning: for a Parent that is "these three child profiles go too", which the
+# user cannot be expected to know, since nothing else in the product treats the
+# household as one object. Deleting a Parent takes its children with it (see
+# household_profiles) -- so the prompt says so, by name.
 #
-# @param email: The email of the current user.
-# @param password: The password of the current user to confirm their identity.
+# @return {profiles: [{name, role, schools}], schools: [...], is_household}
+@reader.route('/delete_account/preview', methods=['GET'])
+@login_required
+def delete_account_preview():
+    try:
+        profiles, children = household_profiles(current_user)
+
+        def describe(user):
+            return {
+                'id': user.id,
+                'name': user.display_name or user.username,
+                'role': 'parent' if user.type == 'parent' else 'reader',
+                'is_current': user.id == current_user.id,
+                'schools': get_user_schools(user.id)
+            }
+
+        described = [describe(user) for user in profiles]
+        schools = {
+            school['id']: school
+            for profile in described for school in profile['schools']
+        }
+
+        return jsonify({
+            'profiles': described,
+            'children': [profile for profile in described if not profile['is_current']],
+            'schools': list(schools.values()),
+            'is_household': bool(children)
+        }), 200
+    except Exception as error:
+        logging.error('Delete-account preview failed for user=%s: %s', current_user.id, error)
+        return jsonify({'message': 'Internal server error'}), 500
+
+## @brief Route for deleting the signed-in account, permanently.
 #
-# @return: A JSON object containing information about the result of the request to delete the account.
+# Confirmed with the account password, which is also what stops a child from
+# doing it: child profiles are entered with a 4-digit PIN and share the
+# household password they do not normally type.
+#
+# Deleting a Parent deletes the whole household (see household_profiles) --
+# the children have no separate credentials or billing identity of their own,
+# so leaving them behind would keep a set of children's reading records alive
+# after the adult who consented to them asked to be forgotten.
+#
+# Everything pointing at the account is cleared by apps.account_deletion's
+# schema-derived sweep rather than a hand-written table list here; the previous
+# list covered four tables out of ~30 and made this route return 500 for any
+# account that had ever played a game.
+#
+# @param password: The current account's password, to confirm identity.
+# @return: A JSON object describing the result.
 @reader.route('/delete_account',methods=['POST'])
 @login_required
 def delete_account():
-    try:
-        email=current_user.email
-        password=request.json['password']
-        if current_user.email==email and bcrypt.check_password_hash(current_user.password_hashed,password):
-            follow_sessions=Follow_session.query.filter_by(user_id=current_user.id).all()
-            follow_packs=Follow_pack.query.filter_by(user_id=current_user.id).all()
-            notifications = Notification_user.query.filter_by(user_id=current_user.id).all()
-            ReaderNotification.query.filter_by(user_id=current_user.id).delete(synchronize_session=False)
-            [ db.session.delete(notification) for notification in notifications ]
-            [ db.session.delete(follow_session) for follow_session in follow_sessions ]
-            [ db.session.delete(follow_pack) for follow_pack in follow_packs ]
-            # Hand every seat this reader held back to their school(s) before
-            # the account (and its cascading activation rows) goes away.
-            release_all_seats(current_user.id, reason='account_deleted')
-            db.session.commit()
+    password = (request.json or {}).get('password') or ''
+    if not password or not bcrypt.check_password_hash(current_user.password_hashed, password):
+        # 404 rather than 401/403: the mobile client already maps this status to
+        # "that password is not correct", and a signed-in user re-typing their
+        # own password is not an authentication failure worth logging them out
+        # over (a 401 would trip the clients' session-expired handling).
+        return jsonify({'message': 'Invalid password'}), 404
 
-            db.session.delete(current_user)
-            db.session.commit()
-            return jsonify({'message':'Your account has been  deleted succesfully'}),200
-        else:
-            return jsonify({'message':f'Invalid email or passsword'}),404
-    except:
-        return jsonify({'message': 'Internal server error'}), 500
+    try:
+        profiles, children = household_profiles(current_user)
+        deleted = [
+            {'id': user.id, 'name': user.display_name or user.username, 'role': user.type}
+            for user in profiles
+        ]
+        quiz_ids = [user.quiz_id for user in profiles]
+        email = current_user.email
+
+        delete_users(profiles)
+        db.session.commit()
+    except Exception as error:
+        db.session.rollback()
+        logging.error('Account deletion failed for user=%s: %s', current_user.id, error)
+        return jsonify({
+            'message': 'Your account could not be deleted. Please contact support so we can remove it for you.'
+        }), 500
+
+    # After the commit: the account is gone either way, and neither of these
+    # may resurrect it or turn a completed deletion into an error the user
+    # sees. The session first, so the client is never left holding a cookie
+    # for a user row that no longer exists.
+    try:
+        logout_user()
+    except Exception as error:
+        logging.warning('Logout after account deletion failed: %s', error)
+
+    forget_quiz_accounts(quiz_ids)
+
+    try:
+        send_account_deleted_email(email, deleted)
+    except Exception as error:
+        logging.warning('Account-deletion email not sent to %s: %s', email, error)
+
+    return jsonify({
+        'message': 'Your account has been deleted.',
+        'deleted_profiles': deleted
+    }), 200
 
 
 ## @brief Route for registering for a formation.
